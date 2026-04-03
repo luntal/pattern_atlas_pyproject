@@ -8,7 +8,8 @@ from types import SimpleNamespace
 if __name__ == '__main__':
     # retrain = True
     retrain = False
-    model_name = 'model.pt'
+    model_name = '../models/model-test.pt'
+
     if retrain:
         checkpoint = torch.load(model_name)
         model_state_dict = checkpoint['model_state_dict']
@@ -53,13 +54,12 @@ if __name__ == '__main__':
     optim = torch.optim.Adam(vae.parameters(), lr=hparams.learning_rate)
 
     # data = torch.randint(low=1, high=VOCAB, size=(BATCH, SEQ_LEN))
-    dataset_name = 'dataset-groove.npz'
+    dataset_name = '../data/dataset-groove.npz'
     data = np.load(dataset_name)['tensor']
     print('Total amount of training samples: ', data.shape)
     data = data[:hparams.n_samples]
     print('Using ', data.shape[0])
 
-    exit()
     print('---'*5)
 
     loader = DataLoader(data, batch_size=BATCH, shuffle=True)

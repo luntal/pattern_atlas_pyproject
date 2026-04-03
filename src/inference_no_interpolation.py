@@ -23,7 +23,7 @@ spherical interpolation between 2 latent vectors.
 # ONNX = True
 ONNX = False
 # Load the saved data
-checkpoint = torch.load('models/model_cache.pt', map_location='cpu')
+checkpoint = torch.load('../models/model_cache.pt', map_location='cpu')
 model_state_dict = checkpoint['model_state_dict']
 # checkpoint = torch.load('model.pt')
 model_state_dict = checkpoint['model_state_dict']

@@ -30,9 +30,9 @@ for i in range(len(keys)):
 hyper_params = {
     # training
     'batch_size': 20,
-    'n_epochs': 1000,
+    'n_epochs': 100,
     'learning_rate': 1e-4,
-    'n_samples': 100,
+    'n_samples': 10_000,
     # 'annealing_steps': 250 * 200, # kl annealing should start after around 50% of epochs, is computed in train method
     'beta': 0.5,
     'free_bits': 0.1,

@@ -2,7 +2,7 @@
 from pathlib import Path
 import pretty_midi
 import numpy as np
-# import os
+import os
 # from vae_rnn_09.hparams import hparams
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
@@ -79,8 +79,9 @@ class MidiProcessor:
         self.matrices = []
 
 
-    def load(self, data_path, skip=0, take=0):
-        data = np.load(data_path)
+    def load(self, dataset_name, skip=0, take=0):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data', dataset_name)
+        data = np.load(path)
         if take <= 0: take = len(data['tensor'])
         self.sequences = data['tensor'][skip:skip + take]
     
@@ -339,7 +340,7 @@ class MidiProcessor:
         return padded_sequences
 
 
-    def save(self, save_path='dataset.npz'):
+    def save(self, dataset_name='dataset.npz'):
         # pad sequences:
         # max_length = max(len(seq) for seq in self.sequences)
         max_length = self.hparams.max_seq_len
@@ -351,11 +352,18 @@ class MidiProcessor:
             padded_sequences[i, :len(seq)] = seq
 
         # save data:
-        if not save_path.endswith('.npz'):
-            save_path += '.npz'
-        # save_path = '../' + save_path
-        np.savez(save_path, tensor=padded_sequences)
-        print(f"Tensor saved to {save_path}")
+        if not dataset_name.endswith('.npz'):
+            dataset_name += '.npz'
+
+
+        # Prepend data folder path
+        data_folder = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data')
+        os.makedirs(data_folder, exist_ok=True)
+        dataset_path = os.path.join(data_folder, dataset_name)
+
+        np.savez(dataset_path, tensor=padded_sequences)
+        print(f"Tensor saved to {dataset_path}")
+
 
     def generate_matrices(self, print_to_terminal=False):
         """
@@ -469,7 +477,7 @@ class MidiProcessor:
             self.seq_index = idx
             if print_tokens:
                 tokens = [token for token in self.sequences[idx] if  token != self.hparams.pad_token]
-                print('seq: ', tokens)
+                # print('seq: ', tokens)
 
 
             ax.set_title(f"Matrix {idx + 1} of {len(mats)}")

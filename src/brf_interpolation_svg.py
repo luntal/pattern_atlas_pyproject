@@ -26,7 +26,7 @@ calculating RBF (Radial Basis Function) interpolation between multiple latent ve
 ##########################
 
 # Load the saved data
-checkpoint = torch.load('models/model_cache.pt', map_location='cpu')
+checkpoint = torch.load('../models/model_cache.pt', map_location='cpu')
 model_state_dict = checkpoint['model_state_dict']
 hparams_dict = checkpoint['hparams']
 
@@ -131,13 +131,14 @@ img_aspect = 857 / 2000
 height_range = width_range * img_aspect
 y_limit = height_range / 2
 # Extract positions from the original world.svg
-country_coords = get_country_positions("world.svg", (-radius_x, radius_x), (-y_limit, y_limit))
+country_coords = get_country_positions("../assets/world.svg", (-radius_x, radius_x), (-y_limit, y_limit))
 
 # Example: Print a few country positions to verify
 # print("\nParsed Country Coordinates (mapped):")
 # for country in ["Afghanistan", "Angola", "Germany"]:
 #     if country in country_coords:
 #         print(f"{country}: {np.round(country_coords[country], 3)}")
+# exit()
 # for name, coords in list(country_coords.items())[:10]:
 #     print(f"{name}: {coords}")
 country_list = list(country_coords.keys())
@@ -152,12 +153,12 @@ grid_resolution = 4
 precomputed_reconstructions = None
 precomputed_latents = None
 l_min, l_max = None, None
-if os.path.exists('precomputed_reconstructions.pkl'):
-    with open('precomputed_reconstructions.pkl', 'rb') as f:
+if os.path.exists('../outputs/precomputed_reconstructions.pkl'):
+    with open('../outputs/precomputed_reconstructions.pkl', 'rb') as f:
         precomputed_reconstructions = pickle.load(f)
         print('precomputed reconstructions loaded from disk')
-if os.path.exists('precomputed_latents.pkl'):
-    with open('precomputed_latents.pkl', 'rb') as f:
+if os.path.exists('../outputs/precomputed_latents.pkl'):
+    with open('../outputs/precomputed_latents.pkl', 'rb') as f:
         precomputed_latents = pickle.load(f)
         print('precomputed latents loaded from disk')
         latents_array = np.array(list(precomputed_latents.values()))
@@ -166,8 +167,8 @@ if os.path.exists('precomputed_latents.pkl'):
         print(f'l_max: {l_max}, l_min: {l_min}')
 
 midi_processor = MidiProcessor(hparams)
-if os.path.exists('precomputed_sequences.pkl'):
-    with open('precomputed_sequences.pkl', 'rb') as f:
+if os.path.exists('../outputs/precomputed_sequences.pkl'):
+    with open('../outputs/precomputed_sequences.pkl', 'rb') as f:
         midi_processor.sequences = pickle.load(f)
         print('sequences loaded from disk')
         print('n_sequences: ', len(midi_processor.sequences))
@@ -311,14 +312,14 @@ class CursorController:
 # Model and Data Initialization
 ########################################
 processor = MidiProcessor(hparams)
-if os.path.exists('midis.npz'):
+if os.path.exists('../data/midis.npz'):
     print("Loading preprocessed dataset from midis.npz")
-    npz_data = np.load('midis.npz', allow_pickle=True)
+    npz_data = np.load('../data/midis.npz', allow_pickle=True)
     data = npz_data['data']
     metadata = npz_data['metadata']
     # processor.sequences = data
 else:
-    abs_path = 'midis'
+    abs_path = '../midifiles'
 
     processor.extract(abs_path, 0, 0)
     # processor.visualize(playback=False)
@@ -339,8 +340,8 @@ else:
     # processor.sequences = data
 
 
-    np.savez('midis.npz', data=data, metadata=metadata)
-    print("Saved preprocessed dataset to midis.npz")
+    np.savez('../data/midis.npz', data=data, metadata=metadata)
+    print("Saved preprocessed dataset to data/midis.npz")
 print("Data shape:", data.shape)
 print("Metadata shape: ", metadata.shape)
 
@@ -389,9 +390,9 @@ print('latent vectors: ', latent_vectors.shape)
 
 
 # control points in circle:
-if os.path.exists('control_points.npy'):
+if os.path.exists('../outputs/control_points.npy'):
     print("Loading control point locations from control_points.npy")
-    control_points = np.load('control_points.npy')
+    control_points = np.load('../outputs/control_points.npy')
     # control_points *= scale
 else:
     print("control_points.npy not found, using circle method")
@@ -496,7 +497,7 @@ ax.set_ylim(-y_limit, y_limit)
 # --- ADD PNG BACKGROUND ---
 try:
     # Load the world.png directly from your project directory
-    bg_img = mpimg.imread("world.png")
+    bg_img = mpimg.imread("../assets/world.png")
 
     # Display it behind everything (zorder=-1)
     # Match 'extent' to your plot limits (-1.5 to 1.5)

@@ -303,7 +303,7 @@ def vae_loss(logits, targets, mu, logvar, beta=1.0, free_bits=0.0, pad_token=0):
 
 def train_vae(
         model: TransformerVAE, dataloader: DataLoader, _hparams: SimpleNamespace,
-        optimizer, device, model_name='model.pt', annealing_style='sigmoid', scheduler=None, step_start=0):
+        optimizer, device, model_name='../models/model.pt', annealing_style='sigmoid', scheduler=None, step_start=0):
     epochs = _hparams.n_epochs
     # annealing_steps = _hparams.annealing_steps
     # calculate annealing steps based on number of samples, should be approx. 50%
@@ -384,7 +384,7 @@ def train_vae(
         # torch.save({'epoch': epoch, 'model_state': model.state_dict()}, 'model_cache.pt')
         save_cache = False
         if prev_loss is not None and prev_loss > running['loss']/n_batches:
-            save_model(_hparams, model, 'model_cache.pt', scheduler, optimizer, loss_history)
+            save_model(_hparams, model, '../models/model_cache.pt', scheduler, optimizer, loss_history)
             save_cache = True
         # print('previous loss: ', prev_loss, ' , current loss: ', running['loss']/n, '')
         prev_loss = min(running['loss']/n_batches, prev_loss) if prev_loss is not None else running['loss']/n_batches
@@ -413,7 +413,7 @@ def train_vae(
     print(f"Training took {(time.time() - train_start_time)/60:.2f} minutes")
     print(f'model saved to {model_name}')
 
-def save_model(_hparams, model, model_name='model.pt', scheduler=None, optimizer=None, loss_history=None):
+def save_model(_hparams, model, model_name='../models/model.pt', scheduler=None, optimizer=None, loss_history=None):
     _hparams.scheduler_state_dict = scheduler.state_dict() if scheduler is not None else None
     _hparams.optimizer_state_dict = optimizer.state_dict() if optimizer is not None else None
     if loss_history is not None:
@@ -429,7 +429,7 @@ def save_model(_hparams, model, model_name='model.pt', scheduler=None, optimizer
 
 # ------------------------- ONNX Wrapper ---------------------------------
 class ONNXWrapper(nn.Module):
-    def __init__(self, _hparams: SimpleNamespace, encoder_path='encoder.onnx', decoder_path='decoder.onnx'):
+    def __init__(self, _hparams: SimpleNamespace, encoder_path='../models/encoder.onnx', decoder_path='../models/decoder.onnx'):
         super().__init__()
         # Use ONNX Runtime sessions instead of onnx.load
         self.enc_session = onnxruntime.InferenceSession(encoder_path)

@@ -22,7 +22,7 @@ using midi files from specified folder as input data.
 ##########################
 
 # Load the saved data
-checkpoint = torch.load('model_256.pt')
+checkpoint = torch.load('../models/model.pt')
 # checkpoint = torch.load('model.pt')
 model_state_dict = checkpoint['model_state_dict']
 hparams_dict = checkpoint['hparams']
@@ -61,7 +61,7 @@ else:
     processor.extract(abs_path, 0, 0)
     # processor.visualize(playback=False)
     data = processor.convert_to_numpy()
-    processor.save(save_path=midi_clips_data_name)
+    processor.save(dataset_name=midi_clips_data_name)
     # exit()
 
 

@@ -19,7 +19,7 @@ calculating RBF (Radial Basis Function) interpolation between multiple latent ve
 ##########################
 
 # Load the saved data
-checkpoint = torch.load('model_256.pt')
+checkpoint = torch.load('../models/model.pt')
 model_state_dict = checkpoint['model_state_dict']
 hparams_dict = checkpoint['hparams']
 

@@ -23,7 +23,7 @@ spherical interpolation between 2 latent vectors.
 # ONNX = True
 ONNX = False
 # Load the saved data
-checkpoint = torch.load('models/model_cache.pt', map_location='cpu')
+checkpoint = torch.load('../models/model_cache.pt', map_location='cpu')
 model_state_dict = checkpoint['model_state_dict']
 # checkpoint = torch.load('model.pt')
 # model_state_dict = checkpoint['model_state_dict']
@@ -60,7 +60,7 @@ seq2 = 5
 offset = 0
 n_examples = 1
 interpolation_steps = 20
-data = np.load('dataset-groove.npz')['tensor']
+data = np.load('../data/dataset-groove.npz')['tensor']
 # print(data['tensor'])
 print('data shape: ', data.shape)
 # maxi = data.shape[0]

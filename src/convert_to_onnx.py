@@ -5,11 +5,11 @@ from modules.model import TransformerVAE, reparameterize, Encoder, Decoder
 from modules.interpolation import interpolate_latent_vectors_spherical
 from modules.utilities import seq2mat
 from modules.midi_processor import MidiProcessor
-
+import onnx
 from types import SimpleNamespace
 
 # Load the saved data
-checkpoint = torch.load('model96_3.pt')
+checkpoint = torch.load('../models/model_cache.pt', map_location=torch.device('cpu'))
 # checkpoint = torch.load('model.pt')
 model_state_dict = checkpoint['model_state_dict']
 hparams_dict = checkpoint['hparams']
@@ -27,39 +27,49 @@ print('model config: ')
 print('model dimensions: ', hparams.d_model)
 print('n_layers: ', hparams.n_layers)
 print('n_heads: ', hparams.n_heads)
+
+total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f'Total parameters in model: {total_params / 1e6:.2f}M')
 print('--' * 10)
 
-###########################
-# Load Midi Data
-###########################
-abs_path = '/Users/alexanderlunt/Music/Ableton/Projects/Projektrealisation/Drums-Patterns Project/Midi-Clips'
-processor = MidiProcessor(hparams)
-processor.extract(abs_path, 0, 0)
-# processor.visualize(playback=False)
-data = processor.convert_to_numpy()
+
+# 2. Export Encoder (only calls Encoder.forward)
+dummy_enc_input = torch.zeros((1, hparams.max_seq_len), dtype=torch.long)
+torch.onnx.export(
+    model.encoder,
+    (dummy_enc_input, dummy_enc_input),
+    "../models/encoder-test.onnx",
+    input_names=['input_tokens', 'beat_tokens'],
+    output_names=['mu', 'logvar'],
+    dynamic_axes={
+        'input_tokens': {0: 'batch_size', 1: 'seq_len'},
+        'beat_tokens': {0: 'batch_size', 1: 'seq_len'}
+    },
+    opset_version=14,
+)
+
+# 3. Export Decoder (only calls Decoder.forward)
+# Note: This exports the TEACHER FORCING path (one step or parallel training path)
+# which is what you usually want for a separate ONNX decoder.
+dummy_dec_tokens = torch.zeros((1, hparams.max_seq_len), dtype=torch.long) # Current sequence
+dummy_z = torch.randn(1, hparams.latent_dim) # Latent vector
+torch.onnx.export(
+    model.decoder,
+    (dummy_dec_tokens, dummy_z, dummy_dec_tokens),
+    "../models/decoder-test.onnx",
+    input_names=['tgt_tokens', 'latent_z', 'beat_tokens'],
+    output_names=['logits'],
+    dynamic_axes={
+        'tgt_tokens': {0: 'batch_size', 1: 'seq_len'},
+        'latent_z': {0: 'batch_size'},
+        'beat_tokens': {0: 'batch_size', 1: 'seq_len'}
+    },
+    opset_version=14,
+)
+
+print("Modules exported. sample() methods were naturally excluded.")
 
 
-
-# position = 250
-# data = np.load('dataset.npz')['tensor']
-# print(data['tensor'])
-print('data shape: ', data.shape)
-maxi = data.shape[0]
-# maxi = hparams.n_samples + 200
-# print('using: ', maxi, ' samples')
-data_tensors = torch.tensor(data[0], dtype=torch.long)
-data_tensors[data_tensors >= 60] = 59
-data_tensors = data_tensors[data_tensors != 0].view(1, -1) # remove zeros and reshape
-print(data_tensors.shape)
-# exit()
-onnx_program = torch.onnx.export(model, data_tensors, dynamo=True)
-# onnx_program = torch.onnx.export(model, data_tensors, "model.onnx",
-#                   opset_version=17,
-#                   input_names=['tokens'],
-#                   output_names=['logits', 'mu', 'logvar'])
-onnx_program.save("model.onnx")
-
-import onnx
-
-onnx_model = onnx.load("model.onnx")
-onnx.checker.check_model(onnx_model)
+# test load
+# onnx_model = onnx.load("model.onnx")
+# onnx.checker.check_model(onnx_model)
