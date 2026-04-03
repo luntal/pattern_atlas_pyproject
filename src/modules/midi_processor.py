@@ -90,7 +90,7 @@ class MidiProcessor:
     def extract(
             self, midi_folder_path=None, skip=0, take=0, clip=False,
             randomize_velocity=0, qnt_strength=1, qnt_randomness=0, pitch_randomness=False,
-            roland=True):
+            roland=True, drums_only=False, filter=True):
         """
         Extracts sequences from MIDI files and save as list of tokens
         currently sequences are 2 bars long, 16th notes per bar
@@ -118,8 +118,21 @@ class MidiProcessor:
         metadata = []
         prev_n_notes = 0
         prev_last_note = 0
+        skipped_no_drums = 0
+        skipped_invalid = 0
+        failed_files = []
+
         for file_idx, filename in enumerate(selection):
-            midi_data = pretty_midi.PrettyMIDI(filename)
+            try:
+                midi_data = pretty_midi.PrettyMIDI(filename)
+            except Exception as e:
+                print('-------------------------------------')
+                print(f'FAILED: {filename}')
+                print(f'Error: {e}')
+                skipped_invalid += 1
+                failed_files.append((filename, str(e)))
+                continue
+
             print('-------------------------------------')
             print(filename)
             tempo_times, tempo_changes = midi_data.get_tempo_changes()
@@ -136,8 +149,23 @@ class MidiProcessor:
             current_qnt_strength = qnt_strength * (1-qnt_randomness)
             # print('c_qnt_strength', current_qnt_strength)
 
+            # Filter for drum tracks if drums_only is enabled
+            if drums_only:
+                drum_instruments = [inst for inst in midi_data.instruments if inst.is_drum]
+                if len(drum_instruments) == 0:
+                    print('No drum tracks found - skipping file')
+                    skipped_no_drums += 1
+                    continue
+                instruments_to_process = drum_instruments
+            else:
+                instruments_to_process = midi_data.instruments
 
-            for instrument in midi_data.instruments:
+            # Guard against empty instrument list
+            if len(instruments_to_process) == 0:
+                print('No instruments to process - skipping file')
+                continue
+
+            for instrument in instruments_to_process:
                 # print('instrument name: ', instrument.name)
                 width = self.hparams.width
                 height = self.hparams.height
@@ -148,6 +176,12 @@ class MidiProcessor:
                 seconds_per_16th_note = seconds_per_beat / 4
                 # print(seconds_per_16th_note)
                 sorted_midi_notes = sorted(instrument.notes, key=lambda note: note.start)
+
+                # Guard against empty note list
+                if len(sorted_midi_notes) == 0:
+                    print('No notes in instrument - skipping')
+                    continue
+
                 last_note_16th_index = int(sorted_midi_notes[-1].start // seconds_per_16th_note)
                 len_in_bars = np.ceil(last_note_16th_index / 16)
                 offset = False
@@ -186,6 +220,11 @@ class MidiProcessor:
                 for note in sorted_midi_notes:
 
                     pitch = note.pitch
+
+                    # Check if MIDI note is in valid range (0-127)
+                    if pitch < 0 or pitch > 127:
+                        print(f'Warning: Invalid MIDI pitch {pitch} - skipping note')
+                        continue
 
                     if clip:
                         # clip notes to range:
@@ -324,6 +363,49 @@ class MidiProcessor:
                 self.sequences = self.sequences + token_list
                 print('\nTotal Number of Sequences: ', len(self.sequences))
 
+        # Filter similar sequences if requested
+        sequences_before_filter = len(self.sequences)
+        if filter and len(self.sequences) > 0:
+            print('\nFiltering similar sequences...')
+            unique_sequences = []
+            seen_sequences = set()
+
+            for seq in self.sequences:
+                # Convert list to tuple so it can be hashed
+                seq_tuple = tuple(seq)
+                if seq_tuple not in seen_sequences:
+                    seen_sequences.add(seq_tuple)
+                    unique_sequences.append(seq)
+
+            self.sequences = unique_sequences
+            filtered_count = sequences_before_filter - len(self.sequences)
+            print(f'Filtered out {filtered_count} duplicate sequences')
+
+        # Print summary statistics
+        print('\n' + '=' * 50)
+        print(f'EXTRACTION SUMMARY')
+        if drums_only:
+            print(f'Mode: drums_only')
+        if filter:
+            print(f'Filter duplicates: enabled')
+        print(f'Files in selection: {len(selection)}')
+        print(f'Files skipped (invalid/corrupt): {skipped_invalid}')
+        if drums_only:
+            print(f'Files skipped (no drums): {skipped_no_drums}')
+        print(f'Total sequences extracted: {sequences_before_filter}')
+        if filter:
+            print(f'Sequences after filtering: {len(self.sequences)}')
+            print(f'Duplicates removed: {sequences_before_filter - len(self.sequences)}')
+        else:
+            print(f'Final sequences: {len(self.sequences)}')
+
+        if failed_files:
+            print(f'\nFailed files ({len(failed_files)}):')
+            for failed_file, error in failed_files:
+                print(f'  - {failed_file}')
+                print(f'    Error: {error}')
+        print('=' * 50)
+
 
     def convert_to_numpy(self):
         # cut to max len 256
@@ -362,7 +444,7 @@ class MidiProcessor:
         dataset_path = os.path.join(data_folder, dataset_name)
 
         np.savez(dataset_path, tensor=padded_sequences)
-        print(f"Tensor saved to {dataset_path}")
+        print(f"Data saved to {dataset_path}")
 
 
     def generate_matrices(self, print_to_terminal=False):
@@ -466,9 +548,19 @@ class MidiProcessor:
         ax.grid(which='minor', color='gray', linestyle='-', linewidth=0.5)
         # plt.colorbar(im, ax=ax, label='Value (0=Black, 1=White)')
 
+        # Add playback position line (initially hidden at x=-1)
+        playback_line = ax.axvline(x=0, color='red', linewidth=1.5, alpha=0.5, linestyle='-')
+
         # Slider for matrix scrolling
-        ax_slider = plt.axes([0.2, 0.1, 0.65, 0.03])
+        ax_slider = plt.axes([0.25, 0.1, 0.55, 0.03])
         slider = Slider(ax_slider, 'Matrix', 0, len(mats) - 1, valinit=0, valstep=1)
+
+        # Add previous/next buttons
+        from matplotlib.widgets import Button
+        ax_prev = plt.axes([0.05, 0.1, 0.09, 0.04])
+        ax_next = plt.axes([0.87, 0.1, 0.09, 0.04])
+        btn_prev = Button(ax_prev, 'Previous')
+        btn_next = Button(ax_next, 'Next')
         # Update function
         def update(val):
             idx = int(slider.val)
@@ -482,10 +574,38 @@ class MidiProcessor:
 
             ax.set_title(f"Matrix {idx + 1} of {len(mats)}")
             fig.canvas.draw_idle()
+
+        # Button callback functions
+        def previous_matrix(event):
+            current_val = int(slider.val)
+            if current_val > 0:
+                slider.set_val(current_val - 1)
+
+        def next_matrix(event):
+            current_val = int(slider.val)
+            if current_val < len(mats) - 1:
+                slider.set_val(current_val + 1)
+
+        # Timer function to update playback position line
+        def update_playback_line():
+            if playback:
+                # Convert playback_position to x coordinate (accounting for n_timing)
+                x_pos = self.playback_position * n_timing
+                playback_line.set_xdata([x_pos, x_pos])
+                fig.canvas.draw_idle()
+            # Schedule next update
+            return True
+
         if playback:
-            self.playback()
+            self.playback(fig, update_playback_line)
+            # Set up timer to update playback line every 50ms
+            timer = fig.canvas.new_timer(interval=50)
+            timer.add_callback(update_playback_line)
+            timer.start()
 
         slider.on_changed(update)
+        btn_prev.on_clicked(previous_matrix)
+        btn_next.on_clicked(next_matrix)
         plt.show()
         if self.stop_event is not None:
             self.stop_event.set()
@@ -496,7 +616,7 @@ class MidiProcessor:
             self.stop_event.set()
             self.thread.join()
 
-    def playback(self):
+    def playback(self, fig=None, update_callback=None):
         port = mido.get_output_names()[0]
         bpm = 100
         beat_length = 60 / bpm
@@ -528,7 +648,7 @@ class MidiProcessor:
             delay = sixteenth_note_length
 
             for token in seq:
-                if counter > playback_position:
+                if counter > self.playback_position:
                     break
                 if token == self.hparams.eos_token or token == 0:
                     break
@@ -542,13 +662,13 @@ class MidiProcessor:
                     deviation *= (sixteenth_note_length / 2) * deviation_strength
                     delay = sixteenth_note_length + deviation
 
-                if counter == playback_position:
+                if counter == self.playback_position:
                     if self.hparams.min_pitch_token <= token < self.hparams.max_pitch_token:
                         pitch = token - self.hparams.min_pitch_token + 36
                         # output_port.send(mido.Message('note_on', note=pitch , velocity=int(vel)))
                         # play_single_note(pitch, int(vel), delay)
 
-                        # print(playback_position, pitch, int(vel), delay)
+                        # print(self.playback_position, pitch, int(vel), delay)
                         threading.Thread(target=play_single_note, args=(pitch, int(vel), delay)).start()
 
                 if token == self.hparams.step_token:
@@ -573,5 +693,5 @@ class MidiProcessor:
 
 
 
-            playback_position += 1
-            playback_position %= self.hparams.width
+            self.playback_position += 1
+            self.playback_position %= self.hparams.width

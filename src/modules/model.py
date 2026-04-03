@@ -10,6 +10,9 @@ from types import SimpleNamespace
 import onnx
 import onnxruntime
 import math
+import csv
+from datetime import datetime
+import os
 
 def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     std = (0.5 * logvar).exp()
@@ -312,6 +315,21 @@ def train_vae(
     free_bits = _hparams.free_bits
     loss_history = []
 
+    # Initialize CSV logging
+    log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', 'docs')
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    log_file = os.path.join(log_dir, f'training_log_{timestamp}.csv')
+
+    with open(log_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'epoch', 'batch_size', 'total_loss', 'reconstruction_loss', 'kl_loss',
+            'perplexity', 'avg_tokens_per_sequence', 'learning_rate', 'beta',
+            'annealing_factor', 'epoch_time_seconds', 'elapsed_time_seconds',
+            'remaining_time_seconds', 'saved_cache'
+        ])
+
     prev_loss = None
     model.to(device)
     # transfer optimizer state tensors to device:
@@ -404,6 +422,26 @@ def train_vae(
         r_seconds = int(remaining_time % 60)
         print(f"Elapsed: {e_hours:.2f}h {e_minutes}min {e_seconds}s | Remaining: {r_hours}h {r_minutes}m {r_seconds}s")
 
+        # Log metrics to CSV
+        with open(log_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                epoch,
+                _hparams.batch_size,
+                f"{(running['loss']/n_batches).item():.6f}",
+                f"{(running['rec']/n_batches).item():.6f}",
+                f"{(running['kl']/n_batches).item():.6f}",
+                f"{perplexity:.4f}",
+                f"{running['n_tokens']/_hparams.n_samples:.2f}",
+                f"{current_lr:.10f}",
+                f"{weighted_beta:.6f}",
+                f"{annealing_factor:.6f}",
+                f"{epoch_time:.2f}",
+                f"{elapsed_time:.2f}",
+                f"{remaining_time:.2f}",
+                save_cache
+            ])
+
         print('-' * 100)
     # torch.save(model.state_dict(), model_name)
 
@@ -412,6 +450,7 @@ def train_vae(
 
     print(f"Training took {(time.time() - train_start_time)/60:.2f} minutes")
     print(f'model saved to {model_name}')
+    print(f'training log saved to {log_file}')
 
 def save_model(_hparams, model, model_name='../models/model.pt', scheduler=None, optimizer=None, loss_history=None):
     _hparams.scheduler_state_dict = scheduler.state_dict() if scheduler is not None else None
