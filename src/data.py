@@ -38,7 +38,7 @@ if __name__ == "__main__":
 
     if task == 'extract':
         # Set drums_only=True when extracting from multi-instrument datasets like Lakh
-        processor.extract(midi_folder_path=abs_path, skip=0, take=100, clip=False,
+        processor.extract(midi_folder_path=abs_path, skip=0, take=1500, clip=False,
                           randomize_velocity=0, qnt_strength=0, qnt_randomness=0, pitch_randomness=False,
                           drums_only=True, filter=True)
         processor.save(dataset_name=dataset_name)
