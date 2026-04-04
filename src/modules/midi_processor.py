@@ -208,6 +208,46 @@ def randomize_pitches(notes, target_range=24):
     return randomized_notes
 
 
+def remap_pitches(notes):
+    """
+    Remap specific pitches according to a predefined mapping,
+    preserving other fields (step_idx, deviation, vel).
+
+    Remapping logic:
+    38 -> 39
+    36 -> 41
+    44 -> 54
+    53 -> 59
+    59 -> 53
+
+    Args:
+        notes (list of dict): each note is {'step_idx': int, 'deviation': int, 'pitch': int, 'vel': int}
+
+    Returns:
+        list of dict: same structure as input, only specified pitch values are remapped
+    """
+
+    # Define the pitch mapping
+    pitch_map = {
+        38: 39,
+        36: 41,
+        44: 54,
+        53: 59,
+        59: 53
+    }
+
+    # Apply the mapping to notes
+    remapped_notes = []
+    for note in notes:
+        new_note = note.copy()
+        # Only remap if the pitch is in the mapping, otherwise keep original
+        if note['pitch'] in pitch_map:
+            new_note['pitch'] = pitch_map[note['pitch']]
+        remapped_notes.append(new_note)
+
+    return remapped_notes
+
+
 
 class MidiProcessor:
     def __init__(self, hparams: SimpleNamespace):
@@ -248,7 +288,7 @@ class MidiProcessor:
     def extract(
             self, midi_folder_path=None, skip=0, take=0, clip=False,
             randomize_velocity=0, qnt_strength=1, qnt_randomness=0, pitch_randomness=False,
-            roland=True, drums_only=False, filter=True):
+            roland=True, drums_only=False, filter_duplicates=True, remap=False):
         """
         Extracts sequences from MIDI files and save as list of tokens
         currently sequences are 2 bars long, 16th notes per bar
@@ -403,7 +443,7 @@ class MidiProcessor:
 
                     if clip:
                         # clip notes to range:
-                        if note.pitch < 36 or note.pitch > 36 + 24:
+                        if pitch < 36 or pitch > 36 + 24:
                             if roland:
                                 if pitch == 22:
                                     pitch = 53
@@ -476,7 +516,29 @@ class MidiProcessor:
                 # randomize
                 if pitch_randomness:
                     note_list = randomize_pitches(note_list, self.hparams.n_pitch)
+                if remap:
+                    note_list = remap_pitches(note_list, self.hparams.n_pitch)
 
+                # Check if first bar is empty and remove it if so
+                if note_list:
+                    first_bar_length = 16  # 16th notes in one bar
+                    has_notes_in_first_bar = any(note['step_idx'] < first_bar_length for note in note_list)
+                    if not has_notes_in_first_bar:
+                        # Shift all notes back by one bar
+                        note_list = [
+                            {**note, 'step_idx': note['step_idx'] - first_bar_length}
+                            for note in note_list
+                        ]
+
+                    # Skip what is now the first bar if it has fewer than 6 notes (originally the second bar)
+                    notes_in_first_bar = sum(1 for note in note_list if note['step_idx'] < first_bar_length)
+                    if notes_in_first_bar < 6:
+                        # Remove notes in first bar and shift everything after
+                        note_list = [
+                            {**note, 'step_idx': note['step_idx'] - first_bar_length}
+                            for note in note_list
+                            if note['step_idx'] >= first_bar_length
+                        ]
 
                 # split the whole seq into sequences of 2 bars:
                 len_2bars = 2 * 16  # amount of 16th notes in 2 bars
@@ -545,7 +607,7 @@ class MidiProcessor:
 
         # Filter similar sequences if requested
         sequences_before_filter = len(self.sequences)
-        if filter and len(self.sequences) > 0:
+        if filter_duplicates and len(self.sequences) > 0:
             print('\nFiltering similar sequences...')
             unique_sequences = []
             unique_metadata = []
@@ -571,14 +633,14 @@ class MidiProcessor:
         print(f'EXTRACTION SUMMARY')
         if drums_only:
             print(f'Mode: drums_only')
-        if filter:
+        if filter_duplicates:
             print(f'Filter duplicates: enabled')
         print(f'Files in selection: {len(selection)}')
         print(f'Files skipped (invalid/corrupt): {skipped_invalid}')
         if drums_only:
             print(f'Files skipped (no drums): {skipped_no_drums}')
         print(f'Total sequences extracted: {sequences_before_filter}')
-        if filter:
+        if filter_duplicates:
             print(f'Sequences after filtering: {len(self.sequences)}')
             print(f'Duplicates removed: {sequences_before_filter - len(self.sequences)}')
         else:
@@ -724,6 +786,11 @@ class MidiProcessor:
                     pitch = token - self.hparams.min_pitch_token
                     pitch_counts[pitch] = pitch_counts.get(pitch, 0) + 1
 
+        # Ensure all pitches have an entry, even if count is 0
+        for pitch in range(self.hparams.max_pitch_token - self.hparams.min_pitch_token):
+            if pitch not in pitch_counts:
+                pitch_counts[pitch] = 0
+
         # Visualize matrices
         mats = self.matrices
         x_positions = np.array([0, 4, 8, 12, 16, 20, 24, 28]) * n_timing
@@ -751,7 +818,7 @@ class MidiProcessor:
                 # Extract just the filename without path
                 import os
                 basename = os.path.basename(filename)
-                title += f"\n{basename} - Bar {bar_index}"
+                title += f"\n{basename} - Bar {bar_index * 2}"
             return title
 
         ax.set_title(get_title(current_matrix))
@@ -760,17 +827,20 @@ class MidiProcessor:
         ax.set_xticks(np.arange(0, matrix_width, 4*n_timing))  # Set tick positions
         ax.set_xticklabels(np.arange(0, matrix_width, 4*n_timing)//n_timing+1)
 
+        pitches = sorted(pitch_counts.keys())
+        # Convert pitch indices to MIDI note numbers for labels (pitch range 0-23 -> MIDI 36-59)
+        midi_notes = [p + 36 for p in pitches]
+        drum_names = [get_drum_name_from_24_pitch(mn) for mn in midi_notes]
+
         ax.set_yticks(np.arange(-0.5, mats[0].shape[0], 1), minor=True)
+        ax.set_yticks(np.arange(0, len(pitches)))
+        ax.set_yticklabels([f"{mn}: {dn}" for mn, dn in zip(midi_notes, drum_names)], fontsize=8)
         ax.grid(which='minor', color='gray', linestyle='-', linewidth=0.5)
         # plt.colorbar(im, ax=ax, label='Value (0=Black, 1=White)')
 
         # Create pitch histogram
-        pitches = sorted(pitch_counts.keys())
         counts = [pitch_counts[p] for p in pitches]
 
-        # Convert pitch indices to MIDI note numbers for labels (pitch range 0-23 -> MIDI 36-59)
-        midi_notes = [p + 36 for p in pitches]
-        drum_names = [get_drum_name_from_24_pitch(mn) for mn in midi_notes]
 
         # Create horizontal bar chart
         ax_hist.barh(pitches, counts, color='steelblue', alpha=0.7)

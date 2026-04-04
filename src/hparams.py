@@ -29,19 +29,21 @@ for i in range(len(keys)):
 
 hyper_params = {
     # training
-    'batch_size': 20,
-    'n_epochs': 10,
-    'learning_rate': 1e-4,
-    'n_samples': 100,
+    'dataset_name': 'dataset-merged.npz',
+    'validation_split': 0.1,
+    'batch_size': 32,
+    'n_epochs': 50,
+    'learning_rate': 3e-4,
+    'n_samples': 40_000,
     # 'annealing_steps': 250 * 200, # kl annealing should start after around 50% of epochs, is computed in train method
-    'beta': 0.5,
-    'free_bits': 0.1,
+    'beta': 0.3,
+    'free_bits': 0.05,
     'global_step': 0,
     'global_epoch': 0, # num of trained epochs
     'kl_annealing_step': 0,
     'current_lr': 0.0,
 
-    'latent_dim': d_base,
+    'latent_dim': d_base // 2,
 
     'steps_per_bar': 32,
     'total_steps': 32 * 2,

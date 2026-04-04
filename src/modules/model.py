@@ -306,7 +306,7 @@ def vae_loss(logits, targets, mu, logvar, beta=1.0, free_bits=0.0, pad_token=0):
 
 def train_vae(
         model: TransformerVAE, dataloader: DataLoader, _hparams: SimpleNamespace,
-        optimizer, device, model_name='../models/model.pt', annealing_style='sigmoid', scheduler=None, step_start=0):
+        optimizer, device, annealing_style='sigmoid', scheduler=None, step_start=0, val_loader=None):
     epochs = _hparams.n_epochs
     # annealing_steps = _hparams.annealing_steps
     # calculate annealing steps based on number of samples, should be approx. 50%
@@ -315,22 +315,74 @@ def train_vae(
     free_bits = _hparams.free_bits
     loss_history = []
 
-    # Initialize CSV logging
+    # Initialize CSV logging and generate model name with timestamp
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', 'docs')
     os.makedirs(log_dir, exist_ok=True)
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     log_file = os.path.join(log_dir, f'training_log_{timestamp}.csv')
+
+    # Generate model name with timestamp
+    model_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', 'models')
+    os.makedirs(model_dir, exist_ok=True)
+    model_name = os.path.join(model_dir, f'model_{timestamp}.pt')
+
+    # Configure performance optimizations based on device
+    use_amp = False  # Automatic Mixed Precision
+    use_compile = False  # torch.compile for optimization
+    scaler = None
+
+    if device.type == 'cuda':
+        # Check for H100/A100 (compute capability 8.0+) for TF32 and other optimizations
+        cuda_capability = torch.cuda.get_device_capability(device)
+        compute_capability = cuda_capability[0] + cuda_capability[1] / 10
+
+        print(f"CUDA Compute Capability: {compute_capability}")
+
+        # Enable TF32 for H100/A100 (faster matmul operations)
+        if compute_capability >= 8.0:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            print("TF32 enabled for faster training on H100/A100")
+
+        # Enable cuDNN benchmarking for optimal kernels
+        torch.backends.cudnn.benchmark = True
+
+        # Use Automatic Mixed Precision (FP16) for H100
+        # H100 has excellent FP16 and even FP8 support
+        use_amp = True
+        scaler = torch.cuda.amp.GradScaler()
+        print("Automatic Mixed Precision (AMP) enabled")
+
+        # torch.compile for PyTorch 2.0+ (significant speedup on modern GPUs)
+        if hasattr(torch, 'compile') and compute_capability >= 8.0:
+            try:
+                model = torch.compile(model, mode='reduce-overhead')
+                use_compile = True
+                print("torch.compile enabled for additional optimization")
+            except Exception as e:
+                print(f"torch.compile not available: {e}")
+
+    elif device.type == 'mps':
+        # MPS-specific optimizations for Apple Silicon
+        print("MPS optimizations enabled for Apple Silicon")
+        # Note: AMP not well supported on MPS yet, keeping FP32
+
+    else:
+        print("CPU mode - no hardware-specific optimizations")
 
     with open(log_file, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
             'epoch', 'batch_size', 'total_loss', 'reconstruction_loss', 'kl_loss',
             'perplexity', 'avg_tokens_per_sequence', 'learning_rate', 'beta',
-            'annealing_factor', 'epoch_time_seconds', 'elapsed_time_seconds',
+            'annealing_factor', 'val_total_loss', 'val_reconstruction_loss', 'val_kl_loss',
+            'val_perplexity', 'epoch_time_seconds', 'elapsed_time_seconds',
             'remaining_time_seconds', 'saved_cache'
         ])
 
     prev_loss = None
+    best_loss = float('inf')
+    best_model_state = None
     model.to(device)
     # transfer optimizer state tensors to device:
     if optimizer is not None:
@@ -374,11 +426,26 @@ def train_vae(
             prev_time = time.time()
             batch = batch.to(device)
             optimizer.zero_grad()
-            logits, mu, logvar = model(batch)
-            loss, rec, kl, perplexity, token_count = vae_loss(logits, batch, mu, logvar, beta=weighted_beta, free_bits=free_bits, pad_token=_hparams.pad_token)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+
+            # Use automatic mixed precision if enabled
+            if use_amp:
+                with torch.cuda.amp.autocast():
+                    logits, mu, logvar = model(batch)
+                    loss, rec, kl, perplexity, token_count = vae_loss(logits, batch, mu, logvar, beta=weighted_beta, free_bits=free_bits, pad_token=_hparams.pad_token)
+
+                # Scaled backward pass for mixed precision
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Standard FP32 training
+                logits, mu, logvar = model(batch)
+                loss, rec, kl, perplexity, token_count = vae_loss(logits, batch, mu, logvar, beta=weighted_beta, free_bits=free_bits, pad_token=_hparams.pad_token)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
             print(f'\rEpoch {epoch:03d}/{epochs} | Step {batch_iteration + 1:2d}/{len(dataloader)} | step_time: {time_elapsed:.2f}s', end='')
             batch_iteration += 1
             if scheduler is not None:
@@ -390,6 +457,40 @@ def train_vae(
         n_batches = len(dataloader)
         print()
 
+        # Validation evaluation
+        val_metrics = {'loss': 0.0, 'rec': 0.0, 'kl': 0.0, 'perplexity': 0.0}
+        if val_loader is not None:
+            model.eval()
+            with torch.no_grad():
+                for val_batch in val_loader:
+                    val_batch = val_batch.to(device)
+
+                    # Use AMP for validation if enabled
+                    if use_amp:
+                        with torch.cuda.amp.autocast():
+                            logits, mu, logvar = model(val_batch)
+                            val_loss, val_rec, val_kl, val_perplexity, _ = vae_loss(
+                                logits, val_batch, mu, logvar, beta=weighted_beta,
+                                free_bits=free_bits, pad_token=_hparams.pad_token
+                            )
+                    else:
+                        logits, mu, logvar = model(val_batch)
+                        val_loss, val_rec, val_kl, val_perplexity, _ = vae_loss(
+                            logits, val_batch, mu, logvar, beta=weighted_beta,
+                            free_bits=free_bits, pad_token=_hparams.pad_token
+                        )
+
+                    val_metrics['loss'] += val_loss.detach()
+                    val_metrics['rec'] += val_rec.detach()
+                    val_metrics['kl'] += val_kl.detach()
+                    val_metrics['perplexity'] += val_perplexity
+
+            n_val_batches = len(val_loader)
+            val_metrics['loss'] /= n_val_batches
+            val_metrics['rec'] /= n_val_batches
+            val_metrics['kl'] /= n_val_batches
+            val_metrics['perplexity'] /= n_val_batches
+
         now = time.time()
         epoch_time = now - prev_epoch_time
         prev_epoch_time = now
@@ -398,16 +499,30 @@ def train_vae(
         _hparams.global_epoch = total_steps // n_batches
         _hparams.current_lr = current_lr
         loss_history.append(running['loss']/n_batches)
-        # if save_dir is not None:
-        # torch.save({'epoch': epoch, 'model_state': model.state_dict()}, 'model_cache.pt')
+
+        # Track best model based on validation loss (or training loss if no validation)
+        current_loss = val_metrics['loss'] if val_loader is not None else running['loss']/n_batches
         save_cache = False
-        if prev_loss is not None and prev_loss > running['loss']/n_batches:
-            save_model(_hparams, model, '../models/model_cache.pt', scheduler, optimizer, loss_history)
+        if current_loss < best_loss:
+            best_loss = current_loss
+            # Save best model state
+            best_model_state = {
+                'model_state_dict': model.state_dict(),
+                'hparams': vars(_hparams),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+                'loss_history': loss_history
+            }
+            # Save cache checkpoint immediately
+            cache_path = os.path.join(model_dir, 'model_cache.pt')
+            torch.save(best_model_state, cache_path)
             save_cache = True
-        # print('previous loss: ', prev_loss, ' , current loss: ', running['loss']/n, '')
+
         prev_loss = min(running['loss']/n_batches, prev_loss) if prev_loss is not None else running['loss']/n_batches
 
-        print(f"Loss {running['loss']/n_batches:.4f} | rec {running['rec']/n_batches:.4f} | kl {running['kl']/n_batches:.4f} | Epoch_time: {epoch_time:.2f}s | saved cache: {save_cache} | lr: {current_lr:.10f}")
+        print(f"Train Loss {running['loss']/n_batches:.4f} | rec {running['rec']/n_batches:.4f} | kl {running['kl']/n_batches:.4f} | Epoch_time: {epoch_time:.2f}s | saved cache: {save_cache} | lr: {current_lr:.10f}")
+        if val_loader is not None:
+            print(f"Val Loss {val_metrics['loss']:.4f} | rec {val_metrics['rec']:.4f} | kl {val_metrics['kl']:.4f} | perplexity {val_metrics['perplexity']:.4f}")
         print(f'Model Perplexity: {perplexity} | Avg tokens per sequence: {running["n_tokens"]/_hparams.n_samples:.2f}')
 
 
@@ -436,6 +551,10 @@ def train_vae(
                 f"{current_lr:.10f}",
                 f"{weighted_beta:.6f}",
                 f"{annealing_factor:.6f}",
+                f"{val_metrics['loss'].item():.6f}" if val_loader is not None else "",
+                f"{val_metrics['rec'].item():.6f}" if val_loader is not None else "",
+                f"{val_metrics['kl'].item():.6f}" if val_loader is not None else "",
+                f"{val_metrics['perplexity']:.4f}" if val_loader is not None else "",
                 f"{epoch_time:.2f}",
                 f"{elapsed_time:.2f}",
                 f"{remaining_time:.2f}",
@@ -443,14 +562,18 @@ def train_vae(
             ])
 
         print('-' * 100)
-    # torch.save(model.state_dict(), model_name)
 
-    save_model(_hparams, model, model_name, scheduler, optimizer, loss_history)
-
+    # Save the best model at the end of training
+    if best_model_state is not None:
+        torch.save(best_model_state, model_name)
+        print(f"\nBest model saved to {model_name} (loss: {best_loss:.4f})")
+    else:
+        # Fallback: save current model if no best was found
+        save_model(_hparams, model, model_name, scheduler, optimizer, loss_history)
+        print(f"\nModel saved to {model_name}")
 
     print(f"Training took {(time.time() - train_start_time)/60:.2f} minutes")
-    print(f'model saved to {model_name}')
-    print(f'training log saved to {log_file}')
+    print(f'Training log saved to {log_file}')
 
 def save_model(_hparams, model, model_name='../models/model.pt', scheduler=None, optimizer=None, loss_history=None):
     _hparams.scheduler_state_dict = scheduler.state_dict() if scheduler is not None else None
