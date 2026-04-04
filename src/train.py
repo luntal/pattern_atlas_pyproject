@@ -8,6 +8,7 @@ import os
 import glob
 
 if __name__ == '__main__':
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     # retrain = True
     retrain = False
 
@@ -58,7 +59,7 @@ if __name__ == '__main__':
     optim = torch.optim.Adam(vae.parameters(), lr=hparams.learning_rate)
 
     # data = torch.randint(low=1, high=VOCAB, size=(BATCH, SEQ_LEN))
-    dataset_name = '../data/' + hparams.dataset_name
+    dataset_name = os.path.join(project_root, 'data', hparams.dataset_name)
     data = np.load(dataset_name)['data']
     print('Total amount of samples: ', data.shape)
     data = data[:hparams.n_samples]

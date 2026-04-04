@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-# from vae_rnn_09.hparams import hparams
 from torchtune.modules import RotaryPositionalEmbeddings
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -13,6 +12,7 @@ import math
 import csv
 from datetime import datetime
 import os
+import shutil
 
 def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     std = (0.5 * logvar).exp()
@@ -330,6 +330,7 @@ def train_vae(
     use_amp = False  # Automatic Mixed Precision
     use_compile = False  # torch.compile for optimization
     scaler = None
+    autocast_ctx = None
 
     if device.type == 'cuda':
         # Check for H100/A100 (compute capability 8.0+) for TF32 and other optimizations
@@ -350,17 +351,29 @@ def train_vae(
         # Use Automatic Mixed Precision (FP16) for H100
         # H100 has excellent FP16 and even FP8 support
         use_amp = True
-        scaler = torch.cuda.amp.GradScaler()
+        if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
+            scaler = torch.amp.GradScaler('cuda')
+            autocast_ctx = lambda: torch.amp.autocast(device_type='cuda')
+        else:
+            scaler = torch.cuda.amp.GradScaler()
+            autocast_ctx = lambda: torch.cuda.amp.autocast()
         print("Automatic Mixed Precision (AMP) enabled")
 
         # torch.compile for PyTorch 2.0+ (significant speedup on modern GPUs)
         if hasattr(torch, 'compile') and compute_capability >= 8.0:
-            try:
-                model = torch.compile(model, mode='reduce-overhead')
-                use_compile = True
-                print("torch.compile enabled for additional optimization")
-            except Exception as e:
-                print(f"torch.compile not available: {e}")
+            compiler = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
+            if compiler is None:
+                print("torch.compile disabled: no system C compiler found (cc/gcc/clang)")
+            else:
+                try:
+                    model = torch.compile(model, mode='reduce-overhead')
+                    use_compile = True
+                    # If a compiled backend fails at runtime, fall back to eager instead of crashing.
+                    from torch import _dynamo
+                    _dynamo.config.suppress_errors = True
+                    print("torch.compile enabled for additional optimization")
+                except Exception as e:
+                    print(f"torch.compile not available: {e}")
 
     elif device.type == 'mps':
         # MPS-specific optimizations for Apple Silicon
@@ -429,7 +442,7 @@ def train_vae(
 
             # Use automatic mixed precision if enabled
             if use_amp:
-                with torch.cuda.amp.autocast():
+                with autocast_ctx():
                     logits, mu, logvar = model(batch)
                     loss, rec, kl, perplexity, token_count = vae_loss(logits, batch, mu, logvar, beta=weighted_beta, free_bits=free_bits, pad_token=_hparams.pad_token)
 
@@ -467,7 +480,7 @@ def train_vae(
 
                     # Use AMP for validation if enabled
                     if use_amp:
-                        with torch.cuda.amp.autocast():
+                        with autocast_ctx():
                             logits, mu, logvar = model(val_batch)
                             val_loss, val_rec, val_kl, val_perplexity, _ = vae_loss(
                                 logits, val_batch, mu, logvar, beta=weighted_beta,
