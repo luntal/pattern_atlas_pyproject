@@ -728,7 +728,7 @@ def update_latent_display(isCursor=False):
             # find the original idx in precomputed token sequences stored in midi_processor.sequences
             x_idx = np.argmin(np.abs(x_vals - current_nearest_x))
             y_idx = np.argmin(np.abs(y_vals - current_nearest_y))
-            original_idx = y_idx * grid_resolution + x_idx
+            original_idx = x_idx * grid_resolution + y_idx
 
 
             # original_idx = y_idx * grid_resolution + x_idx
@@ -755,7 +755,7 @@ def update_latent_display(isCursor=False):
             
             # ax2.imshow(sample_mat, aspect='auto', cmap='Grays', origin='lower')
             im.set_data(sample_mat)
-            show_matrix_debug_preview(sample_mat)
+            # show_matrix_debug_preview(sample_mat)
             # im.set_clim(vmin=sample_mat.min(), vmax=sample_mat.max())  # <-- Add this line
             # make sample_mat visible with opencv2:
             # cv2.imshow('Sample Matrix', sample_mat)
