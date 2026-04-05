@@ -701,8 +701,9 @@ class MidiProcessor:
 
     def generate_matrices(self, print_to_terminal=False):
         """
-                Turn sequences into matrices
-                """
+        Turn sequences into matrices
+        resolution: (steps * n_timing) x pitch
+        """
         min_pitch_token = self.hparams.min_pitch_token
         min_vel_token = self.hparams.min_vel_token
         max_pitch_token = self.hparams.max_pitch_token

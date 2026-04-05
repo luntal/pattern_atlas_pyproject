@@ -16,6 +16,15 @@ import re
 import os
 import os.path
 import pickle
+import glob
+
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    cv2 = None
+    CV2_AVAILABLE = False
+
 """
 calculating RBF (Radial Basis Function) interpolation between multiple latent vectors
 
@@ -25,8 +34,15 @@ calculating RBF (Radial Basis Function) interpolation between multiple latent ve
 # Load model with metadata
 ##########################
 
-# Load the saved data
-checkpoint = torch.load('../models/model_cache.pt', map_location='cpu')
+# Find the latest model in the models directory
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+model_files = glob.glob(os.path.join(_script_dir, '../models/model_*.pt'))
+if not model_files:
+    raise FileNotFoundError("No model files found in ../models/ directory")
+latest_model = max(model_files, key=os.path.getmtime)
+print(f'Loading model: {latest_model}')
+
+checkpoint = torch.load(latest_model, map_location='cpu')
 model_state_dict = checkpoint['model_state_dict']
 hparams_dict = checkpoint['hparams']
 
@@ -42,6 +58,7 @@ print('model config: ')
 print('model dimensions: ', hparams.d_model)
 print('n_layers: ', hparams.n_layers)
 print('n_heads: ', hparams.n_heads)
+print('latent dim: ', hparams.latent_dim)
 print('--' * 10)
 
 ########################################
@@ -131,7 +148,7 @@ img_aspect = 857 / 2000
 height_range = width_range * img_aspect
 y_limit = height_range / 2
 # Extract positions from the original world.svg
-country_coords = get_country_positions("../assets/world.svg", (-radius_x, radius_x), (-y_limit, y_limit))
+country_coords = get_country_positions("assets/world.svg", (-radius_x, radius_x), (-y_limit, y_limit))
 
 # Example: Print a few country positions to verify
 # print("\nParsed Country Coordinates (mapped):")
@@ -147,28 +164,28 @@ selected_countries = ['United States', 'Spain',  'New Zealand', 'China', 'Austra
 # NUM_POINTS = len(selected_countries)  # number of control points / latent vectors
 LATENT_DIM = hparams.latent_dim  # dimension of latent space
 RBF_SIGMA = 0.3  # width of Gaussian RBF
-grid_resolution = 4
+grid_resolution = 16
 
 # Global buffer to store precomputed values
 precomputed_reconstructions = None
 precomputed_latents = None
 l_min, l_max = None, None
-if os.path.exists('../outputs/precomputed_reconstructions.pkl'):
-    with open('../outputs/precomputed_reconstructions.pkl', 'rb') as f:
+if os.path.exists('outputs/precomputed_reconstructions.pkl'):
+    with open('outputs/precomputed_reconstructions.pkl', 'rb') as f:
         precomputed_reconstructions = pickle.load(f)
         print('precomputed reconstructions loaded from disk')
-if os.path.exists('../outputs/precomputed_latents.pkl'):
-    with open('../outputs/precomputed_latents.pkl', 'rb') as f:
+if os.path.exists('outputs/precomputed_latents.pkl'):
+    with open('outputs/precomputed_latents.pkl', 'rb') as f:
         precomputed_latents = pickle.load(f)
-        print('precomputed latents loaded from disk')
-        latents_array = np.array(list(precomputed_latents.values()))
-        l_max = float(np.max(latents_array))
-        l_min = float(np.min(latents_array))
+        print('precomputed latents loaded from disk, shape: ', precomputed_latents.shape)
+        
+        l_max = float(np.max(precomputed_latents))
+        l_min = float(np.min(precomputed_latents))
         print(f'l_max: {l_max}, l_min: {l_min}')
 
 midi_processor = MidiProcessor(hparams)
-if os.path.exists('../outputs/precomputed_sequences.pkl'):
-    with open('../outputs/precomputed_sequences.pkl', 'rb') as f:
+if os.path.exists('outputs/precomputed_sequences.pkl'):
+    with open('outputs/precomputed_sequences.pkl', 'rb') as f:
         midi_processor.sequences = pickle.load(f)
         print('sequences loaded from disk')
         print('n_sequences: ', len(midi_processor.sequences))
@@ -312,14 +329,15 @@ class CursorController:
 # Model and Data Initialization
 ########################################
 processor = MidiProcessor(hparams)
-if os.path.exists('../data/midis.npz'):
+if os.path.exists('data/midis.npz'):
     print("Loading preprocessed dataset from midis.npz")
-    npz_data = np.load('../data/midis.npz', allow_pickle=True)
+    npz_data = np.load('data/midis.npz', allow_pickle=True)
     data = npz_data['data']
     metadata = npz_data['metadata']
     # processor.sequences = data
 else:
-    abs_path = '../midifiles'
+
+    abs_path = 'midifiles'
 
     processor.extract(abs_path, 0, 0)
     # processor.visualize(playback=False)
@@ -340,33 +358,11 @@ else:
     # processor.sequences = data
 
 
-    np.savez('../data/midis.npz', data=data, metadata=metadata)
+    np.savez('data/midis.npz', data=data, metadata=metadata)
     print("Saved preprocessed dataset to data/midis.npz")
 print("Data shape:", data.shape)
 print("Metadata shape: ", metadata.shape)
 
-# data = np.load('dataset.npz')['tensor']
-# print('data shape: ', data.shape)
-# print('metadata len: ', len(metadata))
-# for i in range(len(metadata)):
-#     print(metadata[i][0])
-
-# # 1. Identify indices for unique filenames
-# seen_filenames = set()
-# unique_indices = []
-#
-# for i, meta in enumerate(metadata):
-#     filename = meta[0]  # Extract filename from metadata entry
-#     if filename not in seen_filenames:
-#         seen_filenames.add(filename)
-#         unique_indices.append(i)
-# unique_indices = unique_indices[:20]
-# # 2. Extract corresponding sequences from data
-# # This creates a new array containing only one sequence per unique filename
-# filtered_data = data[unique_indices]
-#
-# # 3. (Optional) Filter metadata if you need to keep it aligned
-# filtered_metadata = [metadata[i] for i in unique_indices]
 
 print(f"Original n_samples: {len(data)}")
 # print(f"Unique filenames: {len(seen_filenames)}")
@@ -390,9 +386,9 @@ print('latent vectors: ', latent_vectors.shape)
 
 
 # control points in circle:
-if os.path.exists('../outputs/control_points.npy'):
+if os.path.exists('outputs/control_points.npy'):
     print("Loading control point locations from control_points.npy")
-    control_points = np.load('../outputs/control_points.npy')
+    control_points = np.load('outputs/control_points.npy')
     # control_points *= scale
 else:
     print("control_points.npy not found, using circle method")
@@ -497,7 +493,7 @@ ax.set_ylim(-y_limit, y_limit)
 # --- ADD PNG BACKGROUND ---
 try:
     # Load the world.png directly from your project directory
-    bg_img = mpimg.imread("../assets/world.png")
+    bg_img = mpimg.imread("assets/world.png")
 
     # Display it behind everything (zorder=-1)
     # Match 'extent' to your plot limits (-1.5 to 1.5)
@@ -531,27 +527,19 @@ ax.grid(which='minor', color='gray', linestyle='-', linewidth=0.3)
 
 
 # MIDI Grid
-midi_grid_width = hparams.width
+midi_grid_width = hparams.width * hparams.n_timing
 im = ax2.imshow(np.zeros((hparams.height, midi_grid_width)), aspect='auto', cmap='Grays', origin='lower', interpolation='nearest', vmin=0, vmax=1)
 ax2.set_title("Reconstructed Sample")
 ax2.set_box_aspect(0.4)
 
-ax2.set_xticks(np.arange(-0.5, midi_grid_width, 1), minor=True)
-ax2.set_xticks(np.arange(0, midi_grid_width, 4))
+ax2.set_xticks(np.arange(-0.5, midi_grid_width, hparams.n_timing), minor=True)
+ax2.set_xticks(np.arange(0, midi_grid_width, 4 * hparams.n_timing), minor=False)
+
+# ax.set_xticklabels(np.arange(0, midi_grid_width, 4 * hparams.n_timing) // hparams.n_timing + 1)
 ax2.set_yticks(np.arange(-0.5, hparams.height, 1), minor=True)
 ax2.grid(which='minor', color='gray', linestyle='-', linewidth=0.3)
 ax2.tick_params(axis='both', which='major', labelsize=tick_font_size)
 ax2.tick_params(axis='both', which='minor', labelsize=tick_font_size)
-
-# ax2.set_xticks(np.arange(-0.5, hparams.width, hparams.n_timing), minor=True)
-# matrix_width = hparams.width * hparams.n_timing
-# ax2.set_xticks(np.arange(0, matrix_width, 4 * hparams.n_timing))  # Set tick positions
-# ax2.set_xticklabels(np.arange(0, matrix_width, 4 * hparams.n_timing) // hparams.n_timing + 1)
-#
-# ax2.set_yticks(np.arange(-0.5, hparams.height, 1), minor=True)
-# ax2.grid(which='minor', color='gray', linestyle='-', linewidth=0.5)
-# ax2.tick_params(axis='both', which='major', labelsize=tick_font_size)
-# ax2.tick_params(axis='both', which='minor', labelsize=tick_font_size)
 
 
 lane_positions = [0, 1, 2, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
@@ -663,6 +651,35 @@ def get_centers(lin):
         centers.append(center)
     return centers
 
+
+def show_matrix_debug_preview(note_matrix):
+    """Show a simple, robust pixel preview of the current matrix in an OpenCV window."""
+    if not CV2_AVAILABLE or note_matrix is None:
+        return
+
+    mat = np.asarray(note_matrix, dtype=np.float32)
+    mat = np.nan_to_num(mat, nan=0.0, posinf=1.0, neginf=0.0)
+
+    max_val = float(np.max(mat)) if mat.size else 0.0
+    min_val = float(np.min(mat)) if mat.size else 0.0
+    if max_val > 1.0 or min_val < 0.0:
+        denom = max(max_val - min_val, 1e-8)
+        mat = (mat - min_val) / denom
+    else:
+        mat = np.clip(mat, 0.0, 1.0)
+
+    # Match matplotlib's origin='lower' by flipping vertically for OpenCV display.
+    img = np.flipud((mat * 255.0).astype(np.uint8))
+
+    scale = 16
+    preview = cv2.resize(
+        img,
+        (img.shape[1] * scale, img.shape[0] * scale),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    cv2.imshow('MIDI Matrix Preview', preview)
+    cv2.waitKey(1)
+
 def update_latent_display(isCursor=False):
     global weights, nearest_x, nearest_y, grid_resolution, im, note_matrix, precomputed_reconstructions, precomputed_latents
 
@@ -721,8 +738,8 @@ def update_latent_display(isCursor=False):
             nearest_x = current_nearest_x
             nearest_y = current_nearest_y
 
-            sample_mat = precomputed_reconstructions[(x_idx, y_idx)]
-            latent = precomputed_latents[(x_idx, y_idx)]
+            sample_mat = precomputed_reconstructions[original_idx]
+            latent = precomputed_latents[original_idx]
 
 
 
@@ -731,13 +748,19 @@ def update_latent_display(isCursor=False):
             # Optional: auto-scale colors based on the current vector values
             # latent_im.set_clim(vmin=latent.min(), vmax=latent.max())
 
-            note_matrix = sample_mat
+            # note_matrix = sample_mat.copy()
 
-            mask = note_matrix != 0
-            note_matrix[mask] = note_matrix[mask] * 0.7 + 0.3
+            # mask = note_matrix != 0
+            # note_matrix[mask] = note_matrix[mask] * 0.7 + 0.3
+            
             # ax2.imshow(sample_mat, aspect='auto', cmap='Grays', origin='lower')
-            im.set_data(note_matrix)
-            im.set_clim(vmin=sample_mat.min(), vmax=sample_mat.max())  # <-- Add this line
+            im.set_data(sample_mat)
+            show_matrix_debug_preview(sample_mat)
+            # im.set_clim(vmin=sample_mat.min(), vmax=sample_mat.max())  # <-- Add this line
+            # make sample_mat visible with opencv2:
+            # cv2.imshow('Sample Matrix', sample_mat)
+            # cv2.waitKey(1)
+
 
     fig.canvas.draw_idle()
     # plt.draw()
@@ -769,8 +792,8 @@ def recalculate_and_update(event):
 
 
     # Initialize a buffer for precomputed reconstructions
-    precomputed_reconstructions = {}
-    precomputed_latents = {}
+    precomputed_reconstructions = []
+    precomputed_latents = []
     print()
     counter = 0
     # Iterate over all grid points
@@ -792,38 +815,28 @@ def recalculate_and_update(event):
         samples = model.sample(z, hparams.max_seq_len, 0.1, False)
         print(f'Processing {samples.shape[0]} sequences...')
     sequences = samples.tolist()
+
     midi_processor.sequences = sequences
     midi_processor.generate_matrices()
-    m_reconstructions = midi_processor.matrices
-    for idx, m_sample in enumerate(m_reconstructions):
-        # sample_mat = seq2mat(sample.squeeze(0).tolist(), hparams)
-        # width = hparams.width
-        # height = hparams.height
-        # pos_x = x_vals[idx % grid_resolution]
-        # pos_y = y_vals[idx // grid_resolution]
-        pos_x = idx // grid_resolution
-        pos_y = idx % grid_resolution
-
-        # Store the reconstruction in the buffer
-        precomputed_reconstructions[(pos_x, pos_y)] = m_sample
-        precomputed_latents[(pos_x, pos_y)] = latents[idx]
+    precomputed_reconstructions = midi_processor.matrices
+    
     process_time = time.time()-start
 
     # save point locations and rhythms:
     # reconstructions from the model:
     print(f"Precomputation complete! {process_time:.2f}s")
-    with open('precomputed_reconstructions.pkl', 'wb') as f:
+    with open('outputs/precomputed_reconstructions.pkl', 'wb') as f:
         pickle.dump(precomputed_reconstructions, f)
     print('saved reconstructions as ', 'precomputed_reconstructions.pkl')
     # locations of control_points
-    np.save('control_points.npy', control_points)
+    np.save('outputs/control_points.npy', control_points)
     print('saved control point locations')
     # save the latent vectors in a separate numpy file:
-    with open('precomputed_latents.pkl', 'wb') as f:
-        pickle.dump(precomputed_latents, f)
+    with open('outputs/precomputed_latents.pkl', 'wb') as f:
+        pickle.dump(latents, f)
     print('saved latent vectors')
     # save midi_processor.sequences
-    with open('precomputed_sequences.pkl', 'wb') as f:
+    with open('outputs/precomputed_sequences.pkl', 'wb') as f:
         pickle.dump(midi_processor.sequences, f)
     print('saved midi sequences')
 
@@ -859,6 +872,8 @@ recalculate_button.on_clicked(on_button_click)
 update_latent_display()
 plt.show()
 midi_processor.stop_playback()
+if CV2_AVAILABLE:
+    cv2.destroyAllWindows()
 # stop_event.set()
 # thread.join()
 # print('control: ', control_points)

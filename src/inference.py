@@ -12,6 +12,8 @@ import threading
 from types import SimpleNamespace
 import math
 import time
+import glob
+import os
 
 """
 spherical interpolation between 2 latent vectors.
@@ -23,7 +25,15 @@ spherical interpolation between 2 latent vectors.
 # ONNX = True
 ONNX = False
 # Load the saved data
-checkpoint = torch.load('../models/model_cache.pt', map_location='cpu')
+# Find the latest model in the models directory
+model_files = glob.glob('../models/model_*.pt')
+if not model_files:
+    raise FileNotFoundError("No model files found in ../models/ directory")
+latest_model = max(model_files, key=os.path.getmtime)
+print(f'Loading model: {latest_model}')
+
+checkpoint = torch.load(latest_model, map_location='cpu')
+
 model_state_dict = checkpoint['model_state_dict']
 # checkpoint = torch.load('model.pt')
 # model_state_dict = checkpoint['model_state_dict']
@@ -60,7 +70,7 @@ seq2 = 5
 offset = 0
 n_examples = 1
 interpolation_steps = 20
-data = np.load('../data/dataset-groove.npz')['tensor']
+data = np.load('../data/dataset-groove.npz')['data']
 # print(data['tensor'])
 print('data shape: ', data.shape)
 # maxi = data.shape[0]

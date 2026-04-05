@@ -12,6 +12,8 @@ import threading
 from types import SimpleNamespace
 import math
 import time
+import glob
+import os
 
 """
 spherical interpolation between 2 latent vectors.
@@ -22,10 +24,16 @@ spherical interpolation between 2 latent vectors.
 ##########################
 # ONNX = True
 ONNX = False
+
+# Find the latest model in the models directory
+model_files = glob.glob('models/model_*.pt')
+if not model_files:
+    raise FileNotFoundError("No model files found in ../models/ directory")
+latest_model = max(model_files, key=os.path.getmtime)
+print(f'Loading model: {latest_model}')
+
 # Load the saved data
-checkpoint = torch.load('../models/model_cache.pt', map_location='cpu')
-model_state_dict = checkpoint['model_state_dict']
-# checkpoint = torch.load('model.pt')
+checkpoint = torch.load(latest_model, map_location='cpu')
 model_state_dict = checkpoint['model_state_dict']
 hparams_dict = checkpoint['hparams']
 
@@ -57,7 +65,7 @@ else:
 offset = 0
 n_examples = 1
 interpolation_steps = 25
-data = np.load('dataset-groove.npz')['tensor']
+data = np.load('data/dataset-merged.npz')['data']
 # print(data['tensor'])
 print('data shape: ', data.shape)
 # maxi = data.shape[0]
@@ -191,31 +199,6 @@ def visualize_with_slider():
     # Add slider for interpolation index display
     ax_index_slider = plt.axes([slider_x, 0.12, slider_width, slider_height])
     index_slider = Slider(ax_index_slider, 'Index', 0, len(data) - 1, valinit=current_index, valstep=1)
-
-    # print('max: ',max(syncopation_measures), 'min', min(syncopation_measures), 'length: ', len(syncopation_measures))
-
-
-
-
-    # Dynamically update based on slider changes
-    # def recalculate_and_update(val):
-    #     # nonlocal mats, seq1_matrix, seq2_matrix
-    #     global syncopation_measures, vel_deviations, note_densities
-    #
-    #     mats, seq1_matrix, seq2_matrix = calculate(new_seq1 + offset, new_seq2 + offset, interpolation_steps)
-    #     global_vars.set_matrices(mats)
-    #     _current_index = int(index_slider.val)
-    #     global_vars.set_current_index(_current_index)
-    #     axs[0].imshow(seq1_matrix, cmap='Grays', interpolation='nearest', aspect='auto', vmin=0, vmax=1)
-    #     axs[0].invert_yaxis()
-    #     axs[1].imshow(seq2_matrix, cmap='Grays', interpolation='nearest', aspect='auto', vmin=0, vmax=1)
-    #     axs[1].invert_yaxis()
-    #     mat_display.set_data(mats[_current_index])
-
-
-
-
-        # fig.canvas.draw_idle()
 
     def update_index(val):
         # global sequences

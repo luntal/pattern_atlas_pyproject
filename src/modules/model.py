@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torchtune.modules import RotaryPositionalEmbeddings
+# from torchtune.modules import RotaryPositionalEmbeddings
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import time
