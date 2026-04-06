@@ -28,7 +28,7 @@ ONNX = False
 # Find the latest model in the models directory
 model_files = glob.glob('models/model_*.pt')
 if not model_files:
-    raise FileNotFoundError("No model files found in ../models/ directory")
+    raise FileNotFoundError("No model files found in models/ directory")
 latest_model = max(model_files, key=os.path.getmtime)
 print(f'Loading model: {latest_model}')
 

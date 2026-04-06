@@ -427,9 +427,9 @@ def train_vae(
                 # annealing_factor = 1.0 / (1.0 + np.exp(-10 * (total_steps / annealing_steps - 0.5)))
                 if annealing_style == 'sigmoid':
                     # MuseMorphose-inspired Sigmoid Annealing
-                    # This starts slow, then rises quickly around the midpoint of annealing_steps
+                    # This starts slow, then rises quickly around 75% of annealing_steps
                     x_prop = (total_steps / annealing_steps)
-                    annealing_factor = 1.0 / (1.0 + np.exp(-10 * (x_prop - 0.5)))
+                    annealing_factor = 1.0 / (1.0 + np.exp(-10 * (x_prop - 0.75)))
 
             else:
                 annealing_factor = 1.0

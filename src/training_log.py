@@ -4,7 +4,7 @@ import glob
 import os
 
 # Find the latest training log in docs directory
-log_files = glob.glob('../docs/training_log_*.csv')
+log_files = glob.glob('docs/training_log_*.csv')
 if not log_files:
     raise FileNotFoundError("No training log files found in ../docs/ directory")
 
