@@ -34,7 +34,7 @@ hyper_params = {
     'batch_size': 32,
     'n_epochs': 50,
     'learning_rate': 3e-4,
-    'n_samples': 40_000,
+    'n_samples': 0,
     # 'annealing_steps': 250 * 200, # kl annealing should start after around 50% of epochs, is computed in train method
     'beta': 0.3,
     'free_bits': 0.05,

@@ -62,9 +62,14 @@ if __name__ == '__main__':
     dataset_name = os.path.join(project_root, 'data', hparams.dataset_name)
     data = np.load(dataset_name)['data']
     print('Total amount of samples: ', data.shape)
-    data = data[:hparams.n_samples]
+    if hparams.n_samples < data.shape[0] and hparams.n_samples > 0:
+        data = data[:hparams.n_samples]
+    elif hparams.n_samples < 0:
+        pass
+        
+    
     print('Using ', data.shape[0])
-
+    exit()
     print('---'*5)
 
     # Shuffle data before splitting
