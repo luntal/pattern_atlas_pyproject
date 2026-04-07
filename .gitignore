@@ -81,5 +81,6 @@ venv.bak/
 # Project-specific
 models/
 outputs/
+docs/training_log_*.csv
 data/*.npz
 midifiles/

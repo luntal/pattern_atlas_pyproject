@@ -49,6 +49,12 @@ functions
 - transform midi to matrices 
 - transform tokens to midi
 
+### git
+- hard reset:
+  - git fetch origin
+  - git checkout dev (check that your are in the correct branch!)
+  - git reset --hard origin/dev
+
 ---
 ### training
 

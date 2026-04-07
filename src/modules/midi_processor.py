@@ -31,6 +31,147 @@ def get_randomness(value, strength=1, invert=False):
     return value
 
 
+def remap_drum_pitch_to_24(pitch):
+    """
+    Remap General MIDI and Roland drum pitches to 24-pitch range (36-59).
+    The output range directly corresponds to MIDI notes 36-59 (where 36=kick, 38=snare, 42=hi-hat, etc.)
+
+    This mapping prioritizes Roland drum kit layout and uses free slots for useful GM percussion.
+
+    Target range (MIDI note 36-59):
+    36: Kick
+    37: Snare X-Stick (Side Stick)
+    38: Snare (Head)
+    39: Hand Clap
+    40: Snare (Rim)
+    41: Low Floor Tom
+    42: Hi-Hat Closed
+    43: Tom 3 (Floor)
+    44: Hi-Hat Pedal
+    45: Tom 2
+    46: Hi-Hat Open
+    47: Tom 2 Rim
+    48: Tom 1
+    49: Crash 1
+    50: Tom 1 Rim
+    51: Ride (Bow)
+    52: Crash 2 Edge (Chinese)
+    53: Ride Bell
+    54: Tambourine
+    55: Crash 1 Edge (Splash)
+    56: Cowbell
+    57: Crash 2 (Bow)
+    58: Tom 3 Rim (Vibraslap)
+    59: Ride Edge
+
+    Args:
+        pitch (int): Input General MIDI or Roland drum pitch
+
+    Returns:
+        int: Remapped pitch in range 36-59, or None if pitch should be excluded
+    """
+    drum_map = {
+        # ROLAND DIRECT MAPPINGS (keep these as-is, they're already in 36-59 range)
+        36: 36,  # Kick
+        37: 37,  # Snare X-Stick / Side Stick
+        38: 38,  # Snare (Head) / Acoustic Snare
+        39: 39,  # Hand Clap
+        40: 40,  # Snare (Rim) / Electric Snare
+        41: 41,  # Low Floor Tom
+        42: 42,  # Hi-Hat Closed (Bow)
+        43: 43,  # Tom 3 (Head) / High Floor Tom
+        44: 44,  # Hi-Hat Pedal
+        45: 45,  # Tom 2 / Low Tom
+        46: 46,  # Hi-Hat Open (Bow)
+        47: 47,  # Tom 2 Rim / Low-Mid Tom
+        48: 48,  # Tom 1 / Hi-Mid Tom
+        49: 49,  # Crash 1 (Bow)
+        50: 50,  # Tom 1 Rim / High Tom
+        51: 51,  # Ride (Bow) / Ride Cymbal 1
+        52: 52,  # Crash 2 Edge / Chinese Cymbal
+        53: 53,  # Ride Bell
+        54: 54,  # Tambourine
+        55: 55,  # Crash 1 Edge / Splash Cymbal
+        56: 56,  # Cowbell
+        57: 57,  # Crash 2 (Bow) / Crash Cymbal 2
+        58: 58,  # Tom 3 Rim (originally Vibraslap in GM)
+        59: 59,  # Ride Edge / Ride Cymbal 2
+
+        # ROLAND NON-STANDARD MAPPINGS (map to equivalent positions)
+        22: 42,  # Roland: HH Closed (Edge) -> map to HH Closed
+        26: 46,  # Roland: HH Open (Edge) -> map to HH Open
+
+        # GM PITCHES BELOW 36 (map to equivalent slots)
+        35: 36,  # GM: Acoustic Bass Drum -> Kick
+
+        # GM PITCHES ABOVE 59 (map to meaningful slots in the 36-59 range)
+        60: 48,  # Hi Bongo -> Tom 1 (similar high pitched sound)
+        61: 45,  # Low Bongo -> Tom 2 (similar mid pitched sound)
+        62: 50,  # Mute Hi Conga -> Tom 1 Rim slot
+        63: 47,  # Open Hi Conga -> Tom 2 Rim slot
+        64: 41,  # Low Conga -> Low Floor Tom
+        65: 48,  # Hi Timbale -> Tom 1
+        66: 45,  # Low Timbale -> Tom 2
+        67: 56,  # Hi Agogo -> Cowbell (similar metallic sound)
+        68: 56,  # Low Agogo -> Cowbell
+        69: 54,  # Cabasa -> Tambourine (similar shaker sound)
+        70: 54,  # Maracas -> Tambourine
+        71: 39,  # Short Whistle -> Hand Clap slot
+        72: 39,  # Long Whistle -> Hand Clap slot
+        73: 56,  # Short Guiro -> Cowbell (scraping sound, use metallic slot)
+        74: 56,  # Long Guiro -> Cowbell
+        75: 37,  # Claves -> Side Stick (similar wood click)
+        76: 50,  # Hi Wood Block -> Tom 1 Rim slot
+        77: 47,  # Low Wood Block -> Tom 2 Rim slot
+        78: 58,  # Mute Cuica -> Tom 3 Rim slot (unusual sounds)
+        79: 58,  # Open Cuica -> Tom 3 Rim slot
+        80: 55,  # Mute Triangle -> Crash 1 Edge (metallic)
+        81: 55,  # Open Triangle -> Crash 1 Edge (metallic)
+    }
+
+    return drum_map.get(pitch, None)
+
+
+def get_drum_name_from_24_pitch(pitch):
+    """
+    Get a descriptive name for MIDI drum pitches in the range 36-59 (Roland mapping).
+
+    Args:
+        pitch (int): MIDI pitch in range 36-59
+
+    Returns:
+        str: Descriptive name of the drum sound
+    """
+    # Dictionary mapping MIDI note numbers 36-59 to drum names
+    drum_names = {
+        36: "Kick",
+        37: "Snare X-Stick",
+        38: "Snare (Head)",
+        39: "Hand Clap",
+        40: "Snare (Rim)",
+        41: "Low Floor Tom",
+        42: "Hi-Hat Closed",
+        43: "Tom 3 (Floor)",
+        44: "Hi-Hat Pedal",
+        45: "Tom 2",
+        46: "Hi-Hat Open",
+        47: "Tom 2 Rim",
+        48: "Tom 1",
+        49: "Crash 1",
+        50: "Tom 1 Rim",
+        51: "Ride (Bow)",
+        52: "Chinese Cymbal",
+        53: "Ride Bell",
+        54: "Tambourine",
+        55: "Splash Cymbal",
+        56: "Cowbell",
+        57: "Crash 2",
+        58: "Tom 3 Rim",
+        59: "Ride (Edge)",
+    }
+    return drum_names.get(pitch, f"Unknown ({pitch})")
+
+
 def randomize_pitches(notes, target_range=24):
     """
     Randomly remap the occurring pitches in a list of notes to values in 0..target_range-1
@@ -66,6 +207,48 @@ def randomize_pitches(notes, target_range=24):
 
     return randomized_notes
 
+
+def remap_pitches(notes):
+    """
+    Remap specific pitches according to a predefined mapping,
+    preserving other fields (step_idx, deviation, vel).
+
+    Remapping logic:
+    38 -> 39
+    36 -> 41
+    44 -> 54
+    53 -> 59
+    59 -> 53
+
+    Args:
+        notes (list of dict): each note is {'step_idx': int, 'deviation': int, 'pitch': int, 'vel': int}
+
+    Returns:
+        list of dict: same structure as input, only specified pitch values are remapped
+    """
+
+    # Define the pitch mapping
+    pitch_map = {
+        38: 39,
+        36: 41,
+        44: 54,
+        53: 59,
+        59: 53
+    }
+
+    # Apply the mapping to notes
+    remapped_notes = []
+    for note in notes:
+        new_note = note.copy()
+        # Only remap if the pitch is in the mapping, otherwise keep original
+        if note['pitch'] in pitch_map:
+            new_note['pitch'] = pitch_map[note['pitch']]
+        remapped_notes.append(new_note)
+
+    return remapped_notes
+
+
+
 class MidiProcessor:
     def __init__(self, hparams: SimpleNamespace):
         self.hparams = hparams
@@ -81,16 +264,31 @@ class MidiProcessor:
 
     def load(self, dataset_name, skip=0, take=0):
         path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data', dataset_name)
-        data = np.load(path)
-        if take <= 0: take = len(data['tensor'])
-        self.sequences = data['tensor'][skip:skip + take]
+        npz_data = np.load(path, allow_pickle=True)
+
+        # Support both old and new format
+        if 'data' in npz_data:
+            sequences_data = npz_data['data']
+        elif 'tensor' in npz_data:
+            sequences_data = npz_data['tensor']
+        else:
+            raise ValueError(f"Dataset {dataset_name} does not contain 'data' or 'tensor' key")
+
+        if take <= 0: take = len(sequences_data)
+        self.sequences = sequences_data[skip:skip + take]
+
+        # Load metadata if available
+        if 'metadata' in npz_data:
+            self.metadata = npz_data['metadata'][skip:skip + take].tolist()
+        else:
+            self.metadata = []
     
 
 
     def extract(
             self, midi_folder_path=None, skip=0, take=0, clip=False,
             randomize_velocity=0, qnt_strength=1, qnt_randomness=0, pitch_randomness=False,
-            roland=True):
+            roland=True, drums_only=False, filter_duplicates=True, remap=False):
         """
         Extracts sequences from MIDI files and save as list of tokens
         currently sequences are 2 bars long, 16th notes per bar
@@ -105,9 +303,25 @@ class MidiProcessor:
             print('No MIDI folder path provided. Exiting...')
             exit()
         abs_path = midi_folder_path
-        filenames = sorted([str(file) for file in Path(abs_path).rglob('*.mid*')])
+        all_filenames = sorted([str(file) for file in Path(abs_path).rglob('*.mid*')])
+
+        # Filter out duplicate files with numeric suffixes (e.g., .1.mid, .2.mid, .3.mid)
+        # Keep only original files without numeric suffixes
+        import re
+        filenames = []
+        duplicate_pattern = re.compile(r'\.\d+\.mid[i]?$')  # Matches .1.mid, .2.midi, .123.mid, etc.
+
+        skipped_duplicates = 0
+        for filename in all_filenames:
+            if duplicate_pattern.search(filename):
+                skipped_duplicates += 1
+                continue
+            filenames.append(filename)
+
         n_files = len(filenames)
         print('Number of Files: ', n_files)
+        if skipped_duplicates > 0:
+            print(f'Skipped {skipped_duplicates} duplicate files with numeric suffixes (.1.mid, .2.mid, etc.)')
         if skip < 0: skip = 0
         if skip >= n_files: skip = n_files - 1
         limit = n_files - skip
@@ -118,8 +332,22 @@ class MidiProcessor:
         metadata = []
         prev_n_notes = 0
         prev_last_note = 0
+        skipped_no_drums = 0
+        skipped_invalid = 0
+        failed_files = []
+
+
         for file_idx, filename in enumerate(selection):
-            midi_data = pretty_midi.PrettyMIDI(filename)
+            try:
+                midi_data = pretty_midi.PrettyMIDI(filename)
+            except Exception as e:
+                print('-------------------------------------')
+                print(f'FAILED: {filename}')
+                print(f'Error: {e}')
+                skipped_invalid += 1
+                failed_files.append((filename, str(e)))
+                continue
+
             print('-------------------------------------')
             print(filename)
             tempo_times, tempo_changes = midi_data.get_tempo_changes()
@@ -136,8 +364,23 @@ class MidiProcessor:
             current_qnt_strength = qnt_strength * (1-qnt_randomness)
             # print('c_qnt_strength', current_qnt_strength)
 
+            # Filter for drum tracks if drums_only is enabled
+            if drums_only:
+                drum_instruments = [inst for inst in midi_data.instruments if inst.is_drum]
+                if len(drum_instruments) == 0:
+                    print('No drum tracks found - skipping file')
+                    skipped_no_drums += 1
+                    continue
+                instruments_to_process = drum_instruments
+            else:
+                instruments_to_process = midi_data.instruments
 
-            for instrument in midi_data.instruments:
+            # Guard against empty instrument list
+            if len(instruments_to_process) == 0:
+                print('No instruments to process - skipping file')
+                continue
+
+            for instrument in instruments_to_process:
                 # print('instrument name: ', instrument.name)
                 width = self.hparams.width
                 height = self.hparams.height
@@ -148,6 +391,12 @@ class MidiProcessor:
                 seconds_per_16th_note = seconds_per_beat / 4
                 # print(seconds_per_16th_note)
                 sorted_midi_notes = sorted(instrument.notes, key=lambda note: note.start)
+
+                # Guard against empty note list
+                if len(sorted_midi_notes) == 0:
+                    print('No notes in instrument - skipping')
+                    continue
+
                 last_note_16th_index = int(sorted_midi_notes[-1].start // seconds_per_16th_note)
                 len_in_bars = np.ceil(last_note_16th_index / 16)
                 offset = False
@@ -187,9 +436,14 @@ class MidiProcessor:
 
                     pitch = note.pitch
 
+                    # Check if MIDI note is in valid range (0-127)
+                    if pitch < 0 or pitch > 127:
+                        print(f'Warning: Invalid MIDI pitch {pitch} - skipping note')
+                        continue
+
                     if clip:
                         # clip notes to range:
-                        if note.pitch < 36 or note.pitch > 36 + 24:
+                        if pitch < 36 or pitch > 36 + 24:
                             if roland:
                                 if pitch == 22:
                                     pitch = 53
@@ -234,6 +488,13 @@ class MidiProcessor:
                     #     deviation_center = self.hparams.n_timing // 2
                     #     deviation =  deviation_center + self.hparams.min_timing_token
 
+                    # Remap drum pitches when in drums_only mode
+                    if drums_only:
+                        remapped_pitch = remap_drum_pitch_to_24(pitch)
+                        if remapped_pitch is None:
+                            # Skip notes that don't map to our drum kit
+                            continue
+                        pitch = remapped_pitch
 
                     # wrap the pitches to 24 values with 36 as basis
                     pitch = pitch - 12
@@ -255,14 +516,36 @@ class MidiProcessor:
                 # randomize
                 if pitch_randomness:
                     note_list = randomize_pitches(note_list, self.hparams.n_pitch)
+                if remap:
+                    note_list = remap_pitches(note_list, self.hparams.n_pitch)
 
+                # Check if first bar is empty and remove it if so
+                if note_list:
+                    first_bar_length = 16  # 16th notes in one bar
+                    has_notes_in_first_bar = any(note['step_idx'] < first_bar_length for note in note_list)
+                    if not has_notes_in_first_bar:
+                        # Shift all notes back by one bar
+                        note_list = [
+                            {**note, 'step_idx': note['step_idx'] - first_bar_length}
+                            for note in note_list
+                        ]
+
+                    # Skip what is now the first bar if it has fewer than 6 notes (originally the second bar)
+                    notes_in_first_bar = sum(1 for note in note_list if note['step_idx'] < first_bar_length)
+                    if notes_in_first_bar < 6:
+                        # Remove notes in first bar and shift everything after
+                        note_list = [
+                            {**note, 'step_idx': note['step_idx'] - first_bar_length}
+                            for note in note_list
+                            if note['step_idx'] >= first_bar_length
+                        ]
 
                 # split the whole seq into sequences of 2 bars:
                 len_2bars = 2 * 16  # amount of 16th notes in 2 bars
                 qnt_notes_2bars = []
                 window = []
                 # handle the case of 2bars midi files, which have no 32nd step
-                if note_list[-1]['step_idx'] < len_2bars:
+                if note_list and note_list[-1]['step_idx'] < len_2bars:
                     new_note = {'step_idx': len_2bars, 'deviation': 0, 'pitch': 0, 'vel': 0}
                     note_list.append(new_note)
 
@@ -290,13 +573,11 @@ class MidiProcessor:
                 # print('split: ', qnt_notes_2bars)
                 # tokenize the 2 bar windows
                 ##############################################
-                prev_vel = 0
-                prev_deviation = self.hparams.n_timing // 2
-                prev_idx = 0
                 token_list = []
                 pattern_index = 0
                 for window in qnt_notes_2bars:
                     token_window = []
+                    prev_idx = 0  # Reset prev_idx for each window to avoid skipping notes
                     for step_idx, deviation, pitch, vel in window:
                         steps = step_idx - prev_idx
                         for _ in range(steps):
@@ -323,6 +604,54 @@ class MidiProcessor:
 
                 self.sequences = self.sequences + token_list
                 print('\nTotal Number of Sequences: ', len(self.sequences))
+
+        # Filter similar sequences if requested
+        sequences_before_filter = len(self.sequences)
+        if filter_duplicates and len(self.sequences) > 0:
+            print('\nFiltering similar sequences...')
+            unique_sequences = []
+            unique_metadata = []
+            seen_sequences = set()
+
+            for idx, seq in enumerate(self.sequences):
+                # Convert list to tuple so it can be hashed
+                seq_tuple = tuple(seq)
+                if seq_tuple not in seen_sequences:
+                    seen_sequences.add(seq_tuple)
+                    unique_sequences.append(seq)
+                    # Keep metadata at the same index
+                    if idx < len(self.metadata):
+                        unique_metadata.append(self.metadata[idx])
+
+            self.sequences = unique_sequences
+            self.metadata = unique_metadata
+            filtered_count = sequences_before_filter - len(self.sequences)
+            print(f'Filtered out {filtered_count} duplicate sequences')
+
+        # Print summary statistics
+        print('\n' + '=' * 50)
+        print(f'EXTRACTION SUMMARY')
+        if drums_only:
+            print(f'Mode: drums_only')
+        if filter_duplicates:
+            print(f'Filter duplicates: enabled')
+        print(f'Files in selection: {len(selection)}')
+        print(f'Files skipped (invalid/corrupt): {skipped_invalid}')
+        if drums_only:
+            print(f'Files skipped (no drums): {skipped_no_drums}')
+        print(f'Total sequences extracted: {sequences_before_filter}')
+        if filter_duplicates:
+            print(f'Sequences after filtering: {len(self.sequences)}')
+            print(f'Duplicates removed: {sequences_before_filter - len(self.sequences)}')
+        else:
+            print(f'Final sequences: {len(self.sequences)}')
+
+        if failed_files:
+            print(f'\nFailed files ({len(failed_files)}):')
+            for failed_file, error in failed_files:
+                print(f'  - {failed_file}')
+                print(f'    Error: {error}')
+        print('=' * 50)
 
 
     def convert_to_numpy(self):
@@ -361,14 +690,20 @@ class MidiProcessor:
         os.makedirs(data_folder, exist_ok=True)
         dataset_path = os.path.join(data_folder, dataset_name)
 
-        np.savez(dataset_path, tensor=padded_sequences)
-        print(f"Tensor saved to {dataset_path}")
+        # Convert metadata to numpy array for saving
+        metadata_array = np.array(self.metadata, dtype=object)
+
+        np.savez(dataset_path, data=padded_sequences, metadata=metadata_array)
+        print(f"Dataset saved to {dataset_path}")
+        print(f"  - Data shape: {padded_sequences.shape}")
+        print(f"  - Metadata entries: {len(metadata_array)}")
 
 
     def generate_matrices(self, print_to_terminal=False):
         """
-                Turn sequences into matrices
-                """
+        Turn sequences into matrices
+        resolution: (steps * n_timing) x pitch
+        """
         min_pitch_token = self.hparams.min_pitch_token
         min_vel_token = self.hparams.min_vel_token
         max_pitch_token = self.hparams.max_pitch_token
@@ -444,31 +779,97 @@ class MidiProcessor:
 
         n_timing = self.hparams.n_timing
 
+        # Count pitch occurrences in all sequences
+        pitch_counts = {}
+        for seq in self.sequences:
+            for token in seq:
+                if self.hparams.min_pitch_token <= token < self.hparams.max_pitch_token:
+                    pitch = token - self.hparams.min_pitch_token
+                    pitch_counts[pitch] = pitch_counts.get(pitch, 0) + 1
+
+        # Ensure all pitches have an entry, even if count is 0
+        for pitch in range(self.hparams.max_pitch_token - self.hparams.min_pitch_token):
+            if pitch not in pitch_counts:
+                pitch_counts[pitch] = 0
+
         # Visualize matrices
         mats = self.matrices
         x_positions = np.array([0, 4, 8, 12, 16, 20, 24, 28]) * n_timing
         width = self.hparams.width
         cols = width * n_timing
         beat = 4 * n_timing
-        fig, ax = plt.subplots()
+
+        # Create figure with subplots: main matrix and pitch histogram
+        fig = plt.figure(figsize=(14, 8))
+        gs = fig.add_gridspec(1, 2, width_ratios=[3, 1], wspace=0.3)
+        ax = fig.add_subplot(gs[0])
+        ax_hist = fig.add_subplot(gs[1])
+
         plt.subplots_adjust(bottom=0.25)
         current_matrix = 0
         # self.matrix = mats[current_matrix]
         im = ax.imshow(mats[current_matrix], cmap='Grays', interpolation='nearest', aspect='auto', vmin=0, vmax=1)
         ax.invert_yaxis()
-        ax.set_title(f"Matrix {current_matrix + 1} of {len(mats)}")
+
+        # Helper function to format title with metadata
+        def get_title(idx):
+            title = f"Matrix {idx + 1} of {len(mats)}"
+            if idx < len(self.metadata):
+                filename, bar_index = self.metadata[idx]
+                # Extract just the filename without path
+                import os
+                basename = os.path.basename(filename)
+                title += f"\n{basename} - Bar {bar_index * 2}"
+            return title
+
+        ax.set_title(get_title(current_matrix))
         ax.set_xticks(np.arange(-0.5, cols, n_timing), minor=True)
         matrix_width = mats[0].shape[1]
         ax.set_xticks(np.arange(0, matrix_width, 4*n_timing))  # Set tick positions
         ax.set_xticklabels(np.arange(0, matrix_width, 4*n_timing)//n_timing+1)
 
+        pitches = sorted(pitch_counts.keys())
+        # Convert pitch indices to MIDI note numbers for labels (pitch range 0-23 -> MIDI 36-59)
+        midi_notes = [p + 36 for p in pitches]
+        drum_names = [get_drum_name_from_24_pitch(mn) for mn in midi_notes]
+
         ax.set_yticks(np.arange(-0.5, mats[0].shape[0], 1), minor=True)
+        ax.set_yticks(np.arange(0, len(pitches)))
+        ax.set_yticklabels([f"{mn}: {dn}" for mn, dn in zip(midi_notes, drum_names)], fontsize=8)
         ax.grid(which='minor', color='gray', linestyle='-', linewidth=0.5)
         # plt.colorbar(im, ax=ax, label='Value (0=Black, 1=White)')
 
+        # Create pitch histogram
+        counts = [pitch_counts[p] for p in pitches]
+
+
+        # Create horizontal bar chart
+        ax_hist.barh(pitches, counts, color='steelblue', alpha=0.7)
+        ax_hist.set_yticks(pitches)
+        ax_hist.set_yticklabels([f"{mn}: {dn}" for mn, dn in zip(midi_notes, drum_names)], fontsize=8)
+        ax_hist.set_xlabel('Count', fontsize=10)
+        ax_hist.set_ylabel('Pitch (MIDI Note)', fontsize=10)
+        ax_hist.set_title('Pitch Occurrences\nin Dataset', fontsize=10)
+        ax_hist.grid(axis='x', alpha=0.3)
+        # Do not invert y-axis, keep natural order (low pitches at bottom)
+
+        # Add count labels on bars
+        for i, (pitch, count) in enumerate(zip(pitches, counts)):
+            ax_hist.text(count, pitch, f' {count}', va='center', fontsize=7)
+
+        # Add playback position line (initially hidden at x=-1)
+        playback_line = ax.axvline(x=0, color='red', linewidth=1.5, alpha=0.5, linestyle='-')
+
         # Slider for matrix scrolling
-        ax_slider = plt.axes([0.2, 0.1, 0.65, 0.03])
+        ax_slider = plt.axes([0.25, 0.1, 0.55, 0.03])
         slider = Slider(ax_slider, 'Matrix', 0, len(mats) - 1, valinit=0, valstep=1)
+
+        # Add previous/next buttons
+        from matplotlib.widgets import Button
+        ax_prev = plt.axes([0.05, 0.1, 0.09, 0.04])
+        ax_next = plt.axes([0.87, 0.1, 0.09, 0.04])
+        btn_prev = Button(ax_prev, 'Previous')
+        btn_next = Button(ax_next, 'Next')
         # Update function
         def update(val):
             idx = int(slider.val)
@@ -480,12 +881,40 @@ class MidiProcessor:
                 # print('seq: ', tokens)
 
 
-            ax.set_title(f"Matrix {idx + 1} of {len(mats)}")
+            ax.set_title(get_title(idx))
             fig.canvas.draw_idle()
+
+        # Button callback functions
+        def previous_matrix(event):
+            current_val = int(slider.val)
+            if current_val > 0:
+                slider.set_val(current_val - 1)
+
+        def next_matrix(event):
+            current_val = int(slider.val)
+            if current_val < len(mats) - 1:
+                slider.set_val(current_val + 1)
+
+        # Timer function to update playback position line
+        def update_playback_line():
+            if playback:
+                # Convert playback_position to x coordinate (accounting for n_timing)
+                x_pos = self.playback_position * n_timing
+                playback_line.set_xdata([x_pos, x_pos])
+                fig.canvas.draw_idle()
+            # Schedule next update
+            return True
+
         if playback:
-            self.playback()
+            self.playback(fig, update_playback_line)
+            # Set up timer to update playback line every 50ms
+            timer = fig.canvas.new_timer(interval=50)
+            timer.add_callback(update_playback_line)
+            timer.start()
 
         slider.on_changed(update)
+        btn_prev.on_clicked(previous_matrix)
+        btn_next.on_clicked(next_matrix)
         plt.show()
         if self.stop_event is not None:
             self.stop_event.set()
@@ -496,7 +925,7 @@ class MidiProcessor:
             self.stop_event.set()
             self.thread.join()
 
-    def playback(self):
+    def playback(self, fig=None, update_callback=None):
         port = mido.get_output_names()[0]
         bpm = 100
         beat_length = 60 / bpm
@@ -528,7 +957,7 @@ class MidiProcessor:
             delay = sixteenth_note_length
 
             for token in seq:
-                if counter > playback_position:
+                if counter > self.playback_position:
                     break
                 if token == self.hparams.eos_token or token == 0:
                     break
@@ -542,13 +971,13 @@ class MidiProcessor:
                     deviation *= (sixteenth_note_length / 2) * deviation_strength
                     delay = sixteenth_note_length + deviation
 
-                if counter == playback_position:
+                if counter == self.playback_position:
                     if self.hparams.min_pitch_token <= token < self.hparams.max_pitch_token:
                         pitch = token - self.hparams.min_pitch_token + 36
                         # output_port.send(mido.Message('note_on', note=pitch , velocity=int(vel)))
                         # play_single_note(pitch, int(vel), delay)
 
-                        # print(playback_position, pitch, int(vel), delay)
+                        # print(self.playback_position, pitch, int(vel), delay)
                         threading.Thread(target=play_single_note, args=(pitch, int(vel), delay)).start()
 
                 if token == self.hparams.step_token:
@@ -573,5 +1002,5 @@ class MidiProcessor:
 
 
 
-            playback_position += 1
-            playback_position %= self.hparams.width
+            self.playback_position += 1
+            self.playback_position %= self.hparams.width
