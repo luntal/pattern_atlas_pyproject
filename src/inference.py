@@ -19,9 +19,9 @@ import os
 spherical interpolation between 2 latent vectors.
 """
 
-##########################
+############################
 # Load model with metadata
-##########################
+############################
 # ONNX = True
 ONNX = False
 # Load the saved data

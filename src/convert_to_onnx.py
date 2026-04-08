@@ -7,9 +7,21 @@ from modules.utilities import seq2mat
 from modules.midi_processor import MidiProcessor
 import onnx
 from types import SimpleNamespace
+import glob
+import os
 
-# Load the saved data
-checkpoint = torch.load('../models/model_cache.pt', map_location=torch.device('cpu'))
+# Find the latest model in the models directory
+model_files = glob.glob('models/model_*.pt')
+if not model_files:
+    raise FileNotFoundError("No model files found in models/ directory")
+latest_model = max(model_files, key=os.path.getmtime)
+print(f'Loading model: {latest_model}')
+# model_name = os.path.basename(latest_model)
+# change the model name to have onnx suffix
+onnx_encoder_name = latest_model.replace('.pt', '_encoder.onnx')
+onnx_decoder_name = latest_model.replace('.pt', '_decoder.onnx')
+
+checkpoint = torch.load(latest_model, map_location='cpu')
 # checkpoint = torch.load('model.pt')
 model_state_dict = checkpoint['model_state_dict']
 hparams_dict = checkpoint['hparams']
@@ -38,7 +50,7 @@ dummy_enc_input = torch.zeros((1, hparams.max_seq_len), dtype=torch.long)
 torch.onnx.export(
     model.encoder,
     (dummy_enc_input, dummy_enc_input),
-    "../models/encoder-test.onnx",
+    onnx_encoder_name,
     input_names=['input_tokens', 'beat_tokens'],
     output_names=['mu', 'logvar'],
     dynamic_axes={
@@ -56,7 +68,7 @@ dummy_z = torch.randn(1, hparams.latent_dim) # Latent vector
 torch.onnx.export(
     model.decoder,
     (dummy_dec_tokens, dummy_z, dummy_dec_tokens),
-    "../models/decoder-test.onnx",
+    onnx_decoder_name,
     input_names=['tgt_tokens', 'latent_z', 'beat_tokens'],
     output_names=['logits'],
     dynamic_axes={
@@ -71,5 +83,5 @@ print("Modules exported. sample() methods were naturally excluded.")
 
 
 # test load
-# onnx_model = onnx.load("model.onnx")
+# onnx_model = onnx.load(onnx_encoder_name)
 # onnx.checker.check_model(onnx_model)

@@ -69,7 +69,6 @@ if __name__ == '__main__':
         
     
     print('Using ', data.shape[0])
-    exit()
     print('---'*5)
 
     # Shuffle data before splitting

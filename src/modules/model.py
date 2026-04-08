@@ -417,6 +417,7 @@ def train_vae(
         batch_iteration = 0
         prev_time = time.time()
         perplexity = 1000
+        print('-' * 100)
         for batch in dataloader:
             # Compute annealing factor
             if total_steps < annealing_steps:
@@ -575,7 +576,7 @@ def train_vae(
                 save_cache
             ])
 
-        print('-' * 100)
+        
 
     # Save the best model at the end of training
     if best_model_state is not None:
