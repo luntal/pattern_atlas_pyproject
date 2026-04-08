@@ -288,7 +288,7 @@ class MidiProcessor:
     def extract(
             self, midi_folder_path=None, skip=0, take=0, clip=False,
             randomize_velocity=0, qnt_strength=1, qnt_randomness=0, pitch_randomness=False,
-            roland=True, drums_only=False, filter_duplicates=True, remap=False):
+            roland=True, drums_only=False, filter_duplicates=True, remap=False, jump=1):
         """
         Extracts sequences from MIDI files and save as list of tokens
         currently sequences are 2 bars long, 16th notes per bar
@@ -304,6 +304,8 @@ class MidiProcessor:
             exit()
         abs_path = midi_folder_path
         all_filenames = sorted([str(file) for file in Path(abs_path).rglob('*.mid*')])
+        print(f'Found {len(all_filenames)} MIDI files in {abs_path}')
+
 
         # Filter out duplicate files with numeric suffixes (e.g., .1.mid, .2.mid, .3.mid)
         # Keep only original files without numeric suffixes
@@ -571,11 +573,13 @@ class MidiProcessor:
                     #     deviation = 0 # avoid shifting notes before bar start!
                     window.append((step_idx % len_2bars, deviation, pitch, vel))
                 # print('split: ', qnt_notes_2bars)
+                # Apply jump filter: keep only every jump-th window
+                filtered_windows = qnt_notes_2bars[::jump]
                 # tokenize the 2 bar windows
                 ##############################################
                 token_list = []
                 pattern_index = 0
-                for window in qnt_notes_2bars:
+                for window in filtered_windows:
                     token_window = []
                     prev_idx = 0  # Reset prev_idx for each window to avoid skipping notes
                     for step_idx, deviation, pitch, vel in window:

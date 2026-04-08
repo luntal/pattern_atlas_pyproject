@@ -1,11 +1,17 @@
 import numpy as np
+from pathlib import Path
 from hparams import hparams
+
+DATA_DIR = Path(__file__).resolve().parent.parent / 'data'
 
 # List of .npz files to merge
 files_to_merge = [
-    '../data/dataset-groove.npz',
-    '../data/dataset-groove-rnd.npz',
-    '../data/dataset-lakh.npz'
+    DATA_DIR / 'dataset-groove.npz',
+    DATA_DIR / 'dataset-groove-rnd.npz',
+    DATA_DIR / 'dataset-lakh-all.npz',
+    DATA_DIR / 'dataset-lakh-all-augmented.npz',
+    DATA_DIR / 'dataset-groove-augmented.npz',
+    DATA_DIR / 'dataset-groove-rnd-augmented-50p.npz',
 ]
 
 # Load all datasets
@@ -15,16 +21,12 @@ all_metadata = []
 for file_path in files_to_merge:
     npz_file = np.load(file_path, allow_pickle=True)
     data = npz_file['data']
-    if data.shape[0] > 20000:
-        data = data[:21000]
     all_data.append(data)
     print(f"Loaded {file_path}: shape {data.shape}")
 
     # Load metadata if it exists
     if 'metadata' in npz_file:
         metadata = npz_file['metadata']
-        if metadata.shape[0] > 20000:
-            metadata = metadata[:21000]
         all_metadata.append(metadata)
         print(f"  Metadata entries: {len(metadata)}")
     else:
@@ -42,7 +44,7 @@ else:
     merged_metadata = None
 
 # Save merged dataset
-save_path = '../data/dataset-merged.npz'
+save_path = DATA_DIR / 'dataset-merged-aug.npz'
 if merged_metadata is not None:
     np.savez(save_path, data=merged_data, metadata=merged_metadata)
 else:

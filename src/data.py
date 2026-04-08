@@ -17,7 +17,7 @@ if __name__ == "__main__":
     scores = '/Users/alexanderlunt/Nextcloud/KI-Labor/Forschung KI-Labor/_Trainingsdaten/MIDI-Files/scores'
     piano = '/Users/alexanderlunt/Programmierung/datasets/piano'
     lakh = '/Users/alexanderlunt/Nextcloud/KI-Labor/Forschung KI-Labor/_Trainingsdaten/MIDI-Files/LakhMidiDataset-Clean'
-    abs_path = groove
+    abs_path = lakh
 
     # Initialize processor
     processor = MidiProcessor(hparams)
@@ -25,7 +25,7 @@ if __name__ == "__main__":
 
     tasks = ['select_folder', 'extract', 'only_visualize']
     task = tasks[2]
-    dataset_name = 'dataset-groove-rnd.npz'
+    dataset_name = 'dataset-lakh-augmented.npz' 
 
     if task == 'select_folder':
         folder = select_folder()
@@ -38,13 +38,13 @@ if __name__ == "__main__":
 
     if task == 'extract':
         # Set drums_only=True when extracting from multi-instrument datasets like Lakh
-        processor.extract(midi_folder_path=abs_path, skip=0, take=0, clip=True,
-                          randomize_velocity=0, qnt_strength=0.7, qnt_randomness=0.5, pitch_randomness=True,
-                          drums_only=False, filter_duplicates=False)
+        processor.extract(midi_folder_path=abs_path, skip=0, take=0, clip=False,
+                          randomize_velocity=0, qnt_strength=0, qnt_randomness=0, pitch_randomness=False,
+                          drums_only=True, filter_duplicates=True, jump=40)
         processor.save(dataset_name=dataset_name)
 
     elif task == 'only_visualize':
-        processor.load(dataset_name, take=0, skip=0)
+        processor.load(dataset_name, take=1000, skip=0)
         print('Data shape: ', processor.sequences.shape)
         print('Data size: ', processor.sequences.nbytes / (1024 * 1024), 'MB')
         processor.generate_matrices()

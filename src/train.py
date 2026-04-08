@@ -66,6 +66,8 @@ if __name__ == '__main__':
         data = data[:hparams.n_samples]
     elif hparams.n_samples < 0:
         pass
+    elif hparams.n_samples == 0:
+        hparams.n_samples = data.shape[0]
         
     
     print('Using ', data.shape[0])
@@ -85,8 +87,25 @@ if __name__ == '__main__':
     print(f'Validation samples: {len(val_data)}')
     print('---'*5)
 
-    loader = DataLoader(train_data, batch_size=BATCH, shuffle=True)
-    val_loader = DataLoader(val_data, batch_size=BATCH, shuffle=False)
+    # DataLoader with worker tuning for efficient data loading on H100
+    loader = DataLoader(
+        train_data,
+        batch_size=BATCH,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2
+    )
+    val_loader = DataLoader(
+        val_data,
+        batch_size=BATCH,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2
+    )
     scheduler = None
 
     if retrain:
