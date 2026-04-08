@@ -26,9 +26,9 @@ spherical interpolation between 2 latent vectors.
 ONNX = False
 # Load the saved data
 # Find the latest model in the models directory
-model_files = glob.glob('../models/model_*.pt')
+model_files = glob.glob('models/model_*.pt')
 if not model_files:
-    raise FileNotFoundError("No model files found in ../models/ directory")
+    raise FileNotFoundError("No model files found in models/ directory")
 latest_model = max(model_files, key=os.path.getmtime)
 print(f'Loading model: {latest_model}')
 
@@ -70,7 +70,7 @@ seq2 = 5
 offset = 0
 n_examples = 1
 interpolation_steps = 20
-data = np.load('../data/dataset-groove.npz')['data']
+data = np.load('data/dataset-groove.npz')['data']
 # print(data['tensor'])
 print('data shape: ', data.shape)
 # maxi = data.shape[0]

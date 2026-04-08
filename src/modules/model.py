@@ -317,6 +317,7 @@ def train_vae(
 
     # Initialize CSV logging and generate model name with timestamp
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    print(f"Training timestamp: {timestamp}")
     log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', 'docs')
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f'training_log_{timestamp}.csv')
@@ -429,7 +430,7 @@ def train_vae(
                     # MuseMorphose-inspired Sigmoid Annealing
                     # This starts slow, then rises quickly around 75% of annealing_steps
                     x_prop = (total_steps / annealing_steps)
-                    annealing_factor = 1.0 / (1.0 + np.exp(-10 * (x_prop - 0.75)))
+                    annealing_factor = 1.0 / (1.0 + np.exp(-10 * (x_prop - 0.5)))
 
             else:
                 annealing_factor = 1.0
