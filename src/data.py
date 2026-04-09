@@ -25,7 +25,7 @@ if __name__ == "__main__":
 
     tasks = ['select_folder', 'extract', 'only_visualize']
     task = tasks[2]
-    dataset_name = 'dataset-groove-augmented.npz' 
+    dataset_name = 'dataset-merged-aug.npz' 
 
     if task == 'select_folder':
         folder = select_folder()
@@ -40,11 +40,11 @@ if __name__ == "__main__":
         # Set drums_only=True when extracting from multi-instrument datasets like Lakh
         processor.extract(midi_folder_path=abs_path, skip=0, take=0, clip=False,
                           randomize_velocity=0, qnt_strength=0, qnt_randomness=0, pitch_randomness=False,
-                          drums_only=True, filter_duplicates=True, jump=40)
+                          drums_only=True, filter_duplicates=True, jump=15)
         processor.save(dataset_name=dataset_name)
 
     elif task == 'only_visualize':
-        processor.load(dataset_name, take=1000, skip=0)
+        processor.load(dataset_name, take=0, skip=0)
         print('Data shape: ', processor.sequences.shape)
         print('Data size: ', processor.sequences.nbytes / (1024 * 1024), 'MB')
         processor.generate_matrices()

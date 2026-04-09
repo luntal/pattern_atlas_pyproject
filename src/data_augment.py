@@ -313,6 +313,6 @@ def augment_dataset(
 
 if __name__ == "__main__":
 	# Edit these as needed.
-	INPUT_FILE = "dataset-groove.npz"
-	OUTPUT_FILE = "dataset-groove-augmented.npz"
+	INPUT_FILE = "dataset-lakh-all-j15.npz"
+	OUTPUT_FILE = "dataset-lakh-all-j15-augmented.npz"
 	augment_dataset(input_filename=INPUT_FILE, output_filename=OUTPUT_FILE, keep_percentage=100)

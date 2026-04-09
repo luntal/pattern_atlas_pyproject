@@ -29,15 +29,15 @@ for i in range(len(keys)):
 
 hyper_params = {
     # training
-    'dataset_name': 'dataset-merged.npz',
+    'dataset_name': 'dataset-merged-aug.npz',
     'validation_split': 0.1,
-    'batch_size': 256,
-    'n_epochs': 50,
+    'batch_size': 64,
+    'n_epochs': 100,
     'learning_rate': 4e-4,
     'n_samples': 0,
     # 'annealing_steps': 250 * 200, # kl annealing should start after around 50% of epochs, is computed in train method
     'beta': 0.3,
-    'free_bits': 0.2,
+    'free_bits': 0.15,
     'global_step': 0,
     'global_epoch': 0, # num of trained epochs
     'kl_annealing_step': 0,
@@ -54,7 +54,7 @@ hyper_params = {
 
     'd_model': d_base, # embedding dim and model dimension
     'n_heads': 4,
-    'n_layers': 4,
+    'n_layers': 6,
     'ff_dim': d_base * 2,
     'dropout': 0.02,
     'max_seq_len': 256,

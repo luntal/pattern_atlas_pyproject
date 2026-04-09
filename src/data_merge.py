@@ -8,11 +8,12 @@ DATA_DIR = Path(__file__).resolve().parent.parent / 'data'
 files_to_merge = [
     DATA_DIR / 'dataset-groove.npz',
     DATA_DIR / 'dataset-groove-rnd.npz',
-    DATA_DIR / 'dataset-lakh-all.npz',
-    DATA_DIR / 'dataset-lakh-all-augmented.npz',
+    DATA_DIR / 'dataset-lakh-all-j15.npz',
+    DATA_DIR / 'dataset-lakh-all-j15-augmented.npz',
     DATA_DIR / 'dataset-groove-augmented.npz',
-    DATA_DIR / 'dataset-groove-rnd-augmented-50p.npz',
 ]
+
+save_path = DATA_DIR / 'dataset-merged-aug.npz'
 
 # Load all datasets
 all_data = []
@@ -44,7 +45,6 @@ else:
     merged_metadata = None
 
 # Save merged dataset
-save_path = DATA_DIR / 'dataset-merged-aug.npz'
 if merged_metadata is not None:
     np.savez(save_path, data=merged_data, metadata=merged_metadata)
 else:

@@ -336,7 +336,9 @@ class MidiProcessor:
         prev_last_note = 0
         skipped_no_drums = 0
         skipped_invalid = 0
+        skipped_time_signature = 0
         failed_files = []
+        allowed_time_signatures = {(4, 4), (2, 4), (2, 2)}
 
 
         for file_idx, filename in enumerate(selection):
@@ -352,6 +354,21 @@ class MidiProcessor:
 
             print('-------------------------------------')
             print(filename)
+
+            # Only accept files with allowed time signatures.
+            # If no explicit signature exists, MIDI convention implies 4/4.
+            time_signatures = midi_data.time_signature_changes
+            if len(time_signatures) == 0:
+                signatures_in_file = {(4, 4)}
+            else:
+                signatures_in_file = {(ts.numerator, ts.denominator) for ts in time_signatures}
+
+            if not signatures_in_file.issubset(allowed_time_signatures):
+                unsupported = sorted(signatures_in_file)
+                print(f'Unsupported time signature(s) {unsupported} - skipping file')
+                skipped_time_signature += 1
+                continue
+
             tempo_times, tempo_changes = midi_data.get_tempo_changes()
             # print(f"Tempo changes: {list(tempo_changes)} at times: {list(tempo_times)}")
             if len(tempo_changes) == 0:
@@ -497,7 +514,9 @@ class MidiProcessor:
                             # Skip notes that don't map to our drum kit
                             continue
                         pitch = remapped_pitch
-
+                        if pitch < 36 or pitch > 36 + 24:
+                            print(f'Warning: MIDI pitch {pitch} out of expected range after remapping - skipping note')
+                            exit()
                     # wrap the pitches to 24 values with 36 as basis
                     pitch = pitch - 12
                     pitch = pitch % 24
@@ -641,6 +660,7 @@ class MidiProcessor:
             print(f'Filter duplicates: enabled')
         print(f'Files in selection: {len(selection)}')
         print(f'Files skipped (invalid/corrupt): {skipped_invalid}')
+        print(f'Files skipped (time signature): {skipped_time_signature}')
         if drums_only:
             print(f'Files skipped (no drums): {skipped_no_drums}')
         print(f'Total sequences extracted: {sequences_before_filter}')
