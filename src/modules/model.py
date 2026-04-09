@@ -274,10 +274,11 @@ def vae_loss(logits, targets, mu, logvar, beta=1.0, free_bits=0.0, pad_token=0):
     logits_flat = logits.reshape(-1, logits.size(-1))
     targets_flat = targets.reshape(-1)
     mask = (targets_flat != pad_token)
-    token_count = mask.sum().clamp(min=1).to(logits.device, dtype=logits.dtype)
+    token_count = mask.sum().clamp(min=1)  # int64, safe from float16 overflow
+    token_count_f = token_count.to(logits.device, dtype=logits.dtype)  # cast only for loss division
     ce_sum = F.cross_entropy(logits_flat, targets_flat, ignore_index=pad_token, reduction="sum")
     # loss per token
-    recon = ce_sum / token_count
+    recon = ce_sum / token_count_f
 
     # kl per sample
     kl_per_sample = -0.5 * torch.sum(
@@ -302,7 +303,7 @@ def vae_loss(logits, targets, mu, logvar, beta=1.0, free_bits=0.0, pad_token=0):
     # )
     perplexity = torch.exp(torch.clamp(recon, max=20)).item()
 
-    return total_loss, recon, kl, perplexity, token_count
+    return total_loss, recon, kl, perplexity, token_count.float()
 
 def train_vae(
         model: TransformerVAE, dataloader: DataLoader, _hparams: SimpleNamespace,

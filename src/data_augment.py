@@ -12,6 +12,10 @@ Augmentation types:
 - Global velocity + microshift variants: create additional versions of each
 	generated sequence using one shared velocity scale and one shared timing
 	shift across the full sequence.
+
+Output balancing:
+- The saved dataset contains only augmented sequences.
+- Augmented output is capped to the original dataset size.
 """
 
 from pathlib import Path
@@ -213,6 +217,8 @@ def augment_dataset(
 		raise ValueError("keep_percentage must be between 0 and 100.")
 
 	data, metadata = _load_npz_from_data(input_filename)
+	original_sequences: List[List[int]] = []
+	original_meta: List[object] = []
 	augmented_sequences: List[List[int]] = []
 	augmented_meta: List[object] = []
 	n_total = len(data)
@@ -225,12 +231,14 @@ def augment_dataset(
 			last_progress_time = now
 
 		base_seq = _trim_sequence(seq)
+		raw_meta = metadata[idx] if metadata is not None and idx < len(metadata) else None
+		filename, bar_index = _normalize_metadata_entry(raw_meta, idx)
+
+		original_sequences.append(base_seq)
+		original_meta.append((filename, bar_index))
 
 		generated = _random_note_removals(base_seq)
 		generated.extend(_pitch_line_removals(base_seq))
-
-		raw_meta = metadata[idx] if metadata is not None and idx < len(metadata) else None
-		filename, bar_index = _normalize_metadata_entry(raw_meta, idx)
 
 		for gen_seq in generated:
 			augmented_sequences.append(gen_seq)
@@ -250,25 +258,40 @@ def augment_dataset(
 
 	print(f"Processed {n_total}/{n_total} source files")
 
-	unique_sequences = []
-	unique_meta = []
+	unique_aug_sequences = []
+	unique_aug_meta = []
 	seen = set()
 	for i, seq in enumerate(augmented_sequences):
 		key = tuple(seq)
 		if key in seen:
 			continue
 		seen.add(key)
-		unique_sequences.append(seq)
-		unique_meta.append(augmented_meta[i])
+		unique_aug_sequences.append(seq)
+		unique_aug_meta.append(augmented_meta[i])
+
+	if not original_sequences:
+		raise ValueError("No original sequences were loaded.")
+
+	# Keep only augmented data, capped to original dataset size.
+	aug_count = min(len(original_sequences), len(unique_aug_sequences))
+	if aug_count == 0:
+		raise ValueError("Unable to build augmented dataset because no unique augmentations were generated.")
+
+	aug_indices = random.sample(range(len(unique_aug_sequences)), aug_count)
+	selected_aug_sequences = [unique_aug_sequences[i] for i in aug_indices]
+	selected_aug_meta = [unique_aug_meta[i] for i in aug_indices]
 
 	if keep_percentage < 100:
-		n_keep = int(round(len(unique_sequences) * (keep_percentage / 100.0)))
-		n_keep = max(1, min(n_keep, len(unique_sequences))) if unique_sequences else 0
-		selected_indices = random.sample(range(len(unique_sequences)), n_keep)
-		unique_sequences = [unique_sequences[i] for i in selected_indices]
-		unique_meta = [unique_meta[i] for i in selected_indices]
+		n_keep = int(round(aug_count * (keep_percentage / 100.0)))
+		n_keep = max(1, min(n_keep, aug_count))
+		keep_indices = random.sample(range(aug_count), n_keep)
+		selected_aug_sequences = [selected_aug_sequences[i] for i in keep_indices]
+		selected_aug_meta = [selected_aug_meta[i] for i in keep_indices]
 
-	padded = _to_padded_array(unique_sequences, hparams.max_seq_len)
+	final_sequences = selected_aug_sequences
+	final_meta = selected_aug_meta
+
+	padded = _to_padded_array(final_sequences, hparams.max_seq_len)
 
 	if not output_filename.endswith(".npz"):
 		output_filename += ".npz"
@@ -277,10 +300,12 @@ def augment_dataset(
 	np.savez(
 		output_path,
 		data=padded,
-		metadata=np.array(unique_meta, dtype=object),
+		metadata=np.array(final_meta, dtype=object),
 	)
 	print(f"Saved augmented dataset to {output_path}")
-	print(f"Sequences: {len(unique_sequences)}")
+	print(f"Sequences: {len(final_sequences)}")
+	print("Saved only augmented sequences (originals are excluded).")
+	print(f"Original dataset size cap: {len(original_sequences)}")
 	if keep_percentage < 100:
 		print(f"Keep percentage: {keep_percentage}%")
 	print(f"Shape: {padded.shape}")
@@ -288,6 +313,6 @@ def augment_dataset(
 
 if __name__ == "__main__":
 	# Edit these as needed.
-	INPUT_FILE = "dataset-lakh-all.npz"
-	OUTPUT_FILE = "dataset-lakh-augmented.npz"
+	INPUT_FILE = "dataset-groove.npz"
+	OUTPUT_FILE = "dataset-groove-augmented.npz"
 	augment_dataset(input_filename=INPUT_FILE, output_filename=OUTPUT_FILE, keep_percentage=100)

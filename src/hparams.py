@@ -31,19 +31,19 @@ hyper_params = {
     # training
     'dataset_name': 'dataset-merged.npz',
     'validation_split': 0.1,
-    'batch_size': 32,
+    'batch_size': 256,
     'n_epochs': 50,
-    'learning_rate': 3e-4,
+    'learning_rate': 4e-4,
     'n_samples': 0,
     # 'annealing_steps': 250 * 200, # kl annealing should start after around 50% of epochs, is computed in train method
     'beta': 0.3,
-    'free_bits': 0.05,
+    'free_bits': 0.2,
     'global_step': 0,
     'global_epoch': 0, # num of trained epochs
     'kl_annealing_step': 0,
     'current_lr': 0.0,
 
-    'latent_dim': d_base // 2,
+    'latent_dim': d_base,
 
     'steps_per_bar': 32,
     'total_steps': 32 * 2,
@@ -56,7 +56,7 @@ hyper_params = {
     'n_heads': 4,
     'n_layers': 4,
     'ff_dim': d_base * 2,
-    'dropout': 0.1,
+    'dropout': 0.02,
     'max_seq_len': 256,
 
     # tokens:

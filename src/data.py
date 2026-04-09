@@ -25,7 +25,7 @@ if __name__ == "__main__":
 
     tasks = ['select_folder', 'extract', 'only_visualize']
     task = tasks[2]
-    dataset_name = 'dataset-lakh-augmented.npz' 
+    dataset_name = 'dataset-groove-augmented.npz' 
 
     if task == 'select_folder':
         folder = select_folder()
