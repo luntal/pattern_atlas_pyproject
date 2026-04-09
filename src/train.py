@@ -17,15 +17,25 @@ if __name__ == '__main__':
 
     if retrain:
         # Find the latest model in the models directory
-        model_files = glob.glob('../models/model_*.pt')
+        model_files = glob.glob('models/model_*.pt')
         if not model_files:
-            raise FileNotFoundError("No model files found in ../models/ directory")
+            raise FileNotFoundError("No model files found in models/ directory")
         latest_model = max(model_files, key=os.path.getmtime)
         print(f'Loading checkpoint from: {latest_model}')
 
         checkpoint = torch.load(latest_model)
         model_state_dict = checkpoint['model_state_dict']
         hparams = SimpleNamespace(**checkpoint['hparams'])
+        checkpoint_optimizer_state = checkpoint.get('optimizer_state_dict', getattr(hparams, 'optimizer_state_dict', None))
+        checkpoint_scheduler_state = checkpoint.get('scheduler_state_dict', getattr(hparams, 'scheduler_state_dict', None))
+        checkpoint_current_lr = getattr(hparams, 'current_lr', None)
+
+        # Keep these on hparams for downstream compatibility.
+        hparams.optimizer_state_dict = checkpoint_optimizer_state
+        hparams.scheduler_state_dict = checkpoint_scheduler_state
+        if checkpoint_current_lr is not None:
+            hparams.current_lr = checkpoint_current_lr
+
         hparams.annealing_steps = 0
         # hparams.n_epochs = 10
         hparams.learning_rate = 1e-3
@@ -109,8 +119,18 @@ if __name__ == '__main__':
     scheduler = None
 
     if retrain:
-        optim.load_state_dict(hparams.optimizer_state_dict)
-        optim.param_groups[0]['lr'] = hparams.current_lr
+        if hparams.optimizer_state_dict is not None:
+            optim.load_state_dict(hparams.optimizer_state_dict)
+        if hparams.current_lr is not None:
+            optim.param_groups[0]['lr'] = hparams.current_lr
+        if hparams.scheduler_state_dict is not None:
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optim,
+                max_lr=hparams.learning_rate,
+                steps_per_epoch=len(loader),
+                epochs=hparams.n_epochs
+            )
+            scheduler.load_state_dict(hparams.scheduler_state_dict)
     else:
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optim,
