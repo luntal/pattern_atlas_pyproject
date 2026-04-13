@@ -2,17 +2,19 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import glob
 import os
+from modules.branch_paths import latest_in_branch, safe_branch_name, get_current_branch
 
-# Find the latest training log in docs directory
-log_files = glob.glob('docs/training_log_*.csv')
-if not log_files:
-    raise FileNotFoundError("No training log files found in ../docs/ directory")
+# Find the latest training log in branch-specific docs directory
+branch_name = safe_branch_name(get_current_branch())
+latest_log = latest_in_branch('docs', 'training_log_*.csv')
+if latest_log is None:
+    print(f"Warning: No training log files found in docs/{branch_name}/")
+    raise SystemExit(0)
 
-latest_log = max(log_files, key=os.path.getmtime)
 print(f'Loading training log: {latest_log}')
 
 # Load the CSV file
-df = pd.read_csv(latest_log)
+df = pd.read_csv(str(latest_log))
 print(f'Total epochs: {len(df)}')
 print(df.head())
 

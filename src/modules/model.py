@@ -10,6 +10,7 @@ import onnx
 import onnxruntime
 import math
 import csv
+from modules.branch_paths import branch_dir, safe_branch_name, get_current_branch
 from datetime import datetime
 import os
 import shutil
@@ -311,7 +312,8 @@ def train_vae(
     epochs = _hparams.n_epochs
     # annealing_steps = _hparams.annealing_steps
     # calculate annealing steps based on number of samples, should be approx. 50%
-    annealing_steps = len(dataloader) * (epochs // 2)
+    annealing_steps_norm = min(max(0, _hparams.annealing_steps_norm), 1)
+    annealing_steps = len(dataloader) * (epochs ** annealing_steps_norm)
     beta = _hparams.beta
     free_bits = _hparams.free_bits
     loss_history = []
@@ -319,14 +321,14 @@ def train_vae(
     # Initialize CSV logging and generate model name with timestamp
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     print(f"Training timestamp: {timestamp}")
-    log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', 'docs')
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f'training_log_{timestamp}.csv')
+    branch_name = safe_branch_name(get_current_branch())
+    log_dir = branch_dir('docs')
+    log_file = os.path.join(str(log_dir), f'training_log_{timestamp}.csv')
 
     # Generate model name with timestamp
-    model_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', 'models')
-    os.makedirs(model_dir, exist_ok=True)
-    model_name = os.path.join(model_dir, f'model_{timestamp}.pt')
+    model_dir = branch_dir('models')
+    model_name = os.path.join(str(model_dir), f'model_{timestamp}.pt')
+    print(f"Using branch-specific output folders for branch '{branch_name}'")
 
     # Configure performance optimizations based on device
     use_amp = False  # Automatic Mixed Precision
@@ -408,7 +410,8 @@ def train_vae(
 
 
 
-    total_steps = 0 + _hparams.global_step
+    global_step = 0 + _hparams.global_step
+    train_step = 0
 
     train_start_time = time.time()
     prev_epoch_time = time.time()
@@ -421,22 +424,23 @@ def train_vae(
         print('-' * 100)
         for batch in dataloader:
             # Compute annealing factor
-            if total_steps < annealing_steps:
+            if train_step < annealing_steps:
                 # Linear schedule from 0 to 1
                 if annealing_style == 'linear':
-                    annealing_factor = total_steps / annealing_steps
+                    annealing_factor = train_step / annealing_steps
 
                 # Sigmoid schedule - smoother transition
-                # annealing_factor = 1.0 / (1.0 + np.exp(-10 * (total_steps / annealing_steps - 0.5)))
+                # annealing_factor = 1.0 / (1.0 + np.exp(-10 * (train_step / annealing_steps - 0.5)))
                 if annealing_style == 'sigmoid':
                     # MuseMorphose-inspired Sigmoid Annealing
                     # This starts slow, then rises quickly around 75% of annealing_steps
-                    x_prop = (total_steps / annealing_steps)
+                    x_prop = (train_step / annealing_steps)
                     annealing_factor = 1.0 / (1.0 + np.exp(-10 * (x_prop - 0.5)))
 
             else:
                 annealing_factor = 1.0
-            total_steps += 1
+            global_step += 1
+            train_step += 1
             weighted_beta = beta * annealing_factor
             time_elapsed = time.time() - prev_time
             prev_time = time.time()
@@ -511,8 +515,8 @@ def train_vae(
         epoch_time = now - prev_epoch_time
         prev_epoch_time = now
         current_lr = optimizer.param_groups[0]['lr']
-        _hparams.global_step = total_steps
-        _hparams.global_epoch = total_steps // n_batches
+        _hparams.global_step = global_step
+        _hparams.global_epoch = global_step // n_batches
         _hparams.current_lr = current_lr
         loss_history.append(running['loss']/n_batches)
 

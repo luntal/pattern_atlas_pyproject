@@ -9,12 +9,14 @@ import onnx
 from types import SimpleNamespace
 import glob
 import os
+from modules.branch_paths import latest_in_branch, safe_branch_name, get_current_branch
 
-# Find the latest model in the models directory
-model_files = glob.glob('models/model_*.pt')
-if not model_files:
-    raise FileNotFoundError("No model files found in models/ directory")
-latest_model = max(model_files, key=os.path.getmtime)
+# Find the latest model in branch-specific models directory
+branch_name = safe_branch_name(get_current_branch())
+latest_model_path = latest_in_branch('models', 'model_*.pt')
+if latest_model_path is None:
+    raise FileNotFoundError(f"No model files found in models/{branch_name}/")
+latest_model = str(latest_model_path)
 print(f'Loading model: {latest_model}')
 # model_name = os.path.basename(latest_model)
 # change the model name to have onnx suffix

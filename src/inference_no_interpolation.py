@@ -14,6 +14,7 @@ import math
 import time
 import glob
 import os
+from modules.branch_paths import latest_in_branch, safe_branch_name, get_current_branch
 
 """
 spherical interpolation between 2 latent vectors.
@@ -25,15 +26,15 @@ spherical interpolation between 2 latent vectors.
 # ONNX = True
 ONNX = False
 
-# Find the latest model in the models directory
-model_files = glob.glob('models/model_*.pt')
-if not model_files:
-    raise FileNotFoundError("No model files found in models/ directory")
-latest_model = max(model_files, key=os.path.getmtime)
+# Find the latest model in branch-specific models directory
+branch_name = safe_branch_name(get_current_branch())
+latest_model = latest_in_branch('models', 'model_*.pt')
+if latest_model is None:
+    raise FileNotFoundError(f"No model files found in models/{branch_name}/")
 print(f'Loading model: {latest_model}')
 
 # Load the saved data
-checkpoint = torch.load(latest_model, map_location='cpu')
+checkpoint = torch.load(str(latest_model), map_location='cpu')
 model_state_dict = checkpoint['model_state_dict']
 hparams_dict = checkpoint['hparams']
 

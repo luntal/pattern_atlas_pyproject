@@ -6,6 +6,7 @@ import numpy as np
 from types import SimpleNamespace
 import os
 import glob
+from modules.branch_paths import latest_in_branch, safe_branch_name, get_current_branch
 
 if __name__ == '__main__':
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -15,12 +16,13 @@ if __name__ == '__main__':
     # Validation split configuration
     VALIDATION_SPLIT = hparams.validation_split  # 10% of data for validation
 
+    branch_name = safe_branch_name(get_current_branch())
     if retrain:
-        # Find the latest model in the models directory
-        model_files = glob.glob('models/model_*.pt')
-        if not model_files:
-            raise FileNotFoundError("No model files found in models/ directory")
-        latest_model = max(model_files, key=os.path.getmtime)
+        # Find the latest model in branch-specific models directory
+        latest_model_path = latest_in_branch('models', 'model_*.pt')
+        if latest_model_path is None:
+            raise FileNotFoundError(f"No model files found in models/{branch_name}/")
+        latest_model = str(latest_model_path)
         print(f'Loading checkpoint from: {latest_model}')
 
         checkpoint = torch.load(latest_model)
@@ -69,7 +71,8 @@ if __name__ == '__main__':
     optim = torch.optim.Adam(vae.parameters(), lr=hparams.learning_rate)
 
     # data = torch.randint(low=1, high=VOCAB, size=(BATCH, SEQ_LEN))
-    dataset_name = os.path.join(project_root, 'data', hparams.dataset_name)
+    dataset_name = os.path.join(project_root, 'data', branch_name, hparams.dataset_name)
+    print(f'Loading dataset: {dataset_name}')
     data = np.load(dataset_name)['data']
     print('Total amount of samples: ', data.shape)
     if hparams.n_samples < data.shape[0] and hparams.n_samples > 0:
@@ -155,11 +158,14 @@ if __name__ == '__main__':
         device = torch.device('cpu')
         print('Using CPU device')
 
+    print('len datloader: ', len(loader))
+    exit()
+
     train_vae(vae, loader, hparams, optim,
               device=device,
               scheduler=scheduler,
               step_start=hparams.global_step,
-              val_loader=val_loader
+              val_loader=val_loader,
               )
 
     # sample = vae.sample(max_len=SEQ_LEN, temperature=0, sample=False)

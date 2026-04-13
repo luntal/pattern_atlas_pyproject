@@ -12,6 +12,7 @@ import threading
 from types import SimpleNamespace
 import time
 from mido import Message, MidiFile, MidiTrack
+from modules.branch_paths import latest_in_branch, safe_branch_name, get_current_branch
 """
 spherical interpolation between 2 latent vectors.
 using midi files from specified folder as input data.
@@ -21,8 +22,13 @@ using midi files from specified folder as input data.
 # Load model with metadata
 ##########################
 
-# Load the saved data
-checkpoint = torch.load('../models/model.pt')
+# Load the newest model from branch-specific folder
+branch_name = safe_branch_name(get_current_branch())
+latest_model_path = latest_in_branch('models', 'model_*.pt')
+if latest_model_path is None:
+    raise FileNotFoundError(f"No model files found in models/{branch_name}/")
+print(f'Loading model: {latest_model_path}')
+checkpoint = torch.load(str(latest_model_path))
 # checkpoint = torch.load('model.pt')
 model_state_dict = checkpoint['model_state_dict']
 hparams_dict = checkpoint['hparams']
