@@ -7,13 +7,12 @@ DATA_DIR = Path(__file__).resolve().parent.parent / 'data'
 # List of .npz files to merge
 files_to_merge = [
     DATA_DIR / 'dataset-groove.npz',
-    DATA_DIR / 'dataset-groove-rnd.npz',
-    DATA_DIR / 'dataset-lakh-all-j15.npz',
-    DATA_DIR / 'dataset-lakh-all-j15-augmented.npz',
     DATA_DIR / 'dataset-groove-augmented.npz',
+    DATA_DIR / 'dataset-lakh.npz',
+    DATA_DIR / 'dataset-lakh-augmented.npz',
 ]
 
-save_path = DATA_DIR / 'dataset-merged-aug.npz'
+save_path = DATA_DIR / 'dataset-merged.npz'
 
 # Load all datasets
 all_data = []

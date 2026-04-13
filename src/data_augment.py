@@ -75,15 +75,26 @@ def _note_triplets(seq_tokens: List[int]) -> List[Tuple[int, int]]:
 		token = seq_tokens[i]
 		if token == hparams.eos_token:
 			break
-		if (
-			hparams.min_timing_token <= token < hparams.max_timing_token
-			and i + 2 < len(seq_tokens)
-			and hparams.min_vel_token <= seq_tokens[i + 1] < hparams.max_vel_token
-			and hparams.min_pitch_token <= seq_tokens[i + 2] < hparams.max_pitch_token
-		):
-			notes.append((i, seq_tokens[i + 2]))
-			i += 3
-			continue
+		if i + 2 < len(seq_tokens):
+			t1 = seq_tokens[i + 1]
+			t2 = seq_tokens[i + 2]
+			is_vel_t1 = hparams.min_vel_token <= t1 < hparams.max_vel_token
+			is_pitch_token = hparams.min_pitch_token <= token < hparams.max_pitch_token
+			is_timing_token = hparams.min_timing_token <= token < hparams.max_timing_token
+			is_pitch_t2 = hparams.min_pitch_token <= t2 < hparams.max_pitch_token
+			is_timing_t2 = hparams.min_timing_token <= t2 < hparams.max_timing_token
+
+			# New order: pitch, velocity, timing
+			if is_pitch_token and is_vel_t1 and is_timing_t2:
+				notes.append((i, token))
+				i += 3
+				continue
+
+			# Old order: timing, velocity, pitch
+			if is_timing_token and is_vel_t1 and is_pitch_t2:
+				notes.append((i, t2))
+				i += 3
+				continue
 		i += 1
 	return notes
 
@@ -313,6 +324,6 @@ def augment_dataset(
 
 if __name__ == "__main__":
 	# Edit these as needed.
-	INPUT_FILE = "dataset-lakh-all-j15.npz"
-	OUTPUT_FILE = "dataset-lakh-all-j15-augmented.npz"
-	augment_dataset(input_filename=INPUT_FILE, output_filename=OUTPUT_FILE, keep_percentage=100)
+	INPUT_FILE = "dataset-lakh.npz"
+	OUTPUT_FILE = "dataset-lakh-augmented.npz"
+	augment_dataset(input_filename=INPUT_FILE, output_filename=OUTPUT_FILE, keep_percentage=40)

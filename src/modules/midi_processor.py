@@ -465,9 +465,9 @@ class MidiProcessor:
                         if pitch < 36 or pitch > 36 + 24:
                             if roland:
                                 if pitch == 22:
-                                    pitch = 53
+                                    pitch = 42 # hi-hat closed edge -> hi-hat closed
                                 elif pitch == 26:
-                                    pitch = 56
+                                    pitch = 46 # hi-hat open edge -> hi-hat open
                                 else:
                                     continue
                             else:
@@ -607,14 +607,10 @@ class MidiProcessor:
                             token_window.append(step_token)
                         prev_idx = step_idx
 
-                        # insert deviation/timing token:
-                        token_window.append(deviation + self.hparams.min_timing_token)
-
-                        # prev_deviation = deviation
-                        # if vel != prev_vel:
-                        token_window.append(vel + min_vel_token)
-                        # prev_vel = vel
+                        # insert tokens for the note:
                         token_window.append(pitch + min_pitch_token)
+                        token_window.append(vel + min_vel_token)
+                        token_window.append(deviation + self.hparams.min_timing_token)
                     token_window.append(eos)
                     if len(token_window) < 15:
                         continue
@@ -735,6 +731,7 @@ class MidiProcessor:
         step_token = self.hparams.step_token
         min_timing_token = self.hparams.min_timing_token
         max_timing_token = self.hparams.max_timing_token
+        center_timing_token = self.hparams.center_timing_token
         n_timing = self.hparams.n_timing
 
         # n_timing = 2
@@ -759,23 +756,38 @@ class MidiProcessor:
                     mat[row, s:cols] = value
                     mat[row, 0:(length - first_len)] = value
 
-            for token in seq:
-                if min_vel_token <= token < max_vel_token:
-                    vel = token - min_vel_token
-                    vel /= (self.hparams.n_vel - 1)
-                if min_timing_token <= token < max_timing_token:
-                    timing = token - min_timing_token - self.hparams.n_timing // 2
-                    # timing /= (self.hparams.n_timing-1)
+            for i, token in enumerate(seq):
+                if token == self.hparams.eos_token:
+                    break
+                if token == self.hparams.pad_token:
+                    continue
+                # if min_vel_token <= token < max_vel_token:
+                #     vel = token - min_vel_token
+                #     vel /= (self.hparams.n_vel - 1)
+                # if min_timing_token <= token < max_timing_token:
+                #     timing = token - min_timing_token - self.hparams.n_timing // 2
+
                 if min_pitch_token <= token < max_pitch_token:
-                    pitch = token - self.hparams.token_bias
-                    start = idx * n_timing + timing
-                    if n_timing < 2:
-                        length = 1
-                    else:
-                        length = n_timing // 2
-                    write_wrapped_segment(pitch, start, length, vel)
-                    # end = start + n_timing // 2
-                    # mat[pitch, start:end ] = vel
+                    last_index = len(seq) - 1
+                    if i + 1 >= last_index:
+                        continue
+                    vel_token = seq[i+1]
+                    if min_vel_token <= vel_token < max_vel_token:
+                        timing_token = seq[i+2]
+                        if min_timing_token <= timing_token < max_timing_token:
+                            timing = timing_token - center_timing_token
+                            vel = vel_token - min_vel_token
+                            vel /= (self.hparams.n_vel - 1)
+
+                            pitch = token - min_pitch_token
+                            start = idx * n_timing + timing
+                            if n_timing < 2:
+                                length = 1
+                            else:
+                                length = n_timing // 2
+                            write_wrapped_segment(pitch, start, length, vel)
+                            # end = start + n_timing // 2
+                            # mat[pitch, start:end ] = vel
                 if token == step_token:
                     idx += 1
                 if idx >= self.hparams.width:
@@ -980,51 +992,45 @@ class MidiProcessor:
             vel = 0
             delay = sixteenth_note_length
 
-            for token in seq:
+            for i, token in enumerate(seq):
                 if counter > self.playback_position:
                     break
                 if token == self.hparams.eos_token or token == 0:
                     break
 
-                if self.hparams.min_vel_token <= token < self.hparams.max_vel_token:
-                    vel = (token - self.hparams.min_vel_token) * (127/(self.hparams.n_vel-1))
-                if self.hparams.min_timing_token <= token < self.hparams.max_timing_token:
-                    deviation = token - self.hparams.min_timing_token
-                    deviation = deviation - self.hparams.n_timing // 2 # scale to -16 to 16
-                    deviation /= (self.hparams.n_timing // 2) # scale to -1 to 1
-                    deviation *= (sixteenth_note_length / 2) * deviation_strength
-                    delay = sixteenth_note_length + deviation
+                # if self.hparams.min_vel_token <= token < self.hparams.max_vel_token:
+                #     vel = (token - self.hparams.min_vel_token) * (127/(self.hparams.n_vel-1))
+                # if self.hparams.min_timing_token <= token < self.hparams.max_timing_token:
+                #     deviation = token - self.hparams.center_timing_token
+                #     # deviation = deviation - self.hparams.n_timing // 2 # scale to -16 to 16
+                #     deviation /= (self.hparams.n_timing // 2) # scale to -1 to 1
+                #     deviation *= (sixteenth_note_length / 2) * deviation_strength
+                #     delay = sixteenth_note_length + deviation
 
                 if counter == self.playback_position:
-                    if self.hparams.min_pitch_token <= token < self.hparams.max_pitch_token:
-                        pitch = token - self.hparams.min_pitch_token + 36
-                        # output_port.send(mido.Message('note_on', note=pitch , velocity=int(vel)))
-                        # play_single_note(pitch, int(vel), delay)
+                    vel_token = seq[i+1] if i+1 < len(seq) else None
+                    if vel_token is not None and self.hparams.min_vel_token <= vel_token < self.hparams.max_vel_token:
+                        vel = (vel_token - self.hparams.min_vel_token) * (127/(self.hparams.n_vel-1))
+                        timing_token = seq[i+2] if i+2 < len(seq) else None
+                        if timing_token is not None and self.hparams.min_timing_token <= timing_token < self.hparams.max_timing_token:
+                            deviation = timing_token - self.hparams.center_timing_token
+                            deviation /= (self.hparams.n_timing // 2) # scale to -1 to 1
+                            deviation *= (sixteenth_note_length / 2) * deviation_strength
+                            delay = sixteenth_note_length + deviation
+                            if self.hparams.min_pitch_token <= token < self.hparams.max_pitch_token:
+                                pitch = token - self.hparams.min_pitch_token + 36
+                                # output_port.send(mido.Message('note_on', note=pitch , velocity=int(vel)))
+                                # play_single_note(pitch, int(vel), delay)
 
-                        # print(self.playback_position, pitch, int(vel), delay)
-                        threading.Thread(target=play_single_note, args=(pitch, int(vel), delay)).start()
+                                # print(self.playback_position, pitch, int(vel), delay)
+                                threading.Thread(target=play_single_note, args=(pitch, int(vel), delay)).start()
 
                 if token == self.hparams.step_token:
                     counter += 1
 
 
 
-
-
-            # for pitch in range(self.hparams.height):
-            #     if self.matrix[pitch, playback_position] > 0:
-            #         vel = int(self.matrix[pitch, playback_position] * 127)
-            #         # print(pitch + 36)
-            #         output_port.send(mido.Message('note_on', note=pitch + 36, velocity=vel))
-
-
             time.sleep(sixteenth_note_length)
-
-
-            # for i in range(self.hparams.height):
-            #     output_port.send(mido.Message('note_off', note=i + 36, velocity=int(vel)))
-
-
 
             self.playback_position += 1
             self.playback_position %= self.hparams.width

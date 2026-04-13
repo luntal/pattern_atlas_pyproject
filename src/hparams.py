@@ -77,6 +77,7 @@ hyper_params = {
     'n_timing': ranges['timing'],
     'min_timing_token': min_tokens[timing_index],
     'max_timing_token': min_tokens[timing_index] + ranges['timing'],
+    'center_timing_token': min_tokens[timing_index] + ranges['timing'] // 2,
 
     'token_bias': 4,
 }
@@ -92,6 +93,7 @@ if print_info:
     print('pitch range: ', hyper_params['min_pitch_token'], hyper_params['max_pitch_token'])
     print('velocity range', hyper_params['min_vel_token'], hyper_params['max_vel_token'])
     print('timing range', hyper_params['min_timing_token'], hyper_params['max_timing_token'])
+    print('center timing token:', hyper_params['center_timing_token'])
     print('Ranges are excluding upper bound!')
 
 from types import SimpleNamespace
