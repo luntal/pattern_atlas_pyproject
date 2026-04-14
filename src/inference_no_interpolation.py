@@ -66,7 +66,11 @@ else:
 offset = 0
 n_examples = 1
 interpolation_steps = 25
-data = np.load('data/dataset-merged.npz')['data']
+latest_dataset = latest_in_branch('data', 'dataset-merged.npz')
+if latest_dataset is None:
+    raise FileNotFoundError(f"No dataset files found in data/")
+print(f'Loading dataset: {latest_dataset}')
+data = np.load(latest_dataset)['data']
 # print(data['tensor'])
 print('data shape: ', data.shape)
 # maxi = data.shape[0]

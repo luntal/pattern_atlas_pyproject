@@ -133,7 +133,7 @@ if __name__ == '__main__':
                 steps_per_epoch=len(loader),
                 epochs=hparams.n_epochs
             )
-            scheduler.load_state_dict(hparams.scheduler_state_dict)
+            # scheduler.load_state_dict(hparams.scheduler_state_dict)
     else:
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optim,
@@ -158,8 +158,7 @@ if __name__ == '__main__':
         device = torch.device('cpu')
         print('Using CPU device')
 
-    print('len datloader: ', len(loader))
-    exit()
+
 
     train_vae(vae, loader, hparams, optim,
               device=device,
