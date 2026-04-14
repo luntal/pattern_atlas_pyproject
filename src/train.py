@@ -6,7 +6,9 @@ import numpy as np
 from types import SimpleNamespace
 import os
 import glob
+import math
 from modules.branch_paths import latest_in_branch, safe_branch_name, get_current_branch
+from modules.utilities import load_dataset
 
 if __name__ == '__main__':
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -56,39 +58,20 @@ if __name__ == '__main__':
         vae = TransformerVAE(hparams)
 
 
-    VOCAB = hparams.vocab_size
-    SEQ_LEN = hparams.max_seq_len
+    # VOCAB = hparams.vocab_size
+    # SEQ_LEN = hparams.max_seq_len
     BATCH = hparams.batch_size
-    latent_dim = hparams.latent_dim
-    seed = 42
-    torch.manual_seed(seed)
+    # latent_dim = hparams.latent_dim
+    # seed = 42
+    torch.manual_seed(hparams.seed)
 
     total_params = sum(p.numel() for p in vae.parameters() if p.requires_grad)
     print(f'Total parameters in VAE: {total_params}')
 
-
-
     optim = torch.optim.Adam(vae.parameters(), lr=hparams.learning_rate)
 
-    # data = torch.randint(low=1, high=VOCAB, size=(BATCH, SEQ_LEN))
-    dataset_name = os.path.join(project_root, 'data', branch_name, hparams.dataset_name)
-    print(f'Loading dataset: {dataset_name}')
-    data = np.load(dataset_name)['data']
-    print('Total amount of samples: ', data.shape)
-    if hparams.n_samples < data.shape[0] and hparams.n_samples > 0:
-        data = data[:hparams.n_samples]
-    elif hparams.n_samples < 0:
-        pass
-    elif hparams.n_samples == 0:
-        hparams.n_samples = data.shape[0]
-        
-    
-    print('Using ', data.shape[0])
-    print('---'*5)
+    data = load_dataset(hparams, project_root)
 
-    # Shuffle data before splitting
-    np.random.seed(seed)
-    np.random.shuffle(data)
 
     # Split into train and validation
     val_size = int(len(data) * VALIDATION_SPLIT)
@@ -100,13 +83,17 @@ if __name__ == '__main__':
     print(f'Validation samples: {len(val_data)}')
     print('---'*5)
 
+    # pin_memory is only useful for CUDA host->device transfers.
+    # On MPS, enabling it triggers a warning and has no effect.
+    use_pin_memory = torch.cuda.is_available()
+
     # DataLoader with worker tuning for efficient data loading on H100
     loader = DataLoader(
         train_data,
         batch_size=BATCH,
         shuffle=True,
         num_workers=4,
-        pin_memory=True,
+        pin_memory=use_pin_memory,
         persistent_workers=True,
         prefetch_factor=2
     )
@@ -115,7 +102,7 @@ if __name__ == '__main__':
         batch_size=BATCH,
         shuffle=False,
         num_workers=4,
-        pin_memory=True,
+        pin_memory=use_pin_memory,
         persistent_workers=True,
         prefetch_factor=2
     )
@@ -135,37 +122,43 @@ if __name__ == '__main__':
             )
             # scheduler.load_state_dict(hparams.scheduler_state_dict)
     else:
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optim,
-            max_lr=hparams.learning_rate,
-            steps_per_epoch=len(loader),
-            epochs=hparams.n_epochs
-        )
+        start_lr = getattr(hparams, 'scheduler_start_lr', hparams.learning_rate)
+        end_lr = getattr(hparams, 'scheduler_end_lr', hparams.learning_rate * 0.1)
+        exp_curve_factor = getattr(hparams, 'scheduler_exp_curve_factor', 1.0)
+        total_scheduler_steps = max(len(loader) * hparams.n_epochs, 1)
+
+        for param_group in optim.param_groups:
+            param_group['lr'] = start_lr
+
+        def lr_lambda(current_step):
+            if total_scheduler_steps <= 1:
+                return end_lr / start_lr
+
+            progress = min(max(current_step / (total_scheduler_steps - 1), 0.0), 1.0)
+
+            if math.isclose(exp_curve_factor, 0.0, abs_tol=1e-12):
+                curved_progress = progress
+            else:
+                numerator = math.exp(exp_curve_factor * progress) - 1.0
+                denominator = math.exp(exp_curve_factor) - 1.0
+                curved_progress = numerator / denominator
+
+            current_lr = start_lr + (end_lr - start_lr) * curved_progress
+            return current_lr / start_lr
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lr_lambda)
     # print('scheduler infos: ')
     # print('steps at last epoch: ', scheduler.last_epoch)
     # print('total steps: ', scheduler.total_steps)
     # print('---' * 5)
     # exit()
 
-    # Device selection with priority: CUDA > MPS > CPU
-    if torch.cuda.is_available():
-        device = torch.device('cuda')
-        print(f'Using CUDA device: {torch.cuda.get_device_name(0)}')
-    elif torch.backends.mps.is_available():
-        device = torch.device('mps')
-        print('Using MPS device (Apple Silicon)')
-    else:
-        device = torch.device('cpu')
-        print('Using CPU device')
-
+    
 
 
     train_vae(vae, loader, hparams, optim,
-              device=device,
               scheduler=scheduler,
-              step_start=hparams.global_step,
               val_loader=val_loader,
               )
 
-    # sample = vae.sample(max_len=SEQ_LEN, temperature=0, sample=False)
-    # print('sample shape', sample.shape)
+    

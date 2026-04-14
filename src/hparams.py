@@ -28,21 +28,28 @@ for i in range(len(keys)):
 
 
 hyper_params = {
+    'seed': 42,
     # training
     'dataset_name': 'dataset-merged.npz',
     'validation_split': 0.1,
     'batch_size': 64,
     'n_epochs': 150,
     'learning_rate': 4e-4,
+    'scheduler_start_lr': 4e-4,
+    'scheduler_end_lr': 4e-5,
+    'scheduler_exp_curve_factor': -8.0,
+    
     'n_samples': 0,
     # 'annealing_steps': 250 * 200, # kl annealing should start after around 50% of epochs, is computed in train method
-    'beta': 0.3,
-    'free_bits': 0.15,
+    'beta': 1,
+    'free_bits': 0.1,
     'global_step': 0,
     'global_epoch': 0, # num of trained epochs
     'annealing_steps_norm': 1, # normalized amount of steps. 1 equals number of steps in all epochs, 0.5 equals number of steps in half of the epochs, etc.
+    'annealing_list': [[0,0],[0.5,0],[1,1]], # list of [normalized_step, beta_value] pairs. Normalized step is between 0 and 1, where 1 is the last training step. Beta value is the annealed beta at that point; segments are exponentially smoothed between points.
     'current_lr': 0.0,
 
+    # model
     'latent_dim': d_base,
 
     'steps_per_bar': 32,

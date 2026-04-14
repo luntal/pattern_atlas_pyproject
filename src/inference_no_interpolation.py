@@ -15,6 +15,7 @@ import time
 import glob
 import os
 from modules.branch_paths import latest_in_branch, safe_branch_name, get_current_branch
+from modules.utilities import load_model
 
 """
 spherical interpolation between 2 latent vectors.
@@ -23,40 +24,8 @@ spherical interpolation between 2 latent vectors.
 ##########################
 # Load model with metadata
 ##########################
-# ONNX = True
-ONNX = False
 
-# Find the latest model in branch-specific models directory
-branch_name = safe_branch_name(get_current_branch())
-latest_model = latest_in_branch('models', 'model_*.pt')
-if latest_model is None:
-    raise FileNotFoundError(f"No model files found in models/{branch_name}/")
-print(f'Loading model: {latest_model}')
-
-# Load the saved data
-checkpoint = torch.load(str(latest_model), map_location='cpu')
-model_state_dict = checkpoint['model_state_dict']
-hparams_dict = checkpoint['hparams']
-
-# Recreate the hparams object
-hparams = SimpleNamespace(**hparams_dict)
-
-if ONNX:
-    model = ONNXWrapper(hparams)
-    model.eval()
-else:
-
-    model = TransformerVAE(hparams)
-    model.load_state_dict(model_state_dict)
-    model.eval()
-    print('--' * 10)
-    print('model config: ')
-    print('model dimensions: ', hparams.d_model)
-    print('n_layers: ', hparams.n_layers)
-    print('n_heads: ', hparams.n_heads)
-    print('--' * 10)
-
-
+model, hparams = load_model()
 
 
 ###########################

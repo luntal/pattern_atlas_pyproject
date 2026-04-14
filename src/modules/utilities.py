@@ -1,6 +1,82 @@
 import numpy as np
 import mido
 import time
+import os
+from pathlib import Path
+from modules.branch_paths import latest_in_branch, safe_branch_name, get_current_branch
+from modules.model import TransformerVAE, reparameterize, ONNXWrapper
+from types import SimpleNamespace
+import torch
+
+def load_model(previous=0, onnx=False ):
+    # Find models in the current branch-specific models directory.
+    branch_name = safe_branch_name(get_current_branch())
+    model_dir = Path('models') / branch_name
+    model_files = sorted(model_dir.glob('model_*.pt'), key=os.path.getmtime)
+
+    if not model_files:
+        raise FileNotFoundError(f"No model files found in models/{branch_name}/")
+
+    previous = max(int(previous), 0)
+    selected_index = len(model_files) - 1 - previous
+    if selected_index < 0:
+        selected_index = 0
+        print(
+            f"Requested previous={previous}, but only {len(model_files)} model(s) are available in models/{branch_name}/. "
+            f"Loading oldest model instead: {model_files[selected_index]}"
+        )
+        previous = len(model_files) - 1
+
+    selected_model = model_files[selected_index]
+    if previous == 0:
+        print(f'Loading latest model: {selected_model}')
+    else:
+        print(f'Loading model with previous={previous}: {selected_model}')
+
+    # Load the saved data
+    checkpoint = torch.load(str(selected_model), map_location='cpu')
+    model_state_dict = checkpoint['model_state_dict']
+    hparams_dict = checkpoint['hparams']
+
+    # Recreate the hparams object
+    hparams = SimpleNamespace(**hparams_dict)
+
+    if onnx:
+        model = ONNXWrapper(hparams)
+    else:
+        model = TransformerVAE(hparams)
+        model.load_state_dict(model_state_dict)
+        print('--' * 10)
+        print('model config: ')
+        print('model dimensions: ', hparams.d_model)
+        print('n_layers: ', hparams.n_layers)
+        print('n_heads: ', hparams.n_heads)
+        print('--' * 10)
+    model.eval()
+    return model, hparams
+
+def load_dataset(hparams, project_root):
+    # dataset_name = hparams.dataset_name
+    branch_name = safe_branch_name(get_current_branch())
+    dataset_name = os.path.join(project_root, 'data', branch_name, hparams.dataset_name)
+    print(f'Loading dataset: {dataset_name}')
+    data = np.load(dataset_name)['data']
+    print('Total amount of samples: ', data.shape)
+    if hparams.n_samples < data.shape[0] and hparams.n_samples > 0:
+        data = data[:hparams.n_samples]
+    elif hparams.n_samples < 0:
+        pass
+    elif hparams.n_samples == 0:
+        hparams.n_samples = data.shape[0]
+        
+    
+    print('Using ', data.shape[0])
+    print('---'*5)
+
+    # Shuffle data before splitting
+    np.random.seed(hparams.seed)
+    np.random.shuffle(data)
+    return data
 
 
 def play_midi(_global_vars):

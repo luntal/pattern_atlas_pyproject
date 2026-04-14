@@ -19,7 +19,7 @@ print(f'Total epochs: {len(df)}')
 print(df.head())
 
 # Create a figure with multiple subplots
-fig, axes = plt.subplots(3, 2, figsize=(15, 12))
+fig, axes = plt.subplots(3, 2, figsize=(15, 10))
 fig.suptitle(f'Training Metrics - {os.path.basename(latest_log)}', fontsize=16)
 
 # Plot 1: Total Loss (Train vs Val)

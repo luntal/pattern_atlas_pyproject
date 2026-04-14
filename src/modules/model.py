@@ -308,13 +308,80 @@ def vae_loss(logits, targets, mu, logvar, beta=1.0, free_bits=0.0, pad_token=0):
 
 def train_vae(
         model: TransformerVAE, dataloader: DataLoader, _hparams: SimpleNamespace,
-        optimizer, device, annealing_style='sigmoid', scheduler=None, step_start=0, val_loader=None):
+        optimizer, device=None, annealing_style='sigmoid', scheduler=None, val_loader=None):
+    
+    # Device selection with priority: CUDA > MPS > CPU
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        print(f'Using CUDA device: {torch.cuda.get_device_name(0)}')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
+        print('Using MPS device (Apple Silicon)')
+    else:
+        device = torch.device('cpu')
+        print('Using CPU device')
+
+
+
+    def _prepare_annealing_points(annealing_list):
+        default_points = [(0.0, 0.0), (1.0, 1.0)]
+        if not isinstance(annealing_list, (list, tuple)) or len(annealing_list) == 0:
+            return default_points
+
+        points = []
+        for pair in annealing_list:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                continue
+            x, y = pair
+            try:
+                x = float(x)
+                y = float(y)
+            except (TypeError, ValueError):
+                continue
+            points.append((min(max(x, 0.0), 1.0), y))
+
+        if len(points) == 0:
+            return default_points
+
+        points.sort(key=lambda p: p[0])
+        deduped = []
+        for x, y in points:
+            if deduped and math.isclose(x, deduped[-1][0], rel_tol=0.0, abs_tol=1e-12):
+                deduped[-1] = (x, y)
+            else:
+                deduped.append((x, y))
+
+        if deduped[0][0] > 0.0:
+            deduped.insert(0, (0.0, deduped[0][1]))
+        if deduped[-1][0] < 1.0:
+            deduped.append((1.0, deduped[-1][1]))
+        return deduped
+
+    def _exp_ease(t, k=6.0):
+        t = min(max(float(t), 0.0), 1.0)
+        if math.isclose(k, 0.0, rel_tol=0.0, abs_tol=1e-12):
+            return t
+        return (math.exp(k * t) - 1.0) / (math.exp(k) - 1.0)
+
+    def _annealed_beta_at_progress(progress, points):
+        p = min(max(float(progress), 0.0), 1.0)
+        for idx in range(len(points) - 1):
+            x0, y0 = points[idx]
+            x1, y1 = points[idx + 1]
+            if p <= x1 or idx == len(points) - 2:
+                span = max(x1 - x0, 1e-12)
+                t = (p - x0) / span
+                if y0 > 0.0 and y1 > 0.0:
+                    # Log-space interpolation gives a smooth exponential segment.
+                    return math.exp(math.log(y0) + (math.log(y1) - math.log(y0)) * t)
+                eased_t = _exp_ease(t)
+                return y0 + (y1 - y0) * eased_t
+        return points[-1][1]
+
     epochs = _hparams.n_epochs
-    # annealing_steps = _hparams.annealing_steps
-    # calculate annealing steps based on number of samples, should be approx. 50%
-    annealing_steps_norm = min(max(0, _hparams.annealing_steps_norm), 1)
-    annealing_steps = len(dataloader) * (epochs ** annealing_steps_norm)
-    beta = _hparams.beta
+    total_train_steps = max(len(dataloader) * epochs, 1)
+    annealing_points = _prepare_annealing_points(getattr(_hparams, 'annealing_list', None))
+    beta_multiplier = _hparams.beta
     free_bits = _hparams.free_bits
     loss_history = []
 
@@ -415,6 +482,8 @@ def train_vae(
 
     train_start_time = time.time()
     prev_epoch_time = time.time()
+    print()
+    print(f"Starting training for {epochs} epochs ({total_train_steps} total steps)")
     for epoch in range(1, epochs + 1):
         model.train()
         running = {'loss': 0.0, 'rec': 0.0, 'kl': 0.0, 'n_tokens': 0.0}
@@ -423,25 +492,12 @@ def train_vae(
         perplexity = 1000
         print('-' * 100)
         for batch in dataloader:
-            # Compute annealing factor
-            if train_step < annealing_steps:
-                # Linear schedule from 0 to 1
-                if annealing_style == 'linear':
-                    annealing_factor = train_step / annealing_steps
-
-                # Sigmoid schedule - smoother transition
-                # annealing_factor = 1.0 / (1.0 + np.exp(-10 * (train_step / annealing_steps - 0.5)))
-                if annealing_style == 'sigmoid':
-                    # MuseMorphose-inspired Sigmoid Annealing
-                    # This starts slow, then rises quickly around 75% of annealing_steps
-                    x_prop = (train_step / annealing_steps)
-                    annealing_factor = 1.0 / (1.0 + np.exp(-10 * (x_prop - 0.5)))
-
-            else:
-                annealing_factor = 1.0
+            normalized_step = train_step / max(total_train_steps - 1, 1)
+            annealed_beta = _annealed_beta_at_progress(normalized_step, annealing_points)
             global_step += 1
             train_step += 1
-            weighted_beta = beta * annealing_factor
+            weighted_beta = beta_multiplier * annealed_beta
+            annealing_factor = annealed_beta
             time_elapsed = time.time() - prev_time
             prev_time = time.time()
             batch = batch.to(device)

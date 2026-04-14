@@ -1,0 +1,57 @@
+"""
+IMPORTANT NOTE:
+Start strict from inside src directory!!
+
+
+Script to analyze bit usage and latent dimension utilization in a VAE model.
+
+This script loads a trained VAE model and evaluates how effectively the latent
+representation is being used. It examines the variance of latent dimensions (z)
+and mean values (mu) across a batch of dummy inputs to identify:
+- Which latent dimensions are actively encoding information
+- The distribution of variance across dimensions
+- Potential unused or underutilized dimensions
+
+Useful for diagnosing issues like posterior collapse or free bits ineffectiveness.
+"""
+
+import torch
+import os
+from pathlib import Path
+from modules.model import reparameterize
+from modules.utilities import load_model
+from hparams import hparams
+
+
+model, hparams = load_model()
+
+
+# Check bit usage in latent vector
+with torch.no_grad():
+    # Use a dummy batch to test
+    batch_size = 32
+    dummy_input = torch.randint(0, hparams.vocab_size, (batch_size, hparams.max_seq_len))  # Adjust dimensions as needed
+
+    # Forward pass
+    logits, mu, logvar = model(dummy_input)
+    z = reparameterize(mu, logvar)
+    
+    # Calculate which latent dimensions are actually being used
+    # Method: Check variance of each dimension across batch
+    bit_usage = torch.var(z, dim=0)
+    mean_bit_usage = torch.mean(bit_usage).item()
+    
+    print(f"\nBit Usage Analysis (AVG over batch):")
+    print(f"Mean variance across all latent dimensions: {mean_bit_usage:.6f}")
+    print(f"Min variance: {torch.min(bit_usage).item():.6f}")
+    print(f"Max variance: {torch.max(bit_usage).item():.6f}")
+    print(f"Latent dimension: {z.shape[1]}")
+    print(f"Fully utilized dimensions (var > 0.01): {torch.sum(bit_usage > 0.01).item()}")
+
+    print('--' * 10)
+    mu_var = torch.var(mu, dim=0)
+    print(f"Mean mu variance: {torch.mean(mu_var).item():.6f}")
+    print(f"Min mu variance: {torch.min(mu_var).item():.6f}")
+    print(f"Max mu variance: {torch.max(mu_var).item():.6f}")
+    print(f"Active dimensions (mu var > 0.01): {torch.sum(mu_var > 0.01).item()}")
+    print(f"Active dimensions (mu var > 0.2): {torch.sum(mu_var > 0.2).item()}")
