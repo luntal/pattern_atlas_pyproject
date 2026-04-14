@@ -570,10 +570,10 @@ def train_vae(
         now = time.time()
         epoch_time = now - prev_epoch_time
         prev_epoch_time = now
-        current_lr = optimizer.param_groups[0]['lr']
+        lr = optimizer.param_groups[0]['lr']
         _hparams.global_step = global_step
         _hparams.global_epoch = global_step // n_batches
-        _hparams.current_lr = current_lr
+        _hparams.learning_rate = lr
         _hparams.weighted_beta = weighted_beta
         _hparams.optimizer_state_dict = optimizer.state_dict()
         loss_history.append(running['loss']/n_batches)
@@ -598,7 +598,7 @@ def train_vae(
 
         prev_loss = min(running['loss']/n_batches, prev_loss) if prev_loss is not None else running['loss']/n_batches
 
-        print(f"Train Loss {running['loss']/n_batches:.4f} | rec {running['rec']/n_batches:.4f} | kl {running['kl']/n_batches:.4f} | Epoch_time: {epoch_time:.2f}s | saved cache: {save_cache} | lr: {current_lr:.10f}")
+        print(f"Train Loss {running['loss']/n_batches:.4f} | rec {running['rec']/n_batches:.4f} | kl {running['kl']/n_batches:.4f} | Epoch_time: {epoch_time:.2f}s | saved cache: {save_cache} | lr: {lr:.10f}")
         if val_loader is not None:
             print(f"Val Loss {val_metrics['loss']:.4f} | rec {val_metrics['rec']:.4f} | kl {val_metrics['kl']:.4f} | perplexity {val_metrics['perplexity']:.4f}")
         print(f'Model Perplexity: {perplexity} | Avg tokens per sequence: {running["n_tokens"]/_hparams.n_samples:.2f}')
@@ -626,7 +626,7 @@ def train_vae(
                 f"{(running['kl']/n_batches).item():.6f}",
                 f"{perplexity:.4f}",
                 f"{running['n_tokens']/_hparams.n_samples:.2f}",
-                f"{current_lr:.10f}",
+                f"{lr:.10f}",
                 f"{weighted_beta:.6f}",
                 f"{annealing_factor:.6f}",
                 f"{val_metrics['loss'].item():.6f}" if val_loader is not None else "",

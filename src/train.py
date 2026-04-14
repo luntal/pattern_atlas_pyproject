@@ -23,7 +23,7 @@ if __name__ == '__main__':
         vae, hparams = load_model(previous=0, onnx=False)
 
         # update learning rate
-        hparams.scheduler_start_lr = hparams.current_lr
+        hparams.scheduler_start_lr = hparams.learning_rate
         hparams.scheduler_end_lr = hparams.learning_rate * 0.6
         # update annealing list to continue from current beta
         w_beta_start = hparams.weighted_beta

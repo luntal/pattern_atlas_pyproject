@@ -47,7 +47,7 @@ hyper_params = {
     'global_epoch': 0, # num of trained epochs
     'annealing_steps_norm': 1, # normalized amount of steps. 1 equals number of steps in all epochs, 0.5 equals number of steps in half of the epochs, etc.
     'annealing_list': [[0,0],[0.3,0],[0.6,0.1],[0.9,0.2],[1,0.2]], # list of [normalized_position, beta_value] pairs. Normalized step is between 0 and 1, where 1 is the last training step. Beta value is the annealed beta at that point; segments are exponentially smoothed between points.
-    'current_lr': 0.0,
+    # 'current_lr': 0.0,
     'weighted_beta': 0.0,
 
     # model
