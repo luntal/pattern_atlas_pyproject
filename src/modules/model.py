@@ -493,11 +493,11 @@ def train_vae(
         print('-' * 100)
         for batch in dataloader:
             normalized_step = train_step / max(total_train_steps - 1, 1)
-            annealed_beta = _annealed_beta_at_progress(normalized_step, annealing_points)
+            weighted_beta = _annealed_beta_at_progress(normalized_step, annealing_points)
             global_step += 1
             train_step += 1
-            weighted_beta = beta_multiplier * annealed_beta
-            annealing_factor = annealed_beta
+            # weighted_beta = beta_multiplier * annealed_beta
+            annealing_factor = weighted_beta
             time_elapsed = time.time() - prev_time
             prev_time = time.time()
             batch = batch.to(device)

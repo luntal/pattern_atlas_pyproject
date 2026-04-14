@@ -7,6 +7,8 @@ from modules.branch_paths import latest_in_branch, safe_branch_name, get_current
 from modules.model import TransformerVAE, reparameterize, ONNXWrapper
 from types import SimpleNamespace
 import torch
+import math
+import glob
 
 def load_model(previous=0, onnx=False ):
     # Find models in the current branch-specific models directory.
