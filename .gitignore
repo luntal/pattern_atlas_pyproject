@@ -82,5 +82,7 @@ venv.bak/
 models/
 outputs/
 docs/training_log_*.csv
+docs/**/training_log_*.csv
 data/*.npz
+data/**/*.npz
 midifiles/

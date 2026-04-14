@@ -1,1 +1,0 @@
-epoch,batch_size,total_loss,reconstruction_loss,kl_loss,perplexity,avg_tokens_per_sequence,learning_rate,beta,annealing_factor,val_total_loss,val_reconstruction_loss,val_kl_loss,val_perplexity,epoch_time_seconds,elapsed_time_seconds,remaining_time_seconds,saved_cache
