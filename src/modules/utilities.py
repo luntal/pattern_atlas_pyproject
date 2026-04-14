@@ -78,6 +78,32 @@ def load_dataset(hparams, project_root):
     np.random.shuffle(data)
     return data
 
+def load_scheduler(optim, loader, hparams):
+        start_lr = getattr(hparams, 'scheduler_start_lr', hparams.learning_rate)
+        end_lr = getattr(hparams, 'scheduler_end_lr', hparams.learning_rate * 0.1)
+        exp_curve_factor = getattr(hparams, 'scheduler_exp_curve_factor', 1.0)
+        total_scheduler_steps = max(len(loader) * hparams.n_epochs, 1)
+
+        for param_group in optim.param_groups:
+            param_group['lr'] = start_lr
+
+        def lr_lambda(current_step):
+            if total_scheduler_steps <= 1:
+                return end_lr / start_lr
+
+            progress = min(max(current_step / (total_scheduler_steps - 1), 0.0), 1.0)
+
+            if math.isclose(exp_curve_factor, 0.0, abs_tol=1e-12):
+                curved_progress = progress
+            else:
+                numerator = math.exp(exp_curve_factor * progress) - 1.0
+                denominator = math.exp(exp_curve_factor) - 1.0
+                curved_progress = numerator / denominator
+
+            current_lr = start_lr + (end_lr - start_lr) * curved_progress
+            return current_lr / start_lr
+
+        return torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lr_lambda)
 
 def play_midi(_global_vars):
     # global playback_position

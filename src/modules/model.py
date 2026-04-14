@@ -381,7 +381,7 @@ def train_vae(
     epochs = _hparams.n_epochs
     total_train_steps = max(len(dataloader) * epochs, 1)
     annealing_points = _prepare_annealing_points(getattr(_hparams, 'annealing_list', None))
-    beta_multiplier = _hparams.beta
+    beta_multiplier = _hparams.beta_multiplier
     free_bits = _hparams.free_bits
     loss_history = []
 
@@ -574,6 +574,7 @@ def train_vae(
         _hparams.global_step = global_step
         _hparams.global_epoch = global_step // n_batches
         _hparams.current_lr = current_lr
+        _hparams.weighted_beta = weighted_beta
         loss_history.append(running['loss']/n_batches)
 
         # Track best model based on validation loss (or training loss if no validation)

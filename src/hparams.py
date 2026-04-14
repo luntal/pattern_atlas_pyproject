@@ -41,13 +41,14 @@ hyper_params = {
     
     'n_samples': 0,
     # 'annealing_steps': 250 * 200, # kl annealing should start after around 50% of epochs, is computed in train method
-    'beta': 1,
+    # 'beta_multiplier': 1,
     'free_bits': 0.1,
     'global_step': 0,
     'global_epoch': 0, # num of trained epochs
     'annealing_steps_norm': 1, # normalized amount of steps. 1 equals number of steps in all epochs, 0.5 equals number of steps in half of the epochs, etc.
-    'annealing_list': [[0,0],[0.5,0],[1,1]], # list of [normalized_step, beta_value] pairs. Normalized step is between 0 and 1, where 1 is the last training step. Beta value is the annealed beta at that point; segments are exponentially smoothed between points.
+    'annealing_list': [[0,0],[0.5,0],[1,0.2]], # list of [normalized_position, beta_value] pairs. Normalized step is between 0 and 1, where 1 is the last training step. Beta value is the annealed beta at that point; segments are exponentially smoothed between points.
     'current_lr': 0.0,
+    'weighted_beta': 0.0,
 
     # model
     'latent_dim': d_base,

@@ -8,7 +8,7 @@ import os
 import glob
 import math
 from modules.branch_paths import latest_in_branch, safe_branch_name, get_current_branch
-from modules.utilities import load_dataset
+from modules.utilities import load_dataset, load_scheduler, load_model
 
 if __name__ == '__main__':
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -20,40 +20,16 @@ if __name__ == '__main__':
 
     branch_name = safe_branch_name(get_current_branch())
     if retrain:
-        # Find the latest model in branch-specific models directory
-        latest_model_path = latest_in_branch('models', 'model_*.pt')
-        if latest_model_path is None:
-            raise FileNotFoundError(f"No model files found in models/{branch_name}/")
-        latest_model = str(latest_model_path)
-        print(f'Loading checkpoint from: {latest_model}')
+        vae, hparams = load_model(previous=0, onnx=False)
 
-        checkpoint = torch.load(latest_model)
-        model_state_dict = checkpoint['model_state_dict']
-        hparams = SimpleNamespace(**checkpoint['hparams'])
-        checkpoint_optimizer_state = checkpoint.get('optimizer_state_dict', getattr(hparams, 'optimizer_state_dict', None))
-        checkpoint_scheduler_state = checkpoint.get('scheduler_state_dict', getattr(hparams, 'scheduler_state_dict', None))
-        checkpoint_current_lr = getattr(hparams, 'current_lr', None)
-
-        # Keep these on hparams for downstream compatibility.
-        hparams.optimizer_state_dict = checkpoint_optimizer_state
-        hparams.scheduler_state_dict = checkpoint_scheduler_state
-        if checkpoint_current_lr is not None:
-            hparams.current_lr = checkpoint_current_lr
-
-        hparams.annealing_steps = 0
-        # hparams.n_epochs = 10
-        hparams.learning_rate = 1e-3
-        # hparams.n_samples = 1_000
-        # hparams.batch_size = 50
-
-        vae = TransformerVAE(hparams)
-        vae.load_state_dict(model_state_dict)
-        print('batch size: ', hparams.batch_size, '')
-        print('annealing steps: ', hparams.annealing_steps, '')
-        print('n_samples: ', hparams.n_samples, '')
-        print('d_model: ', hparams.d_model, '')
-        print('global epoch: ', hparams.global_epoch, '')
-        print('fixed current lr: ', hparams.current_lr, '')
+        # update learning rate
+        hparams.scheduler_start_lr = hparams.current_lr
+        hparams.scheduler_end_lr = hparams.learning_rate * 0.6
+        # update annealing list to continue from current beta
+        w_beta_start = hparams.weighted_beta
+        w_beta_end = w_beta_start * 1.2
+        hparams.annealing_list = [[0, w_beta_start], [1,w_beta_end]]
+        
     else:
         vae = TransformerVAE(hparams)
 
@@ -113,47 +89,9 @@ if __name__ == '__main__':
             optim.load_state_dict(hparams.optimizer_state_dict)
         if hparams.current_lr is not None:
             optim.param_groups[0]['lr'] = hparams.current_lr
-        if hparams.scheduler_state_dict is not None:
-            scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                optim,
-                max_lr=hparams.learning_rate,
-                steps_per_epoch=len(loader),
-                epochs=hparams.n_epochs
-            )
-            # scheduler.load_state_dict(hparams.scheduler_state_dict)
-    else:
-        start_lr = getattr(hparams, 'scheduler_start_lr', hparams.learning_rate)
-        end_lr = getattr(hparams, 'scheduler_end_lr', hparams.learning_rate * 0.1)
-        exp_curve_factor = getattr(hparams, 'scheduler_exp_curve_factor', 1.0)
-        total_scheduler_steps = max(len(loader) * hparams.n_epochs, 1)
-
-        for param_group in optim.param_groups:
-            param_group['lr'] = start_lr
-
-        def lr_lambda(current_step):
-            if total_scheduler_steps <= 1:
-                return end_lr / start_lr
-
-            progress = min(max(current_step / (total_scheduler_steps - 1), 0.0), 1.0)
-
-            if math.isclose(exp_curve_factor, 0.0, abs_tol=1e-12):
-                curved_progress = progress
-            else:
-                numerator = math.exp(exp_curve_factor * progress) - 1.0
-                denominator = math.exp(exp_curve_factor) - 1.0
-                curved_progress = numerator / denominator
-
-            current_lr = start_lr + (end_lr - start_lr) * curved_progress
-            return current_lr / start_lr
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lr_lambda)
-    # print('scheduler infos: ')
-    # print('steps at last epoch: ', scheduler.last_epoch)
-    # print('total steps: ', scheduler.total_steps)
-    # print('---' * 5)
-    # exit()
-
     
+    
+    scheduler = load_scheduler(optim, loader, hparams)
 
 
     train_vae(vae, loader, hparams, optim,
