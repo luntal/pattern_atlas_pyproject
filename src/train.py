@@ -12,13 +12,13 @@ from modules.utilities import load_dataset, load_scheduler, load_model
 
 if __name__ == '__main__':
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    # retrain = True
-    retrain = False
-
+    branch_name = safe_branch_name(get_current_branch())
     # Validation split configuration
     VALIDATION_SPLIT = hparams.validation_split  # 10% of data for validation
 
-    branch_name = safe_branch_name(get_current_branch())
+
+    # retrain = True
+    retrain = False
     if retrain:
         vae, hparams = load_model(previous=0, onnx=False)
 

@@ -11,6 +11,7 @@ import math
 import glob
 
 def load_model(previous=0, onnx=False ):
+    print()
     # Find models in the current branch-specific models directory.
     branch_name = safe_branch_name(get_current_branch())
     model_dir = Path('models') / branch_name

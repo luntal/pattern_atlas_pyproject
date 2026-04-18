@@ -35,7 +35,7 @@ model, hparams = load_model()
 offset = 0
 n_examples = 1
 interpolation_steps = 25
-latest_dataset = latest_in_branch('data', 'dataset-merged.npz')
+latest_dataset = latest_in_branch('data', 'dataset-test.npz')
 if latest_dataset is None:
     raise FileNotFoundError(f"No dataset files found in data/")
 print(f'Loading dataset: {latest_dataset}')
@@ -45,7 +45,7 @@ print('data shape: ', data.shape)
 # maxi = data.shape[0]
 maxi = 20
 print('using: ', maxi, ' samples')
-data = data[0:20]
+data = data[50:70]
 # print(data)
 # sequences = None
 syncopation_measures = []

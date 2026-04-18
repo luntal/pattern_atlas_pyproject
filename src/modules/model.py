@@ -133,7 +133,8 @@ class Decoder(nn.Module):
         decoder_layer = nn.TransformerDecoderLayer(d_model=self.emb_size, nhead=_hparams.n_heads, dim_feedforward=_hparams.ff_dim, batch_first=True)
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=_hparams.n_layers)
 
-        self.z_to_mem = nn.Linear(_hparams.latent_dim, self.emb_size)
+        self.n_memory_tokens = getattr(_hparams, 'n_memory_tokens', 1)
+        self.z_to_mem = nn.Linear(_hparams.latent_dim, self.emb_size * self.n_memory_tokens)
         self.fc_out = nn.Linear(self.emb_size, self.vocab_size)
         self.max_seq_len = _hparams.max_seq_len
 
@@ -150,7 +151,7 @@ class Decoder(nn.Module):
         # emb = emb + pos_emb
 
 
-        memory = self.z_to_mem(z).unsqueeze(1)
+        memory = self.z_to_mem(z).view(B, self.n_memory_tokens, self.emb_size)
         tgt_mask = nn.Transformer.generate_square_subsequent_mask(T).to(tgt_tokens.device)
         tgt_key_padding_mask = (tgt_tokens == self.pad_token).float()
         out = self.transformer_decoder(tgt=emb, memory=memory, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask)
@@ -164,7 +165,7 @@ class Decoder(nn.Module):
         device = device or next(self.parameters()).device
         cur_tokens = torch.full((B, 1), self.sos_token, dtype=torch.long, device=device)
         beat_tokens = torch.zeros((B, 1), dtype=torch.long, device=device)
-        memory = self.z_to_mem(z).unsqueeze(1)
+        memory = self.z_to_mem(z).view(B, self.n_memory_tokens, self.emb_size)
         finished = torch.zeros(B, dtype=torch.bool, device=device)
 
         for t in range(max_len):
@@ -281,19 +282,17 @@ def vae_loss(logits, targets, mu, logvar, beta=1.0, free_bits=0.0, pad_token=0):
     # loss per token
     recon = ce_sum / token_count_f
 
-    # kl per sample
-    kl_per_sample = -0.5 * torch.sum(
-        1.0 + logvar - mu.pow(2) - logvar.exp(),
-        dim=1
-    )
+    # Dimension-wise KL with per-dimension free bits
+    kl_per_dim = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())  # [B, latent_dim]
+    if free_bits > 0:
+        kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)  # free bits per dimension
+    kl_per_sample = kl_per_dim.sum(dim=1)  # [B]
 
     # number of valid tokens per sample
     tokens_per_sample = (targets != pad_token).sum(dim=1).clamp(min=1).to(logits.dtype)  # [B]
 
     # normalize KL per token
     kl_per_token = kl_per_sample / tokens_per_sample  # [B]
-    if free_bits > 0:
-        kl_per_token = torch.clamp(kl_per_token, min=free_bits)
     kl = kl_per_token.mean()
     kl = beta * kl
     total_loss = recon + kl

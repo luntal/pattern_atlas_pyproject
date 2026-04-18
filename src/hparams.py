@@ -30,10 +30,10 @@ for i in range(len(keys)):
 hyper_params = {
     'seed': 42,
     # training
-    'dataset_name': 'dataset-merged.npz',
+    'dataset_name': 'dataset-test.npz',
     'validation_split': 0.1,
-    'batch_size': 64,
-    'n_epochs': 150,
+    'batch_size': 30,
+    'n_epochs': 250,
     'learning_rate': 4e-4,
     'scheduler_start_lr': 4e-4,
     'scheduler_end_lr': 4e-5,
@@ -46,12 +46,13 @@ hyper_params = {
     'global_step': 0,
     'global_epoch': 0, # num of trained epochs
     'annealing_steps_norm': 1, # normalized amount of steps. 1 equals number of steps in all epochs, 0.5 equals number of steps in half of the epochs, etc.
-    'annealing_list': [[0,0],[0.3,0],[0.6,0.1],[0.9,0.2],[1,0.2]], # list of [normalized_position, beta_value] pairs. Normalized step is between 0 and 1, where 1 is the last training step. Beta value is the annealed beta at that point; segments are exponentially smoothed between points.
+    'annealing_list': [[0,0],[0.3,0],[0.6,0.05],[0.9,0.1],[1,0.1]], # list of [normalized_position, beta_value] pairs. Normalized step is between 0 and 1, where 1 is the last training step. Beta value is the annealed beta at that point; segments are exponentially smoothed between points.
     # 'current_lr': 0.0,
     'weighted_beta': 0.0,
 
     # model
-    'latent_dim': d_base,
+    'latent_dim': d_base * 2,
+    'n_memory_tokens': 32,
 
     'steps_per_bar': 32,
     'total_steps': 32 * 2,

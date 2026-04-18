@@ -3,6 +3,7 @@ from pathlib import Path
 import pretty_midi
 import numpy as np
 import os
+import subprocess
 # from vae_rnn_09.hparams import hparams
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
@@ -11,6 +12,21 @@ import threading
 import time
 from types import SimpleNamespace
 import random
+from dataclasses import dataclass, field
+from typing import List, Tuple
+import re
+
+
+@dataclass
+class ExtractionStats:
+    """Statistics from MIDI extraction operation."""
+    files_count: int = 0
+    skipped_invalid: int = 0
+    skipped_time_signature: int = 0
+    skipped_no_drums: int = 0
+    sequences_before_filter: int = 0
+    failed_files: List[Tuple[str, str]] = field(default_factory=list)
+
 
 def get_randomness(value, strength=1, invert=False):
     """
@@ -247,12 +263,82 @@ def remap_pitches(notes):
 
     return remapped_notes
 
+def note_checks(note, n_vel, clip=False, randomize_velocity=0, drums_only=False, roland=True):
+    pitch = note.pitch
+    # Check if MIDI note is in valid range (0-127)
+    if pitch < 0 or pitch > 127:
+        print(f'Warning: Invalid MIDI pitch {pitch} - skipping note')
+        return None
+
+    if clip:
+        # clip notes to range:
+        if pitch < 36 or pitch > 36 + 24:
+            if roland:
+                if pitch == 22:
+                    pitch = 42 # hi-hat closed edge -> hi-hat closed
+                elif pitch == 26:
+                    pitch = 46 # hi-hat open edge -> hi-hat open
+                else:
+                    return None
+            else:
+                return None
+    if randomize_velocity > 0:
+        vel = note.velocity / 127
+        v_deviation = float(np.random.uniform(-randomize_velocity, randomize_velocity))
+        vel += v_deviation
+        vel = min(max(0, vel), 1)
+        vel *= (n_vel - 1)
+        vel = int(vel)
+    else:
+
+        vel = int(note.velocity / (127/(n_vel-1)))
+    if vel >= n_vel:
+        print('vel: ', vel)
+        print('velocity range exceeded')
+        exit()
+    
+    # Remap drum pitches when in drums_only mode
+    if drums_only:
+        remapped_pitch = remap_drum_pitch_to_24(pitch)
+        if remapped_pitch is None:
+            # Skip notes that don't map to our drum kit
+            return None
+        pitch = remapped_pitch
+        if pitch < 36 or pitch > 36 + 24:
+            print(f'Warning: MIDI pitch {pitch} out of expected range after remapping - skipping note')
+            exit()
+    # wrap the pitches to 24 values with 36 as basis
+    pitch = pitch - 12
+    pitch = pitch % 24
+
+    
+    return pitch, vel
+
+
+def get_current_git_branch_name(repo_root):
+    """Return a filesystem-safe current git branch name for the given repo root."""
+    try:
+        branch = subprocess.check_output(
+            ["git", "-C", repo_root, "rev-parse", "--abbrev-ref", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        branch = "default"
+
+    if not branch:
+        branch = "default"
+    elif branch == "HEAD":
+        branch = "detached_head"
+
+    return branch.replace("/", "_").replace("\\", "_")
 
 
 class MidiProcessor:
     def __init__(self, hparams: SimpleNamespace):
         self.hparams = hparams
         self.sequences = []
+        # self.seq_advanced = []
         self.metadata = []
         self.playback_position = 0
         # self.matrix = np.zeros((hparams.height, hparams.width))
@@ -263,7 +349,19 @@ class MidiProcessor:
 
 
     def load(self, dataset_name, skip=0, take=0):
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data', dataset_name)
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        data_root = os.path.join(repo_root, 'data')
+        branch_name = get_current_git_branch_name(repo_root)
+        branch_path = os.path.join(data_root, branch_name, dataset_name)
+        legacy_path = os.path.join(data_root, dataset_name)
+
+        if os.path.exists(branch_path):
+            path = branch_path
+        elif os.path.exists(legacy_path):
+            path = legacy_path
+        else:
+            path = branch_path
+
         npz_data = np.load(path, allow_pickle=True)
 
         # Support both old and new format
@@ -282,8 +380,69 @@ class MidiProcessor:
             self.metadata = npz_data['metadata'][skip:skip + take].tolist()
         else:
             self.metadata = []
-    
 
+    def filter_duplicate_sequences(self):
+        """
+        Remove duplicate sequences and corresponding metadata.
+        Modifies self.sequences and self.metadata in place.
+        """
+        if len(self.sequences) == 0:
+            return
+        
+        sequences_before_filter = len(self.sequences)
+        print('\nFiltering similar sequences...')
+        unique_sequences = []
+        unique_metadata = []
+        seen_sequences = set()
+
+        for idx, seq in enumerate(self.sequences):
+            # Convert list to tuple so it can be hashed
+            seq_tuple = tuple(seq)
+            if seq_tuple not in seen_sequences:
+                seen_sequences.add(seq_tuple)
+                unique_sequences.append(seq)
+                # Keep metadata at the same index
+                if idx < len(self.metadata):
+                    unique_metadata.append(self.metadata[idx])
+
+        self.sequences = unique_sequences
+        self.metadata = unique_metadata
+        filtered_count = sequences_before_filter - len(self.sequences)
+        print(f'Filtered out {filtered_count} duplicate sequences')
+
+    def print_extraction_summary(self, stats: ExtractionStats, drums_only: bool, filter_duplicates: bool):
+        """
+        Print extraction summary statistics.
+        
+        Args:
+            stats: ExtractionStats dataclass containing extraction statistics
+            drums_only: whether drums-only mode was enabled
+            filter_duplicates: whether duplicate filtering was enabled
+        """
+        print('\n' + '=' * 50)
+        print(f'EXTRACTION SUMMARY')
+        if drums_only:
+            print(f'Mode: drums_only')
+        if filter_duplicates:
+            print(f'Filter duplicates: enabled')
+        print(f'Files in selection: {stats.files_count}')
+        print(f'Files skipped (invalid/corrupt): {stats.skipped_invalid}')
+        print(f'Files skipped (time signature): {stats.skipped_time_signature}')
+        if drums_only:
+            print(f'Files skipped (no drums): {stats.skipped_no_drums}')
+        print(f'Total sequences extracted: {stats.sequences_before_filter}')
+        if filter_duplicates:
+            print(f'Sequences after filtering: {len(self.sequences)}')
+            print(f'Duplicates removed: {stats.sequences_before_filter - len(self.sequences)}')
+        else:
+            print(f'Final sequences: {len(self.sequences)}')
+
+        if stats.failed_files:
+            print(f'\nFailed files ({len(stats.failed_files)}):')
+            for failed_file, error in stats.failed_files:
+                print(f'  - {failed_file}')
+                print(f'    Error: {error}')
+        print('=' * 50)
 
     def extract(
             self, midi_folder_path=None, skip=0, take=0, clip=False,
@@ -309,7 +468,6 @@ class MidiProcessor:
 
         # Filter out duplicate files with numeric suffixes (e.g., .1.mid, .2.mid, .3.mid)
         # Keep only original files without numeric suffixes
-        import re
         filenames = []
         duplicate_pattern = re.compile(r'\.\d+\.mid[i]?$')  # Matches .1.mid, .2.midi, .123.mid, etc.
 
@@ -332,13 +490,10 @@ class MidiProcessor:
         print(f'Extracting {take} files from {skip} to {skip + take}')
         selection = filenames[skip:skip + take]
         metadata = []
-        prev_n_notes = 0
-        prev_last_note = 0
-        skipped_no_drums = 0
-        skipped_invalid = 0
-        skipped_time_signature = 0
-        failed_files = []
         allowed_time_signatures = {(4, 4), (2, 4), (2, 2)}
+
+        statistics = ExtractionStats()
+
 
 
         for file_idx, filename in enumerate(selection):
@@ -348,8 +503,8 @@ class MidiProcessor:
                 print('-------------------------------------')
                 print(f'FAILED: {filename}')
                 print(f'Error: {e}')
-                skipped_invalid += 1
-                failed_files.append((filename, str(e)))
+                statistics.skipped_invalid += 1
+                statistics.failed_files.append((filename, str(e)))
                 continue
 
             print('-------------------------------------')
@@ -366,7 +521,7 @@ class MidiProcessor:
             if not signatures_in_file.issubset(allowed_time_signatures):
                 unsupported = sorted(signatures_in_file)
                 print(f'Unsupported time signature(s) {unsupported} - skipping file')
-                skipped_time_signature += 1
+                statistics.skipped_time_signature += 1
                 continue
 
             tempo_times, tempo_changes = midi_data.get_tempo_changes()
@@ -388,7 +543,7 @@ class MidiProcessor:
                 drum_instruments = [inst for inst in midi_data.instruments if inst.is_drum]
                 if len(drum_instruments) == 0:
                     print('No drum tracks found - skipping file')
-                    skipped_no_drums += 1
+                    statistics.skipped_no_drums += 1
                     continue
                 instruments_to_process = drum_instruments
             else:
@@ -398,12 +553,12 @@ class MidiProcessor:
             if len(instruments_to_process) == 0:
                 print('No instruments to process - skipping file')
                 continue
+                
 
             for instrument in instruments_to_process:
                 # print('instrument name: ', instrument.name)
                 width = self.hparams.width
                 height = self.hparams.height
-                # print(width, height)
 
                 bpm = tempo_changes[0]
                 seconds_per_beat = 60 / bpm
@@ -419,10 +574,7 @@ class MidiProcessor:
                 last_note_16th_index = int(sorted_midi_notes[-1].start // seconds_per_16th_note)
                 len_in_bars = np.ceil(last_note_16th_index / 16)
                 offset = False
-                # if len_in_bars % 2 == 1:
-                #     print('odd bar count. cutting 1st bar!')
-                #     offset = True
-                #     len_in_bars -= 1
+                
                 if len_in_bars < 2:
                     print('Too short sequence!')
                     continue
@@ -431,16 +583,10 @@ class MidiProcessor:
                 print(
                     f"Number of notes: {len(sorted_midi_notes)}, last note at: {sorted_midi_notes[-1].start:.2f}s, 16th index: {last_note_16th_index}, len in bars: {len_in_bars:.2f}")
                 rhythm_len = 2  # bars
-                n_patterns = max(len_in_bars // rhythm_len, 1)
+                n_patterns = int(max(len_in_bars // rhythm_len, 1))
 
-                # take_n_patterns = max(1, n_patterns_full // (1 + n_patterns_full // 10))
-                # pattern_index_step_size = n_patterns_full // take_n_patterns
-                # print(f"n_patterns_full: {n_patterns_full}, take_n_patterns: {take_n_patterns}")
                 print(f"n_patterns_full: {n_patterns}")
-                # pattern_index = 0
-                # if file_idx > 20:
-                #     exit()
-                # continue
+
 
                 step_token = self.hparams.step_token  # 1 sixteenth
                 min_pitch_token = self.hparams.min_pitch_token
@@ -451,227 +597,104 @@ class MidiProcessor:
                 # extract midi notes and store them in a list of notes.
                 # note = {'step_idx': int, 'deviation': int, 'pitch': int, 'vel': int}
                 note_list = []
+                notes_advanced = []
+                prev_note_start = 0
                 for note in sorted_midi_notes:
-
-                    pitch = note.pitch
-
-                    # Check if MIDI note is in valid range (0-127)
-                    if pitch < 0 or pitch > 127:
-                        print(f'Warning: Invalid MIDI pitch {pitch} - skipping note')
+                    
+                    result = note_checks(note, n_vel=self.hparams.n_vel, clip=clip, randomize_velocity=randomize_velocity, drums_only=drums_only, roland=roland)
+                    if result is None:
                         continue
+                    pitch, vel = result
+                    
 
-                    if clip:
-                        # clip notes to range:
-                        if pitch < 36 or pitch > 36 + 24:
-                            if roland:
-                                if pitch == 22:
-                                    pitch = 42 # hi-hat closed edge -> hi-hat closed
-                                elif pitch == 26:
-                                    pitch = 46 # hi-hat open edge -> hi-hat open
-                                else:
-                                    continue
-                            else:
-                                continue
-                    if randomize_velocity > 0:
-                        vel = note.velocity / 127
-                        deviation = float(np.random.uniform(-randomize_velocity, randomize_velocity))
-                        vel += deviation
-                        vel = min(max(0, vel), 1)
-                        vel *= (self.hparams.n_vel - 1)
-                        vel = int(vel)
-                    else:
+                    
 
-                        vel = int(note.velocity / (127/(self.hparams.n_vel-1)))
-                    if vel >= self.hparams.n_vel:
-                        print('vel: ', vel)
-                        print('velocity range exceeded')
-                        exit()
+
+
 
                     # retrieve the notes
+                    window_size_in_16th = self.hparams.width
                     current_time_idx_16th = round(note.start / seconds_per_16th_note)
+                    current_16th = note.start / seconds_per_16th_note
+                    current_window = current_time_idx_16th // (window_size_in_16th)
+                    current_step_in_window = current_time_idx_16th % (window_size_in_16th)
+                    
+                    
                     qnt_time = current_time_idx_16th * seconds_per_16th_note
-                    deviation = note.start - qnt_time
-                    isDeviationNegative = deviation < 0
-                    max_deviation = seconds_per_16th_note / 2
-                    if abs(deviation) > max_deviation:
-                        # print(f'Exceeding: deviation {deviation} > max_deviation {max_deviation}.')
-                        deviation = (deviation / abs(deviation)) * max_deviation
-                    deviation = deviation / max_deviation  # normalize to - 1 to 1
-                    deviation *= 1-current_qnt_strength
-                    # deviation = get_randomness(deviation, qnt_randomness, invert=invert)
-                    deviation *= (self.hparams.n_timing - 1) / 2 # scale to n_timing range/2 -> -16...16
-                    deviation = int(deviation) + int(self.hparams.n_timing / 2)  # shift to right start point -> 0...33
-                    # bar_counter = current_time_idx_16th % self.hparams.width
+                    dev = note.start - qnt_time
+                    dev_norm = current_16th - current_time_idx_16th
+                    # deviation_norm = (note.start - qnt_time) / seconds_per_16th_note
+                    dev_token = int((dev_norm * (self.hparams.n_timing // 2)) + self.hparams.center_timing_token)
+                    valid_timing_range = self.hparams.min_timing_token <= dev_token < self.hparams.max_timing_token
+                    if not valid_timing_range:
+                        print(f'Warning: dev token out of range: {dev_token}')
 
-                    # if bar_counter == 0 and isDeviationNegative:
-                    #     deviation_center = self.hparams.n_timing // 2
-                    #     deviation =  deviation_center + self.hparams.min_timing_token
+                    note_interval = note.start - prev_note_start
+                    note_interval_in_16th = note_interval / seconds_per_16th_note
+                    first_note_in_window = not any(
+                        n['c_window'] == current_window
+                        for n in notes_advanced
+                    )
+                    
+                    if first_note_in_window:
+                        current_previous_note_start = current_window * window_size_in_16th * seconds_per_16th_note
+                        window_note_interval = note.start - current_previous_note_start
+                        window_note_interval = max(0, window_note_interval)  # Ensure non-negative
+                        window_note_interval_in_16th = window_note_interval / seconds_per_16th_note
+                        window_dev_norm = max(0, dev_norm)
+                    else:
+                        window_note_interval = None
+                        window_note_interval_in_16th = None
+                        window_dev_norm = None
 
-                    # Remap drum pitches when in drums_only mode
-                    if drums_only:
-                        remapped_pitch = remap_drum_pitch_to_24(pitch)
-                        if remapped_pitch is None:
-                            # Skip notes that don't map to our drum kit
-                            continue
-                        pitch = remapped_pitch
-                        if pitch < 36 or pitch > 36 + 24:
-                            print(f'Warning: MIDI pitch {pitch} out of expected range after remapping - skipping note')
-                            exit()
-                    # wrap the pitches to 24 values with 36 as basis
-                    pitch = pitch - 12
-                    pitch = pitch % 24
 
-                    # pitch = note.pitch - 36
-                    if pitch >= self.hparams.max_pitch_token:
-                        print('pitch: ', pitch)
-                        exit()
-                    new_note = {
-                        'step_idx': current_time_idx_16th,
-                        'deviation': deviation, # mapped to n_timing range
-                        'pitch': pitch, #
-                        'vel': vel
+                    advanced_note = {
+                        'start': note.start,
+                        'pitch': note.pitch,
+                        'pitch_token': pitch + min_pitch_token,
+                        'velocity': note.velocity,
+                        'velocity_token': vel + min_vel_token,
+                        'current_16th': current_16th,
+                        'current_time_idx_16th': current_time_idx_16th,
+                        'qnt_time': qnt_time,
+                        'deviation': dev,
+                        'dev_norm': dev_norm,
+                        'dev_token': dev_token,
+                        'c_window': current_window,
+                        'c_step_in_window': current_step_in_window,
+                        'note_interval': note_interval,
+                        'note_interval_in_16th': note_interval_in_16th,
+                        'filename': filename,
+                        'first_note_in_window': first_note_in_window,
+                        'window_note_interval': window_note_interval,
+                        'window_note_interval_in_16th': window_note_interval_in_16th,
+                        'window_dev_norm': window_dev_norm
                     }
-                    # qnt_notes.append((current_time_idx_16th, pitch, vel))
-                    note_list.append(new_note)
+                    prev_note_start = note.start
+                    notes_advanced.append(advanced_note)
 
-                # randomize
-                if pitch_randomness:
-                    note_list = randomize_pitches(note_list, self.hparams.n_pitch)
-                if remap:
-                    note_list = remap_pitches(note_list, self.hparams.n_pitch)
 
-                # Check if first bar is empty and remove it if so
-                if note_list:
-                    first_bar_length = 16  # 16th notes in one bar
-                    has_notes_in_first_bar = any(note['step_idx'] < first_bar_length for note in note_list)
-                    if not has_notes_in_first_bar:
-                        # Shift all notes back by one bar
-                        note_list = [
-                            {**note, 'step_idx': note['step_idx'] - first_bar_length}
-                            for note in note_list
-                        ]
+                # self.seq_advanced.append(notes_advanced)
+                token_list, metadata = self.notes_advanced_to_token_sequences_stream(
+                    notes_advanced,
+                    self.hparams.width,
+                    10,
+                    max_window_exclusive=n_patterns,
+                )
+                self.metadata.extend(metadata)
 
-                    # Skip what is now the first bar if it has fewer than 6 notes (originally the second bar)
-                    notes_in_first_bar = sum(1 for note in note_list if note['step_idx'] < first_bar_length)
-                    if notes_in_first_bar < 6:
-                        # Remove notes in first bar and shift everything after
-                        note_list = [
-                            {**note, 'step_idx': note['step_idx'] - first_bar_length}
-                            for note in note_list
-                            if note['step_idx'] >= first_bar_length
-                        ]
-
-                # split the whole seq into sequences of 2 bars:
-                len_2bars = 2 * 16  # amount of 16th notes in 2 bars
-                qnt_notes_2bars = []
-                window = []
-                # handle the case of 2bars midi files, which have no 32nd step
-                if note_list and note_list[-1]['step_idx'] < len_2bars:
-                    new_note = {'step_idx': len_2bars, 'deviation': 0, 'pitch': 0, 'vel': 0}
-                    note_list.append(new_note)
-
-                ##############################################
-                # if offset=Ture remove the 1st bar:
-                if offset == True:
-                    note_list = [note for note in note_list if note["step_idx"] > 16]
-                    len_2bars = len_2bars - 1
-                # split the note stream into 2bar-windows
-                for note in note_list:
-                    step_idx = note['step_idx']
-                    pitch = note['pitch']
-                    vel = note['vel']
-                    deviation = note['deviation']
-                    # print(step_idx, pitch)
-                    # print('if ', step_idx // len_2bars)
-                    if step_idx // len_2bars == len(qnt_notes_2bars):
-                        # print(step_idx)
-                        qnt_notes_2bars.append(window)
-                        window = []
-
-                    # if step_idx % len_2bars == 0 and deviation < 0:
-                    #     deviation = 0 # avoid shifting notes before bar start!
-                    window.append((step_idx % len_2bars, deviation, pitch, vel))
-                # print('split: ', qnt_notes_2bars)
-                # Apply jump filter: keep only every jump-th window
-                filtered_windows = qnt_notes_2bars[::jump]
-                # tokenize the 2 bar windows
-                ##############################################
-                token_list = []
-                pattern_index = 0
-                for window in filtered_windows:
-                    token_window = []
-                    prev_idx = 0  # Reset prev_idx for each window to avoid skipping notes
-                    for step_idx, deviation, pitch, vel in window:
-                        steps = step_idx - prev_idx
-                        for _ in range(steps):
-                            token_window.append(step_token)
-                        prev_idx = step_idx
-
-                        # insert tokens for the note:
-                        token_window.append(pitch + min_pitch_token)
-                        token_window.append(vel + min_vel_token)
-                        token_window.append(deviation + self.hparams.min_timing_token)
-                    token_window.append(eos)
-                    if len(token_window) < 15:
-                        continue
-                    token_list.append(token_window)  # list of token sequences
-                    self.metadata.append((filename, pattern_index))
-                    pattern_index += 1
-                # for i in range(4):
-                #     print(token_list[i])
-                #     print(qnt_notes_2bars[i])
 
                 self.sequences = self.sequences + token_list
                 print('\nTotal Number of Sequences: ', len(self.sequences))
 
         # Filter similar sequences if requested
-        sequences_before_filter = len(self.sequences)
-        if filter_duplicates and len(self.sequences) > 0:
-            print('\nFiltering similar sequences...')
-            unique_sequences = []
-            unique_metadata = []
-            seen_sequences = set()
-
-            for idx, seq in enumerate(self.sequences):
-                # Convert list to tuple so it can be hashed
-                seq_tuple = tuple(seq)
-                if seq_tuple not in seen_sequences:
-                    seen_sequences.add(seq_tuple)
-                    unique_sequences.append(seq)
-                    # Keep metadata at the same index
-                    if idx < len(self.metadata):
-                        unique_metadata.append(self.metadata[idx])
-
-            self.sequences = unique_sequences
-            self.metadata = unique_metadata
-            filtered_count = sequences_before_filter - len(self.sequences)
-            print(f'Filtered out {filtered_count} duplicate sequences')
-
-        # Print summary statistics
-        print('\n' + '=' * 50)
-        print(f'EXTRACTION SUMMARY')
-        if drums_only:
-            print(f'Mode: drums_only')
+        statistics.sequences_before_filter = len(self.sequences)
         if filter_duplicates:
-            print(f'Filter duplicates: enabled')
-        print(f'Files in selection: {len(selection)}')
-        print(f'Files skipped (invalid/corrupt): {skipped_invalid}')
-        print(f'Files skipped (time signature): {skipped_time_signature}')
-        if drums_only:
-            print(f'Files skipped (no drums): {skipped_no_drums}')
-        print(f'Total sequences extracted: {sequences_before_filter}')
-        if filter_duplicates:
-            print(f'Sequences after filtering: {len(self.sequences)}')
-            print(f'Duplicates removed: {sequences_before_filter - len(self.sequences)}')
-        else:
-            print(f'Final sequences: {len(self.sequences)}')
+            self.filter_duplicate_sequences()
 
-        if failed_files:
-            print(f'\nFailed files ({len(failed_files)}):')
-            for failed_file, error in failed_files:
-                print(f'  - {failed_file}')
-                print(f'    Error: {error}')
-        print('=' * 50)
+        
+        self.print_extraction_summary(statistics, drums_only, filter_duplicates)
+
 
 
     def convert_to_numpy(self):
@@ -705,8 +728,11 @@ class MidiProcessor:
             dataset_name += '.npz'
 
 
-        # Prepend data folder path
-        data_folder = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data')
+        # Save by git branch to keep datasets isolated per branch.
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        data_root = os.path.join(repo_root, 'data')
+        branch_name = get_current_git_branch_name(repo_root)
+        data_folder = os.path.join(data_root, branch_name)
         os.makedirs(data_folder, exist_ok=True)
         dataset_path = os.path.join(data_folder, dataset_name)
 
@@ -715,6 +741,7 @@ class MidiProcessor:
 
         np.savez(dataset_path, data=padded_sequences, metadata=metadata_array)
         print(f"Dataset saved to {dataset_path}")
+        print(f"  - Branch folder: {branch_name}")
         print(f"  - Data shape: {padded_sequences.shape}")
         print(f"  - Metadata entries: {len(metadata_array)}")
 
@@ -1034,3 +1061,71 @@ class MidiProcessor:
 
             self.playback_position += 1
             self.playback_position %= self.hparams.width
+
+    
+
+    def notes_advanced_to_token_sequences_stream(
+        self,
+        notes_advanced,
+        steps_per_window=32,
+        min_seq_len=0,
+        max_window_exclusive=None,
+    ):
+        step_token = self.hparams.step_token
+        eos_token = self.hparams.eos_token
+    
+        sequences = []
+        metadata = []
+        if not notes_advanced:
+            return sequences, metadata
+    
+        current_window = None
+        current_seq = []
+        last_step_in_window = None
+    
+        def flush_window():
+            nonlocal current_seq, last_step_in_window
+            if last_step_in_window is not None:
+                trailing = max(0, steps_per_window - last_step_in_window)
+                if trailing:
+                    current_seq.extend([step_token] * trailing)
+            current_seq.append(eos_token)
+    
+            if len(current_seq) >= min_seq_len:
+                sequences.append(current_seq)
+                metadata.append((notes_advanced[0]["filename"], current_window))
+    
+            current_seq = []
+            last_step_in_window = None
+    
+        for n in notes_advanced:
+            w = n["c_window"]
+            s = n["c_step_in_window"]
+
+            # Keep only full 2-bar windows when requested.
+            if max_window_exclusive is not None and w >= max_window_exclusive:
+                continue
+    
+            # Window change: close previous, start new
+            if current_window is None:
+                current_window = w
+            elif w != current_window:
+                flush_window()
+                current_window = w
+    
+            # Same-window note: emit step gap after previous note
+            if last_step_in_window is not None:
+                gap = max(0, s - last_step_in_window)
+                if gap:
+                    current_seq.extend([step_token] * gap)
+    
+            # Required order: pitch, velocity, deviation, then later step gap
+            current_seq.append(n["pitch_token"])
+            current_seq.append(n["velocity_token"])
+            current_seq.append(n["dev_token"])
+    
+            last_step_in_window = s
+    
+        # Final window
+        flush_window()
+        return sequences, metadata
