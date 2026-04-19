@@ -10,8 +10,8 @@
     .panel { background: #fffdf7; border: 1px solid #d8d7cf; border-radius: 12px; padding: 10px; }
     canvas { width: 100%; border: 1px solid #d8d7cf; border-radius: 10px; background: #fff; display: block; }
     #field { height: 520px; }
-    #recon { height: 220px; margin-top: 10px; }
-    #latent { height: 80px; }
+    #recon { height: 200px; margin-top: 10px; }
+    #latent { height: 30px; ; margin-top: 10px; }
     #influence { height: 120px; }
     .row { display: grid; grid-template-columns: 90px 1fr 60px; gap: 8px; align-items: center; margin: 8px 0; }
     .btns { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
@@ -30,11 +30,11 @@
     <div class="panel">
       <h3>RBF Latent Field Server</h3>
       <canvas id="field"></canvas>
+      <h4>Latent Vector</h4>
+      <canvas id="latent"></canvas>
       <canvas id="recon"></canvas>
     </div>
     <div class="panel">
-      <h4>Latent Vector</h4>
-      <canvas id="latent"></canvas>
       <h4>Anchor Influence</h4>
       <canvas id="influence"></canvas>
       <div class="row"><label>Grid</label><input id="grid" type="range" min="4" max="60" step="1" /><span id="gridVal"></span></div>
@@ -42,11 +42,9 @@
       <div class="btns">
         <button id="modeBtn">Heat: Mag</button>
         <button id="influenceBtn">Influence: Raw</button>
-        <button id="encodeBtn">Encode MIDI: Off</button>
+        <button id="decodeBtn">Decode: Off</button>
         <button id="quantizeBtn">Mode: Continuous</button>
       </div>
-      <h4>MIDI Buffer JSON</h4>
-      <textarea id="midi" placeholder='{"tokens":[...]} or {"matrix":[[...], ...]}'></textarea>
       <h4>Status</h4>
       <div class="status-indicator"><span id="statusLed" class="status-led"></span><span id="statusText">Disconnected</span></div>
       <pre id="status">connecting...</pre>
@@ -66,7 +64,7 @@ const S = {
   sigma: 0.3,
   heatMode: "magnitude",
   influenceMode: "raw",
-  encodeMidi: false,
+  decodeEnabled: false,
   halfExtent: 2.0,
   nTiming: 4,
   decodeStatus: "idle",
@@ -92,9 +90,8 @@ const gridVal = document.getElementById("gridVal");
 const sigmaVal = document.getElementById("sigmaVal");
 const modeBtn = document.getElementById("modeBtn");
 const influenceBtn = document.getElementById("influenceBtn");
-const encodeBtn = document.getElementById("encodeBtn");
+const decodeBtn = document.getElementById("decodeBtn");
 const quantizeBtn = document.getElementById("quantizeBtn");
-const midiEl = document.getElementById("midi");
 
 let socket = null;
 let frameInFlight = false;
@@ -175,23 +172,28 @@ function drawField() {
     ctx.fillStyle = "#0f5d6f";
     ctx.strokeStyle = "#f5fcfc";
     ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-    ctx.fillStyle = "#173f3b";
-    ctx.font = "11px Menlo";
-    ctx.fillText(String(i), x + 8, y - 8);
+    ctx.beginPath(); ctx.arc(x, y, 15, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 16px Menlo";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(String(i), x, y);
+    ctx.textAlign = "start";
+    ctx.textBaseline = "alphabetic";
   });
   const [cx, cy] = toCanvas(S.cursor);
   ctx.strokeStyle = "#ffffff";
-  ctx.lineWidth = 5;
+  ctx.lineWidth = 8;
   ctx.beginPath();
-  ctx.moveTo(cx - 15, cy); ctx.lineTo(cx + 15, cy);
-  ctx.moveTo(cx, cy - 15); ctx.lineTo(cx, cy + 15);
+  const crossSize = 25;
+  ctx.moveTo(cx - crossSize, cy); ctx.lineTo(cx + crossSize, cy);
+  ctx.moveTo(cx, cy - crossSize); ctx.lineTo(cx, cy + crossSize);
   ctx.stroke();
   ctx.strokeStyle = "#ad442a";
-  ctx.lineWidth = 2.5;
+  ctx.lineWidth = 4;
   ctx.beginPath();
-  ctx.moveTo(cx - 15, cy); ctx.lineTo(cx + 15, cy);
-  ctx.moveTo(cx, cy - 15); ctx.lineTo(cx, cy + 15);
+  ctx.moveTo(cx - crossSize, cy); ctx.lineTo(cx + crossSize, cy);
+  ctx.moveTo(cx, cy - crossSize); ctx.lineTo(cx, cy + crossSize);
   ctx.stroke();
   ctx.lineWidth = 1;
 }
@@ -275,24 +277,18 @@ function render() {
     `grid=${S.grid} sigma=${S.sigma.toFixed(2)} heat=${S.heatMode}`,
     `latent_dim=${S.latent.length} points=${S.points.length}`,
     `decode_status=${S.decodeStatus} decode_step=${S.decodeStep}`,
-    `encode_midi=${S.encodeMidi}`,
   ].join("\n");
 }
 
 function payload() {
-  let midi = null;
-  const raw = midiEl.value.trim();
-  if (raw) {
-    try { midi = JSON.parse(raw); } catch { midi = null; }
-  }
   return {
     cursor: S.snappedCursor,
     draggable_points: S.snappedPoints.length === S.points.length ? S.snappedPoints : S.points,
     heatmap: null,
     latent_vector: null,
-    midi_buffer: midi,
+    midi_buffer: null,
     influence_values: null,
-    button_values: { heatmapMode: S.heatMode, influenceMode: S.influenceMode, encodeMidi: S.encodeMidi },
+    button_values: { heatmapMode: S.heatMode, influenceMode: S.influenceMode, encodeMidi: false, decodeEnabled: S.decodeEnabled },
     slider_values: { gridResolution: S.grid, sigma: S.sigma },
   };
 }
@@ -399,10 +395,16 @@ influenceBtn.addEventListener("click", () => {
   sendPayload();
 });
 
-encodeBtn.addEventListener("click", () => {
-  S.encodeMidi = !S.encodeMidi;
-  encodeBtn.classList.toggle("active", S.encodeMidi);
-  encodeBtn.textContent = S.encodeMidi ? "Encode MIDI: On" : "Encode MIDI: Off";
+decodeBtn.addEventListener("click", () => {
+  S.decodeEnabled = !S.decodeEnabled;
+  decodeBtn.classList.toggle("active", S.decodeEnabled);
+  decodeBtn.textContent = S.decodeEnabled ? "Decode: On" : "Decode: Off";
+  if (!S.decodeEnabled) {
+    S.recon = [];
+    S.decodeStatus = "idle";
+    S.decodeStep = -1;
+    render();
+  }
   sendPayload();
 });
 
@@ -438,6 +440,7 @@ socket.on("bootstrap", (data) => {
   S.sigma = data.slider_values.sigma;
   S.heatMode = data.button_values.heatmapMode;
   S.influenceMode = data.button_values.influenceMode;
+  S.decodeEnabled = !!data.button_values.decodeEnabled;
   S.halfExtent = data.field_half_extent;
   S.nTiming = data.n_timing;
   S.decodeStatus = data.decode_status || "idle";
@@ -448,6 +451,8 @@ socket.on("bootstrap", (data) => {
   sigmaVal.textContent = S.sigma.toFixed(2);
   modeBtn.textContent = S.heatMode === "magnitude" ? "Heat: Mag" : "Heat: Conf";
   influenceBtn.textContent = S.influenceMode === "raw" ? "Influence: Raw" : "Influence: %";
+  decodeBtn.classList.toggle("active", S.decodeEnabled);
+  decodeBtn.textContent = S.decodeEnabled ? "Decode: On" : "Decode: Off";
   render();
   sendPayload();
 });
@@ -462,6 +467,7 @@ socket.on("frame", (data) => {
   S.influencePct = data.influence_percentage;
   S.heatMode = data.button_values.heatmapMode;
   S.influenceMode = data.button_values.influenceMode;
+  S.decodeEnabled = !!data.button_values.decodeEnabled;
   S.grid = data.slider_values.gridResolution;
   S.sigma = data.slider_values.sigma;
   S.halfExtent = data.field_half_extent;
@@ -474,6 +480,8 @@ socket.on("frame", (data) => {
   sigmaVal.textContent = S.sigma.toFixed(2);
   modeBtn.textContent = S.heatMode === "magnitude" ? "Heat: Mag" : "Heat: Conf";
   influenceBtn.textContent = S.influenceMode === "raw" ? "Influence: Raw" : "Influence: %";
+  decodeBtn.classList.toggle("active", S.decodeEnabled);
+  decodeBtn.textContent = S.decodeEnabled ? "Decode: On" : "Decode: Off";
   render();
   flushPayload();
 });

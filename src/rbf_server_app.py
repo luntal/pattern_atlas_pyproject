@@ -41,6 +41,7 @@ class FrontendState:
     control_points: np.ndarray
     heatmap_mode: str = "magnitude"
     influence_mode: str = "raw"
+    decode_enabled: bool = False
     grid_resolution: int = 30
     sigma: float = 0.30
     latent_vector: np.ndarray | None = None
@@ -510,6 +511,7 @@ class RBFServerController:
                 "heatmapMode": self.state.heatmap_mode,
                 "influenceMode": self.state.influence_mode,
                 "encodeMidi": encode_midi,
+                "decodeEnabled": self.state.decode_enabled,
             },
             "slider_values": {
                 "gridResolution": self.state.grid_resolution,
@@ -566,6 +568,7 @@ class RBFServerController:
             influence_mode = str(button_values.get("influenceMode", self.state.influence_mode))
             if influence_mode not in {"raw", "percentage"}:
                 influence_mode = "raw"
+            decode_enabled = bool(button_values.get("decodeEnabled", self.state.decode_enabled))
 
             self.state.cursor = cursor
             self.state.control_points = points
@@ -573,6 +576,7 @@ class RBFServerController:
             self.state.sigma = sigma
             self.state.heatmap_mode = heat_mode
             self.state.influence_mode = influence_mode
+            self.state.decode_enabled = decode_enabled
 
             weights_signature = self._make_weights_signature(points, sigma)
             if weights_signature != self._last_weights_signature:
@@ -596,15 +600,21 @@ class RBFServerController:
 
             self.state.latent_vector = latent_vector.astype(np.float32)
 
-            # Only restart the decoder when the latent actually changed.
-            # In quantized mode the frontend only sends on cell change, so the signature
-            # will always differ; in continuous mode this prevents redundant restarts.
-            _decode_sig = (self.state.latent_vector.shape, np.round(self.state.latent_vector, 5).tobytes())
-            if _decode_sig != self._last_triggered_latent_signature:
-                self.decoder_manager.request_decode(self.state.latent_vector, self.reconstruction_matrix)
-                self.decode_status = "decoding"
-                self._last_triggered_latent_signature = _decode_sig
-            self._refresh_decoder_update()
+            if self.state.decode_enabled:
+                # Only restart the decoder when the latent actually changed.
+                # In quantized mode the frontend only sends on cell change, so the signature
+                # will always differ; in continuous mode this prevents redundant restarts.
+                _decode_sig = (self.state.latent_vector.shape, np.round(self.state.latent_vector, 5).tobytes())
+                if _decode_sig != self._last_triggered_latent_signature:
+                    self.decoder_manager.request_decode(self.state.latent_vector, self.reconstruction_matrix)
+                    self.decode_status = "decoding"
+                    self._last_triggered_latent_signature = _decode_sig
+                self._refresh_decoder_update()
+            else:
+                self.reconstruction_matrix.fill(0.0)
+                self.decode_status = "idle"
+                self.decode_progress_step = -1
+                self._last_triggered_latent_signature = None
 
             heatmap_signature = self._make_heatmap_signature(points, sigma, grid, heat_mode)
             if heatmap_signature != self._last_heatmap_signature:
@@ -624,7 +634,7 @@ def create_app(sample_count: int = 10, sample_seed: int = 42):
         while True:
             response = None
             with controller._lock:
-                if controller._refresh_decoder_update():
+                if controller.state.decode_enabled and controller._refresh_decoder_update():
                     response = controller._build_response(
                         midi_buffer=(controller.state.last_frontend_payload or {}).get("midi_buffer"),
                         encode_midi=bool(((controller.state.last_frontend_payload or {}).get("button_values") or {}).get("encodeMidi", False)),
@@ -656,6 +666,7 @@ def create_app(sample_count: int = 10, sample_seed: int = 42):
                 "heatmapMode": controller.state.heatmap_mode,
                 "influenceMode": controller.state.influence_mode,
                 "encodeMidi": False,
+                "decodeEnabled": False,
             },
             "slider_values": {
                 "gridResolution": controller.state.grid_resolution,
@@ -678,7 +689,7 @@ def create_app(sample_count: int = 10, sample_seed: int = 42):
 
 def main():
     host = os.environ.get("RBF_SERVER_HOST", "0.0.0.0")
-    port = _safe_int(os.environ.get("RBF_SERVER_PORT", "5005"), 5005)
+    port = _safe_int(os.environ.get("RBF_SERVER_PORT", "5006"), 5006)
     sample_count = _safe_int(os.environ.get("RBF_SAMPLE_COUNT", "10"), 10)
     sample_seed = _safe_int(os.environ.get("RBF_SAMPLE_SEED", "42"), 42)
     app, socketio = create_app(sample_count=sample_count, sample_seed=sample_seed)
