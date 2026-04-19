@@ -43,6 +43,7 @@
         <button id="modeBtn">Heat: Mag</button>
         <button id="influenceBtn">Influence: Raw</button>
         <button id="encodeBtn">Encode MIDI: Off</button>
+        <button id="quantizeBtn">Mode: Continuous</button>
       </div>
       <h4>MIDI Buffer JSON</h4>
       <textarea id="midi" placeholder='{"tokens":[...]} or {"matrix":[[...], ...]}'></textarea>
@@ -72,6 +73,10 @@ const S = {
   decodeStep: -1,
   requestCounter: 0,
   dragging: -1,
+  quantized: false,
+  quantizedCell: -1,
+  snappedCursor: [0, 0],
+  snappedPoints: [],
 };
 
 const field = document.getElementById("field");
@@ -88,6 +93,7 @@ const sigmaVal = document.getElementById("sigmaVal");
 const modeBtn = document.getElementById("modeBtn");
 const influenceBtn = document.getElementById("influenceBtn");
 const encodeBtn = document.getElementById("encodeBtn");
+const quantizeBtn = document.getElementById("quantizeBtn");
 const midiEl = document.getElementById("midi");
 
 let socket = null;
@@ -118,6 +124,24 @@ function toWorld(x, y) {
     (x / field.width) * (2 * S.halfExtent) - S.halfExtent,
     ((field.height - y) / field.height) * (2 * S.halfExtent) - S.halfExtent,
   ];
+}
+
+function snapToGrid(wx, wy) {
+  if (!S.quantized) return [wx, wy];
+  const cellSize = (2 * S.halfExtent) / S.grid;
+  const col = Math.max(0, Math.min(S.grid - 1, Math.floor((wx + S.halfExtent) / cellSize)));
+  const row = Math.max(0, Math.min(S.grid - 1, Math.floor((wy + S.halfExtent) / cellSize)));
+  return [
+    -S.halfExtent + (col + 0.5) * cellSize,
+    -S.halfExtent + (row + 0.5) * cellSize,
+  ];
+}
+
+function gridCell(wx, wy) {
+  const cellSize = (2 * S.halfExtent) / S.grid;
+  const col = Math.max(0, Math.min(S.grid - 1, Math.floor((wx + S.halfExtent) / cellSize)));
+  const row = Math.max(0, Math.min(S.grid - 1, Math.floor((wy + S.halfExtent) / cellSize)));
+  return row * S.grid + col;
 }
 
 function drawField() {
@@ -262,8 +286,8 @@ function payload() {
     try { midi = JSON.parse(raw); } catch { midi = null; }
   }
   return {
-    cursor: S.cursor,
-    draggable_points: S.points,
+    cursor: S.snappedCursor,
+    draggable_points: S.snappedPoints.length === S.points.length ? S.snappedPoints : S.points,
     heatmap: null,
     latent_vector: null,
     midi_buffer: midi,
@@ -315,8 +339,14 @@ field.addEventListener("pointerdown", (evt) => {
   if (idx >= 0) {
     S.dragging = idx;
   } else {
-    S.cursor = toWorld(x, y);
-    sendPayload();
+    const raw = toWorld(x, y);
+    S.cursor = raw;
+    S.snappedCursor = snapToGrid(raw[0], raw[1]);
+    const cell = gridCell(S.snappedCursor[0], S.snappedCursor[1]);
+    if (!S.quantized || cell !== S.quantizedCell) {
+      S.quantizedCell = cell;
+      sendPayload();
+    }
   }
   render();
   field.setPointerCapture(evt.pointerId);
@@ -326,10 +356,26 @@ field.addEventListener("pointermove", (evt) => {
   if (S.dragging < 0 && evt.buttons === 0) return;
   sizeCanvas(field);
   const [x, y] = pointerXY(evt, field);
-  const w = toWorld(x, y);
-  if (S.dragging >= 0) S.points[S.dragging] = w; else S.cursor = w;
-  render();
-  sendPayload();
+  const raw = toWorld(x, y);
+  if (S.dragging >= 0) {
+    S.points[S.dragging] = raw;
+    S.snappedPoints = S.points.map(p => snapToGrid(p[0], p[1]));
+    render();
+    const dragCell = S.points.map(p => gridCell(snapToGrid(p[0], p[1])[0], snapToGrid(p[0], p[1])[1])).join(",");
+    if (!S.quantized || dragCell !== S.quantizedCell) {
+      S.quantizedCell = dragCell;
+      sendPayload();
+    }
+  } else {
+    S.cursor = raw;
+    S.snappedCursor = snapToGrid(raw[0], raw[1]);
+    render();
+    const cell = gridCell(S.snappedCursor[0], S.snappedCursor[1]);
+    if (!S.quantized || cell !== S.quantizedCell) {
+      S.quantizedCell = cell;
+      sendPayload();
+    }
+  }
 });
 
 field.addEventListener("pointerup", (evt) => {
@@ -338,7 +384,7 @@ field.addEventListener("pointerup", (evt) => {
   sendPayload();
 });
 
-gridEl.addEventListener("input", () => { S.grid = Number(gridEl.value); gridVal.textContent = String(S.grid); sendPayload(); });
+gridEl.addEventListener("input", () => { S.grid = Number(gridEl.value); gridVal.textContent = String(S.grid); S.quantizedCell = -1; sendPayload(); });
 sigmaEl.addEventListener("input", () => { S.sigma = Number(sigmaEl.value); sigmaVal.textContent = S.sigma.toFixed(2); sendPayload(); });
 
 modeBtn.addEventListener("click", () => {
@@ -360,6 +406,14 @@ encodeBtn.addEventListener("click", () => {
   sendPayload();
 });
 
+quantizeBtn.addEventListener("click", () => {
+  S.quantized = !S.quantized;
+  S.quantizedCell = -1;
+  quantizeBtn.classList.toggle("active", S.quantized);
+  quantizeBtn.textContent = S.quantized ? "Mode: Quantized" : "Mode: Continuous";
+  sendPayload();
+});
+
 window.addEventListener("resize", render);
 
 socket = io();
@@ -372,7 +426,9 @@ socket.on("connect", () => {
 
 socket.on("bootstrap", (data) => {
   S.cursor = data.cursor;
+  S.snappedCursor = data.cursor;
   S.points = data.draggable_points;
+  S.snappedPoints = data.draggable_points.map(p => [...p]);
   S.heatmap = data.heatmap || [];
   S.latent = data.latent_vector || [];
   S.recon = data.decoded_matrix || [];
@@ -398,8 +454,7 @@ socket.on("bootstrap", (data) => {
 
 socket.on("frame", (data) => {
   frameInFlight = false;
-  S.cursor = data.cursor;
-  S.points = data.draggable_points;
+  // cursor and points are client-authoritative — never overwrite from server echo
   S.heatmap = data.heatmap;
   S.latent = data.latent_vector;
   S.recon = data.decoded_matrix;

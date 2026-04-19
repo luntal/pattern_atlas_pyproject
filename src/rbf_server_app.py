@@ -430,6 +430,7 @@ class RBFServerController:
         self.reconstruction_matrix = np.zeros((int(self.hparams.height), self.recon_cols), dtype=np.float32)
         self.decode_status = "idle"
         self.decode_progress_step = -1
+        self._last_triggered_latent_signature = None
         self.state = FrontendState(
             cursor=np.zeros(2, dtype=np.float32),
             control_points=control_points,
@@ -595,9 +596,14 @@ class RBFServerController:
 
             self.state.latent_vector = latent_vector.astype(np.float32)
 
-            # Decoding runs asynchronously in a background thread.
-            self.decoder_manager.request_decode(self.state.latent_vector, self.reconstruction_matrix)
-            self.decode_status = "decoding"
+            # Only restart the decoder when the latent actually changed.
+            # In quantized mode the frontend only sends on cell change, so the signature
+            # will always differ; in continuous mode this prevents redundant restarts.
+            _decode_sig = (self.state.latent_vector.shape, np.round(self.state.latent_vector, 5).tobytes())
+            if _decode_sig != self._last_triggered_latent_signature:
+                self.decoder_manager.request_decode(self.state.latent_vector, self.reconstruction_matrix)
+                self.decode_status = "decoding"
+                self._last_triggered_latent_signature = _decode_sig
             self._refresh_decoder_update()
 
             heatmap_signature = self._make_heatmap_signature(points, sigma, grid, heat_mode)
@@ -672,7 +678,7 @@ def create_app(sample_count: int = 10, sample_seed: int = 42):
 
 def main():
     host = os.environ.get("RBF_SERVER_HOST", "0.0.0.0")
-    port = _safe_int(os.environ.get("RBF_SERVER_PORT", "5003"), 5003)
+    port = _safe_int(os.environ.get("RBF_SERVER_PORT", "5005"), 5005)
     sample_count = _safe_int(os.environ.get("RBF_SAMPLE_COUNT", "10"), 10)
     sample_seed = _safe_int(os.environ.get("RBF_SAMPLE_SEED", "42"), 42)
     app, socketio = create_app(sample_count=sample_count, sample_seed=sample_seed)
