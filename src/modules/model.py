@@ -210,6 +210,7 @@ class TransformerVAE(nn.Module):
         self.decoder = Decoder(_hparams)
         self.latent_dim = _hparams.latent_dim
         self.step_token = _hparams.step_token
+        self.pad_token = _hparams.pad_token
 
     def forward(self, tokens):
         B, T = tokens.size()
@@ -218,7 +219,7 @@ class TransformerVAE(nn.Module):
         # mask the input eos token
         decoder_input[decoder_input == 2] = 0
         # decoder_input = torch.where(decoder_input == 2, torch.zeros_like(decoder_input), decoder_input)
-        beat_tokens_enc = self.make_beat_tokens(tokens, step_token=int(self.step_token))
+        beat_tokens_enc = make_beat_tokens(tokens, step_token=int(self.step_token), pad_token=int(self.pad_token))
 
         beat0 = torch.zeros((B, 1), dtype=torch.long, device=tokens.device)
         beat_tokens_dec = torch.cat([beat0, beat_tokens_enc[:, :-1]], dim=1)
@@ -229,16 +230,16 @@ class TransformerVAE(nn.Module):
         logits = self.decoder(decoder_input, z, beat_tokens_dec)
         return logits, mu, logvar
 
-    def make_beat_tokens(self, tokens: torch.Tensor, step_token: int) -> torch.Tensor:
-        # tokens: [B, T] (long)
-        is_step = (tokens == step_token).to(torch.long)  # [B, T] in {0,1}
-        beat_tokens = torch.cumsum(is_step, dim=1)  # [B, T]
-        beat_tokens += 1
-        beat_tokens[:,0] = 0
-        # padding with zeros
-        pad_mask = (tokens == self.decoder.pad_token)
-        beat_tokens = beat_tokens.masked_fill(pad_mask, 0)
-        return beat_tokens
+    # def make_beat_tokens(self, tokens: torch.Tensor, step_token: int, pad_token: int) -> torch.Tensor:
+    #     # tokens: [B, T] (long)
+    #     is_step = (tokens == step_token).to(torch.long)  # [B, T] in {0,1}
+    #     beat_tokens = torch.cumsum(is_step, dim=1)  # [B, T]
+    #     beat_tokens += 1
+    #     beat_tokens[:,0] = 0
+    #     # padding with zeros
+    #     pad_mask = (tokens == pad_token)
+    #     beat_tokens = beat_tokens.masked_fill(pad_mask, 0)
+    #     return beat_tokens
 
     @torch.no_grad()
     def sample(self, z=None, max_len=128, temperature=1.0, sample=True, device=None):
@@ -246,6 +247,41 @@ class TransformerVAE(nn.Module):
         if z is None:
             z = torch.randn(1, self.latent_dim, device=device)
         return self.decoder.sample(z.to(device), max_len=max_len, temperature=temperature, sample=sample, device=device)
+
+
+class EncoderWrapper(nn.Module):
+    def __init__(self, encoder, hparams, return_numpy=True):
+        super().__init__()
+        self.encoder = encoder
+        self.hparams = hparams
+        self.return_numpy = return_numpy
+
+    def forward(self, tokens):
+        if not torch.is_tensor(tokens):
+            tokens = torch.tensor(tokens, dtype=torch.long, device=next(self.encoder.parameters()).device)
+        else:
+            tokens = tokens.to(device=next(self.encoder.parameters()).device, dtype=torch.long)
+
+        beat_tokens = make_beat_tokens(tokens, step_token=int(self.hparams.step_token), pad_token=int(self.hparams.pad_token))
+        mu, _ = self.encoder(tokens, beat_tokens)
+        if self.return_numpy:
+            mu = mu.detach().cpu().numpy()
+        return mu
+
+
+
+def make_beat_tokens(tokens: torch.Tensor, step_token: int, pad_token: int) -> torch.Tensor:
+        # tokens: [B, T] (long)
+        is_step = (tokens == step_token).to(torch.long)  # [B, T] in {0,1}
+        beat_tokens = torch.cumsum(is_step, dim=1)  # [B, T]
+        beat_tokens += 1
+        beat_tokens[:,0] = 0
+        # padding with zeros
+        pad_mask = (tokens == pad_token)
+        beat_tokens = beat_tokens.masked_fill(pad_mask, 0)
+        return beat_tokens
+
+
 
 
 # ------------------------- Loss & Training helpers -------------------------

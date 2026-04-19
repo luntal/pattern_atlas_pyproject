@@ -10,6 +10,12 @@ import torch
 import math
 import glob
 
+def create_latent_vectors(input_data: np.ndarray, model):
+    data_tensor = torch.from_numpy(input_data).long()
+    logits, mu, log_var = model(data_tensor)
+    z = mu.detach().numpy()
+    return z
+
 def load_model(previous=0, onnx=False ):
     print()
     # Find models in the current branch-specific models directory.
@@ -54,19 +60,26 @@ def load_model(previous=0, onnx=False ):
         print('model dimensions: ', hparams.d_model)
         print('n_layers: ', hparams.n_layers)
         print('n_heads: ', hparams.n_heads)
+        print('latent_dim: ', hparams.latent_dim)
         print('--' * 10)
     model.eval()
     return model, hparams
 
-def load_dataset(hparams, project_root):
+def load_dataset(hparams):
     # dataset_name = hparams.dataset_name
     branch_name = safe_branch_name(get_current_branch())
-    dataset_name = os.path.join(project_root, 'data', branch_name, hparams.dataset_name)
+    path = Path('data')
+    dataset_name = os.path.join(path, branch_name, hparams.dataset_name)
     print(f'Loading dataset: {dataset_name}')
-    data = np.load(dataset_name)['data']
+    full_data = np.load(dataset_name, allow_pickle=True)
+    data = full_data['data']
+    metadata = full_data['metadata']
+
     print('Total amount of samples: ', data.shape)
+
     if hparams.n_samples < data.shape[0] and hparams.n_samples > 0:
         data = data[:hparams.n_samples]
+        metadata = metadata[:hparams.n_samples]
     elif hparams.n_samples < 0:
         pass
     elif hparams.n_samples == 0:
@@ -79,7 +92,19 @@ def load_dataset(hparams, project_root):
     # Shuffle data before splitting
     np.random.seed(hparams.seed)
     np.random.shuffle(data)
-    return data
+    return data, metadata
+
+def pick_reproducible_samples(data, metadata, sample_count=5, sample_seed=15):
+    # Pick reproducible aligned samples from data and metadata.
+    # sample_seed = getattr(hparams, 'seed', 42)
+    n_available = len(data)
+    n_pick = min(sample_count, n_available)
+    rng = np.random.default_rng(sample_seed)
+    sample_indices = rng.choice(n_available, size=n_pick, replace=False)
+    data = data[sample_indices]
+    metadata = metadata[sample_indices]
+    return data, metadata, sample_indices
+
 
 def load_scheduler(optim, loader, hparams):
         start_lr = getattr(hparams, 'scheduler_start_lr', hparams.learning_rate)

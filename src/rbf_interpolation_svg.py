@@ -4,8 +4,8 @@ import matplotlib.pyplot as plt
 from modules.model import TransformerVAE, reparameterize
 from modules.midi_processor import MidiProcessor
 import torch
-from modules.utilities import seq2mat
-from matplotlib.widgets import Button
+from modules.utilities import seq2mat, load_model, load_dataset, pick_reproducible_samples, create_latent_vectors
+from matplotlib.widgets import Button, Slider
 import time
 import mido
 import threading
@@ -17,7 +17,8 @@ import os
 import os.path
 import pickle
 import glob
-
+from modules.radial_basis_function import compute_rbf_weights, rbf_interpolate_exact
+from modules.gui import DraggablePoint, CursorController
 try:
     import cv2
     CV2_AVAILABLE = True
@@ -34,32 +35,7 @@ calculating RBF (Radial Basis Function) interpolation between multiple latent ve
 # Load model with metadata
 ##########################
 
-# Find the latest model in the models directory
-_script_dir = os.path.dirname(os.path.abspath(__file__))
-model_files = glob.glob(os.path.join(_script_dir, '../models/model_*.pt'))
-if not model_files:
-    raise FileNotFoundError("No model files found in ../models/ directory")
-latest_model = max(model_files, key=os.path.getmtime)
-print(f'Loading model: {latest_model}')
-
-checkpoint = torch.load(latest_model, map_location='cpu')
-model_state_dict = checkpoint['model_state_dict']
-hparams_dict = checkpoint['hparams']
-
-# Recreate the hparams object
-hparams = SimpleNamespace(**hparams_dict)
-
-
-model = TransformerVAE(hparams)
-model.load_state_dict(model_state_dict)
-model.eval()
-print('--' * 10)
-print('model config: ')
-print('model dimensions: ', hparams.d_model)
-print('n_layers: ', hparams.n_layers)
-print('n_heads: ', hparams.n_heads)
-print('latent dim: ', hparams.latent_dim)
-print('--' * 10)
+model, hparams = load_model()
 
 ########################################
 # CONFIGURATION
@@ -150,308 +126,165 @@ y_limit = height_range / 2
 # Extract positions from the original world.svg
 country_coords = get_country_positions("assets/world.svg", (-radius_x, radius_x), (-y_limit, y_limit))
 
-# Example: Print a few country positions to verify
-# print("\nParsed Country Coordinates (mapped):")
-# for country in ["Afghanistan", "Angola", "Germany"]:
-#     if country in country_coords:
-#         print(f"{country}: {np.round(country_coords[country], 3)}")
-# exit()
-# for name, coords in list(country_coords.items())[:10]:
-#     print(f"{name}: {coords}")
+
 country_list = list(country_coords.keys())
 selected_countries = ['United States', 'Spain',  'New Zealand', 'China', 'Australia', 'Togo', 'Namibia', 'Chile', 'Germany']
 
 # NUM_POINTS = len(selected_countries)  # number of control points / latent vectors
 LATENT_DIM = hparams.latent_dim  # dimension of latent space
 RBF_SIGMA = 0.3  # width of Gaussian RBF
-grid_resolution = 16
+grid_resolution = 4
+last_recalculated_grid_resolution = grid_resolution
+outputs_dir = 'outputs'
+precomputed_reconstructions_path = os.path.join(outputs_dir, 'precomputed_reconstructions.pkl')
+precomputed_latents_path = os.path.join(outputs_dir, 'precomputed_latents.pkl')
+precomputed_sequences_path = os.path.join(outputs_dir, 'precomputed_sequences.pkl')
+control_points_path = os.path.join(outputs_dir, 'control_points.npy')
+recalc_thread = None
+recalc_stop_event = None
+recalc_lock = threading.Lock()
+recalc_status = 'idle'
+recalc_result = None
+recalc_error = None
+recalc_batch_size = 32
 
 # Global buffer to store precomputed values
 precomputed_reconstructions = None
 precomputed_latents = None
 l_min, l_max = None, None
-if os.path.exists('outputs/precomputed_reconstructions.pkl'):
-    with open('outputs/precomputed_reconstructions.pkl', 'rb') as f:
-        precomputed_reconstructions = pickle.load(f)
+
+midi_processor = MidiProcessor(hparams)
+
+
+def infer_grid_resolution(n_items):
+    if n_items is None:
+        return None
+    resolution = int(round(np.sqrt(n_items)))
+    if resolution * resolution == n_items:
+        return resolution
+    return None
+
+
+def load_cached_state():
+    global precomputed_reconstructions, precomputed_latents, l_min, l_max
+    global grid_resolution, last_recalculated_grid_resolution, nearest_x, nearest_y, weights
+
+    loaded_any = False
+
+    if os.path.exists(precomputed_reconstructions_path):
+        with open(precomputed_reconstructions_path, 'rb') as f:
+            precomputed_reconstructions = pickle.load(f)
         print('precomputed reconstructions loaded from disk')
-if os.path.exists('outputs/precomputed_latents.pkl'):
-    with open('outputs/precomputed_latents.pkl', 'rb') as f:
-        precomputed_latents = pickle.load(f)
+        loaded_any = True
+    else:
+        print(f'missing cache file: {precomputed_reconstructions_path}')
+
+    if os.path.exists(precomputed_latents_path):
+        with open(precomputed_latents_path, 'rb') as f:
+            precomputed_latents = pickle.load(f)
         print('precomputed latents loaded from disk, shape: ', precomputed_latents.shape)
-        
         l_max = float(np.max(precomputed_latents))
         l_min = float(np.min(precomputed_latents))
         print(f'l_max: {l_max}, l_min: {l_min}')
+        loaded_any = True
+        if 'latent_im' in globals():
+            latent_im.set_clim(vmin=l_min, vmax=l_max)
+    else:
+        print(f'missing cache file: {precomputed_latents_path}')
 
-midi_processor = MidiProcessor(hparams)
-if os.path.exists('outputs/precomputed_sequences.pkl'):
-    with open('outputs/precomputed_sequences.pkl', 'rb') as f:
-        midi_processor.sequences = pickle.load(f)
+    if os.path.exists(precomputed_sequences_path):
+        with open(precomputed_sequences_path, 'rb') as f:
+            midi_processor.sequences = pickle.load(f)
         print('sequences loaded from disk')
         print('n_sequences: ', len(midi_processor.sequences))
-########################################
-# Exact RBF Interpolation
-########################################
+        loaded_any = True
+    else:
+        print(f'missing cache file: {precomputed_sequences_path}')
+
+    if precomputed_reconstructions is None and getattr(midi_processor, 'sequences', None):
+        midi_processor.generate_matrices()
+        precomputed_reconstructions = midi_processor.matrices
+        print('generated reconstructions from loaded sequences')
+
+    if os.path.exists(control_points_path):
+        loaded_control_points = np.load(control_points_path)
+        if loaded_control_points.shape == control_points.shape:
+            control_points[:, :] = loaded_control_points
+            scatter_points.set_offsets(control_points)
+            print('control point locations loaded from disk')
+            loaded_any = True
+        else:
+            print(
+                f'control point shape mismatch: cached {loaded_control_points.shape}, current {control_points.shape}'
+            )
+    else:
+        print(f'missing cache file: {control_points_path}')
+
+    inferred_resolution = None
+    if precomputed_latents is not None:
+        inferred_resolution = infer_grid_resolution(len(precomputed_latents))
+    elif precomputed_reconstructions is not None:
+        inferred_resolution = infer_grid_resolution(len(precomputed_reconstructions))
+
+    if inferred_resolution is not None:
+        grid_resolution = inferred_resolution
+        last_recalculated_grid_resolution = inferred_resolution
+        if 'grid_slider' in globals():
+            grid_slider.set_val(inferred_resolution)
+        else:
+            apply_world_grid(grid_resolution)
+
+    weights = compute_rbf_weights(control_points, latent_vectors, sigma=RBF_SIGMA)
+    nearest_x, nearest_y = None, None
+
+    if loaded_any:
+        update_latent_display()
+        fig.canvas.draw_idle()
+    else:
+        print('no cached state loaded')
 
 
-def compute_rbf_weights(control_points, latent_vectors, sigma=0.7, lambd=1e-4):
-    """
-    Computes RBF weights with Ridge Regularization (lambda) to handle
-    many/crowded control points without numerical instability.
-    """
-    control_points = np.asarray(control_points)
-    N = len(control_points)
-
-    # Distance matrix
-    dists = np.linalg.norm(control_points[:, None, :] - control_points[None, :, :], axis=2)
-
-    # Gaussian RBF
-    Phi = np.exp(-(dists ** 2) / (2 * sigma ** 2))
-
-    # Regularization: Add a tiny bit to the diagonal (Ridge Regression)
-    # This keeps the matrix invertible even if points are very close.
-    Phi += lambd * np.eye(N)
-
-    # Solve Phi @ W = latent_vectors
-    weights = np.linalg.solve(Phi, latent_vectors)
-    return weights
-
-
-# def compute_rbf_weights(control_points, latent_vectors, sigma=1.0):
-#     """
-#     Computes RBF weights such that interpolation exactly reproduces latent vectors at control points.
-#     """
-#     N = len(control_points)
-#     # Distance matrix
-#     dists = np.linalg.norm(control_points[:, None, :] - control_points[None, :, :], axis=2)
-#     # Gaussian RBF
-#     Phi = np.exp(-(dists ** 2) / (2 * sigma ** 2))
-#     # Solve Phi @ W = latent_vectors
-#     weights = np.linalg.solve(Phi, latent_vectors)
-#     return weights
-
-
-def rbf_interpolate_exact(control_points, weights, cursor_pos, sigma=1.0):
-    """
-    Interpolates latent vector at cursor_pos using precomputed RBF weights.
-    """
-    dists = np.linalg.norm(control_points - cursor_pos, axis=1)
-    rbf_vals = np.exp(-(dists ** 2) / (2 * sigma ** 2))
-    return rbf_vals @ weights
-
-
-########################################
-# Draggable Point
-########################################
-
-class DraggablePoint:
-    def __init__(self, point, index, scatter, update_callback):
-        self.point = point
-        self.index = index
-        self.scatter = scatter
-        self.update_callback = update_callback
-        self.press = None
-
-    def connect(self):
-        self.cidpress = fig.canvas.mpl_connect("button_press_event", self.on_press)
-        self.cidrelease = fig.canvas.mpl_connect("button_release_event", self.on_release)
-        self.cidmotion = fig.canvas.mpl_connect("motion_notify_event", self.on_motion)
-
-
-    def on_press(self, event):
-        if event.inaxes != ax:
-            return
-        contains, _ = self.scatter.contains(event)
-        if contains:
-            # Find the nearest point to click
-            dists = np.linalg.norm(control_points - np.array([event.xdata, event.ydata]), axis=1)
-            idx = np.argmin(dists)
-            if np.allclose(control_points[idx], self.point):
-                self.press = (self.point[0], self.point[1], event.xdata, event.ydata)
-
-    def on_release(self, event):
-        self.press = None
-
-
-    def on_motion(self, event):
-        if self.press is None or event.inaxes != ax:
-            return
-        x0, y0, xpress, ypress = self.press
-        dx = event.xdata - xpress
-        dy = event.ydata - ypress
-        self.point[0] = x0 + dx
-        self.point[1] = y0 + dy
-        self.scatter.set_offsets(control_points)
-        # Update the corresponding label position
-        # point_labels[self.index].set_position((self.point[0] + 0.03, self.point[1] + 0.03))
-        self.update_callback()
-
-
-########################################
-# Cursor Controller
-########################################
-
-class CursorController:
-    def __init__(self, cursor, scatter, update_callback):
-        self.cursor = cursor
-        self.scatter = scatter
-        self.update_callback = update_callback
-        self.press = None
-
-    def connect(self):
-        self.cidpress = fig.canvas.mpl_connect("button_press_event", self.on_press)
-        self.cidrelease = fig.canvas.mpl_connect("button_release_event", self.on_release)
-        self.cidmotion = fig.canvas.mpl_connect("motion_notify_event", self.on_motion)
-
-    def on_press(self, event):
-        if event.inaxes != ax:
-            return
-        contains, _ = self.scatter.contains(event)
-        if contains:
-            self.press = (self.cursor[0], self.cursor[1], event.xdata, event.ydata)
-
-    def on_release(self, event):
-        self.press = None
-
-    def on_motion(self, event):
-        if self.press is None or event.inaxes != ax:
-            return
-        x0, y0, xpress, ypress = self.press
-        dx = event.xdata - xpress
-        dy = event.ydata - ypress
-        self.cursor[0] = x0 + dx
-        self.cursor[1] = y0 + dy
-        self.scatter.set_offsets([self.cursor])
-        self.update_callback(isCursor=True)
 
 
 ########################################
 # Model and Data Initialization
 ########################################
-processor = MidiProcessor(hparams)
-if os.path.exists('data/midis.npz'):
-    print("Loading preprocessed dataset from midis.npz")
-    npz_data = np.load('data/midis.npz', allow_pickle=True)
-    data = npz_data['data']
-    metadata = npz_data['metadata']
-    # processor.sequences = data
-else:
+data, metadata = load_dataset(hparams)
 
-    abs_path = 'midifiles'
+NUM_POINTS = 5
+data, metadata, sample_indices = pick_reproducible_samples(data, metadata, NUM_POINTS, hparams.seed)
 
-    processor.extract(abs_path, 0, 0)
-    # processor.visualize(playback=False)
-    data = processor.convert_to_numpy()
-    metadata = processor.metadata
-
-    filtered_data = []
-    filtered_metadata = []
-    for i in range(len(metadata)):
-        if metadata[i][1] == 1:
-            filtered_data.append(data[i])
-            filtered_metadata.append(metadata[i])
-    # print("Filtered data shape: (", len(filtered_data), ', 256)')
-    # print("Filtered metadata shape: (", len(filtered_metadata), ', 2)')
-
-    data = np.array(filtered_data)
-    metadata = np.array(filtered_metadata)
-    # processor.sequences = data
-
-
-    np.savez('data/midis.npz', data=data, metadata=metadata)
-    print("Saved preprocessed dataset to data/midis.npz")
 print("Data shape:", data.shape)
 print("Metadata shape: ", metadata.shape)
+print("Sample indices:", sample_indices)
 
-
-print(f"Original n_samples: {len(data)}")
-# print(f"Unique filenames: {len(seen_filenames)}")
-# print(f"Filtered data shape: {filtered_data.shape}")
 
 selected_countries = [os.path.basename(meta[0]) for meta in metadata]
-NUM_POINTS = len(selected_countries)
+
 point_positions = []
 print('num points: ', NUM_POINTS)
 
-
-
-def create_latent_vectors(input_data: np.ndarray):
-    data_tensor = torch.from_numpy(input_data).long()
-    logits, mu, log_var = model(data_tensor)
-    z = mu.detach().numpy()
-    return z
-
-latent_vectors = create_latent_vectors(data)
+latent_vectors = create_latent_vectors(data, model)
 print('latent vectors: ', latent_vectors.shape)
 
 
 # control points in circle:
-if os.path.exists('outputs/control_points.npy'):
-    print("Loading control point locations from control_points.npy")
-    control_points = np.load('outputs/control_points.npy')
-    # control_points *= scale
-else:
-    print("control_points.npy not found, using circle method")
-    control_points = np.array([
-        [np.cos(2 * np.pi * i / NUM_POINTS) * radius_x * 0.8, np.sin(2 * np.pi * i / NUM_POINTS) * radius_y * 0.8]
-        for i in range(NUM_POINTS)
-    ])
-# print('control points: ', control_points)
-# control_points = np.random.uniform(-1, 1, size=(NUM_POINTS, 2))
-# control points at selected countries:
-# Assuming selected_countries is a list like ["Germany", "Brazil", "Japan"]
-# control_points = np.array([country_coords[country] for country in selected_countries if country in country_coords])
+print('Using circle method initially; cached positions can be loaded via button')
+control_points = np.array([
+    [np.cos(2 * np.pi * i / NUM_POINTS) * radius_x * 0.8, np.sin(2 * np.pi * i / NUM_POINTS) * radius_y * 0.8]
+    for i in range(NUM_POINTS)
+])
 
-# latent_vectors = np.random.normal(size=(NUM_POINTS, LATENT_DIM))
 cursor_pos = np.array([0.0, 0.0])
-# print('\nLatent Vectors:')
-# for i, vec in enumerate(latent_vectors):
-#     vec_string = np.round(vec[:5], 2)
-#     vec_string = str(vec_string)[0:-1] + ' ...]'
-#     print(i, vec_string)
 
 # Compute initial RBF weights
-weights = compute_rbf_weights(control_points, latent_vectors, sigma=RBF_SIGMA)
+# weights = compute_rbf_weights(control_points, latent_vectors, sigma=RBF_SIGMA)
 
 
 # model.to(torch.device('cuda' if torch.cuda.is_available() else 'gpu'))
 ########################################
 # MIDI Setup
 ########################################
-# playback_position = 0
-# bpm = 100
-# beat_length = 60 / bpm
-# sixteenth_note_length = beat_length / 4
-# midi_output_port_name = mido.get_output_names()[0]
-# print('using midi port ', midi_output_port_name)
-# output_port = mido.open_output(midi_output_port_name, callback=lambda msg: print(msg))
-# note_matrix = np.zeros((hparams.height, hparams.width))
-# stop_event = threading.Event()
-#
-# def play_midi():
-#     global playback_position, note_matrix, current_index
-#
-#     vel = 0
-#     while not stop_event.is_set():
-#         matrix = note_matrix
-#         matrix = np.array(matrix)
-#         # print(playback_position)
-#
-#         for pitch in range(hparams.height):
-#             if matrix[pitch, playback_position] > 0:
-#                 vel = int(matrix[pitch, playback_position] * 127)
-#                 # print(pitch + 36)
-#                 output_port.send(mido.Message('note_on', note=pitch + 36, velocity=vel))
-#         time.sleep(sixteenth_note_length)
-#         for i in range(hparams.height):
-#             output_port.send(mido.Message('note_off', note=i + 36, velocity=vel))
-#         playback_position += 1
-#         playback_position %= hparams.width
-#
-# stop_event.clear()  # Ensure the event is not set before starting
-# thread = threading.Thread(target=play_midi)
-# thread.start()
-
 midi_processor.playback()
 
 
@@ -505,26 +338,26 @@ except Exception as e:
 
 
 # World SVG Grid
-grid_arrange_x = np.linspace(-radius_x, radius_x, grid_resolution + 1)  # Ensures even spacing including endpoints
-grid_arrange_y = np.linspace(-y_limit, y_limit, grid_resolution + 1)
-print(grid_arrange_x)
 tick_font_size = 5
-ax.set_xticks(grid_arrange_x)
-ax.set_yticks(grid_arrange_y, minor=True)
-# Turn on the grid for BOTH major and minor ticks
-# 'which='minor'' is the key here to see your linspace grid
-ax.grid(visible=True, which='minor', color='gray', linestyle='-', linewidth=0.3, alpha=0.5)
-# ax.grid(axis='x', visible=True, which='major', color='black', linestyle='-', linewidth=0.3, alpha=0.3)
-ax.grid(which='major', axis='x', color='gray', linestyle='-', linewidth=0.3, alpha=0.5)
-
-ax.axhline(y=0, color='gray', linestyle='-', alpha=0.2)
-ax.axvline(x=0, color='gray', linestyle='-', alpha=0.2)
-ax.tick_params(axis='both', which='major', labelsize=tick_font_size)
-ax.tick_params(axis='both', which='minor', labelsize=tick_font_size)
-
-ax.grid(which='minor', color='gray', linestyle='-', linewidth=0.3)
 
 
+def apply_world_grid(resolution):
+    x_ticks = np.linspace(-radius_x, radius_x, resolution + 1)
+    y_ticks = np.linspace(-y_limit, y_limit, resolution + 1)
+    ax.set_xticks(x_ticks)
+    ax.set_yticks(y_ticks)
+    ax.set_xticks([], minor=True)
+    ax.set_yticks([], minor=True)
+    ax.tick_params(axis='both', which='major', labelsize=tick_font_size)
+    ax.tick_params(axis='both', which='minor', length=0)
+    ax.grid(False, which='minor')
+    ax.grid(True, which='major', axis='both', color='gray', linestyle='-', linewidth=0.3, alpha=0.5)
+
+
+apply_world_grid(grid_resolution)
+
+# ax.axhline(y=0, color='gray', linestyle='-', alpha=0.2)
+# ax.axvline(x=0, color='gray', linestyle='-', alpha=0.2)
 
 # MIDI Grid
 midi_grid_width = hparams.width * hparams.n_timing
@@ -579,6 +412,39 @@ ax3.tick_params(axis='x', labelsize=tick_font_size)
 ax_button = plt.axes([0.14, 0.01, 0.14, 0.04])  # Position for button
 recalculate_button = Button(ax_button, 'Recalculate Positions')
 recalculate_button.label.set_fontsize(6)
+
+# Grid Resolution Slider and Reset Button:
+ax_grid_slider = plt.axes([0.33, 0.02, 0.28, 0.03])
+grid_slider = Slider(ax_grid_slider, 'Grid', 4, 20, valinit=grid_resolution, valstep=1)
+grid_slider.label.set_fontsize(6)
+grid_slider.valtext.set_fontsize(6)
+
+ax_reset_grid_button = plt.axes([0.64, 0.01, 0.14, 0.04])
+reset_grid_button = Button(ax_reset_grid_button, 'Reset Grid')
+reset_grid_button.label.set_fontsize(6)
+
+ax_load_cache_button = plt.axes([0.80, 0.01, 0.14, 0.04])
+load_cache_button = Button(ax_load_cache_button, 'Load Cached')
+load_cache_button.label.set_fontsize(6)
+
+
+def set_recalculate_button_state(state):
+    labels = {
+        'idle': 'Recalculate Positions',
+        'running': 'Stop Recalculation',
+        'stopping': 'Stopping...',
+    }
+    facecolors = {
+        'idle': '0.85',
+        'running': '#f2c9c9',
+        'stopping': '#f0dfb3',
+    }
+    recalculate_button.label.set_text(labels[state])
+    ax_button.set_facecolor(facecolors[state])
+    fig.canvas.draw_idle()
+
+
+set_recalculate_button_state('idle')
 
 # Reinitialize latent Vectors:
 # ax_button2 = plt.axes([0.31, 0.01, 0.14, 0.04])
@@ -638,7 +504,7 @@ def nearest_cell_center(value, vmin, vmax, n_cells):
     idx = max(0, min(n_cells - 1, idx))
     center = vmin + (idx + 0.5) * cell_size
     return idx, center
-nearest_x, nearest_y = 0,0
+nearest_x, nearest_y = None, None
 
 def get_centers(lin):
     centers = []
@@ -709,6 +575,12 @@ def update_latent_display(isCursor=False):
 
 
     if isCursor:
+        expected_count = grid_resolution * grid_resolution
+        recon_count = 0 if precomputed_reconstructions is None else len(precomputed_reconstructions)
+        latent_count = 0 if precomputed_latents is None else len(precomputed_latents)
+        if recon_count != expected_count or latent_count != expected_count:
+            return
+
         # Retrieve reconstruction from the precomputed buffer
         # grid_resolution = 8
         
@@ -768,105 +640,209 @@ def update_latent_display(isCursor=False):
 # Draggable blue dots
 draggables = []
 for i in range(NUM_POINTS):
-    d = DraggablePoint(control_points[i], i, scatter_points, update_latent_display)
+    d = DraggablePoint(control_points[i], i, scatter_points, update_latent_display, fig, ax, control_points)
     d.connect()
     draggables.append(d)
 
 # Draggable red cursor
-cursor_control = CursorController(cursor_pos, scatter_cursor, update_latent_display)
+cursor_control = CursorController(cursor_pos, scatter_cursor, update_latent_display, fig, ax, control_points)
 cursor_control.connect()
 
-def recalculate_and_update(event):
-    global weights, latent_vectors, control_points, cursor_pos, precomputed_reconstructions, grid_resolution, precomputed_latents
-    # print('control points: ', control_points)
-    # Recompute weights
+def recalculate_worker(control_points_snapshot, latent_vectors_snapshot, resolution, stop_event):
+    global recalc_status, recalc_result, recalc_error
+
     start = time.time()
-    weights = compute_rbf_weights(control_points, latent_vectors, sigma=RBF_SIGMA)
+    print('Recomputing RBF weights...')
 
-    # Define the resolution of the 2D space grid
-    # grid_resolution = 8  # Higher value means finer grid
-    x_vals = np.linspace(-radius_x, radius_x, grid_resolution + 1)
-    y_vals = np.linspace(-y_limit, y_limit, grid_resolution + 1)
-    x_vals = get_centers(x_vals)
-    y_vals = get_centers(y_vals)
+    try:
+        worker_weights = compute_rbf_weights(control_points_snapshot, latent_vectors_snapshot, sigma=RBF_SIGMA)
+
+        x_vals = np.linspace(-radius_x, radius_x, resolution + 1)
+        y_vals = np.linspace(-y_limit, y_limit, resolution + 1)
+        x_vals = get_centers(x_vals)
+        y_vals = get_centers(y_vals)
+
+        print()
+        print('Precomputing reconstructions for grid points...')
+        latents = np.zeros((resolution * resolution, LATENT_DIM))
+        counter = 0
+        for x in x_vals:
+            for y in y_vals:
+                if stop_event.is_set():
+                    with recalc_lock:
+                        recalc_status = 'cancelled'
+                    return
+                cursor_pos_grid = np.array([x, y])
+                latents[counter] = rbf_interpolate_exact(control_points_snapshot, worker_weights, cursor_pos_grid, sigma=RBF_SIGMA)
+                counter += 1
+
+        print(f'Processing {latents.shape[0]} latent vectors...')
+        z = torch.tensor(latents, dtype=torch.float32)
+        sequences = []
+        with torch.no_grad():
+            for start_idx in range(0, latents.shape[0], recalc_batch_size):
+                if stop_event.is_set():
+                    with recalc_lock:
+                        recalc_status = 'cancelled'
+                    return
+                end_idx = min(start_idx + recalc_batch_size, latents.shape[0])
+                samples = model.sample(z[start_idx:end_idx], hparams.max_seq_len, 0.1, False)
+                sequences.extend(samples.tolist())
+
+        if stop_event.is_set():
+            with recalc_lock:
+                recalc_status = 'cancelled'
+            return
+
+        worker_midi_processor = MidiProcessor(hparams)
+        worker_midi_processor.sequences = sequences
+        worker_midi_processor.generate_matrices()
+
+        with recalc_lock:
+            recalc_result = {
+                'weights': worker_weights,
+                'latents': latents,
+                'sequences': sequences,
+                'reconstructions': worker_midi_processor.matrices,
+                'resolution': resolution,
+                'duration': time.time() - start,
+            }
+            recalc_error = None
+            recalc_status = 'done'
+    except Exception as exc:
+        with recalc_lock:
+            recalc_error = exc
+            recalc_result = None
+            recalc_status = 'error'
 
 
-    # Initialize a buffer for precomputed reconstructions
-    precomputed_reconstructions = []
-    precomputed_latents = []
-    print()
-    counter = 0
-    # Iterate over all grid points
-    latents = np.zeros((grid_resolution*grid_resolution, LATENT_DIM))
-    for x in x_vals:
-        for y in y_vals:
-            cursor_pos_grid = np.array([x, y])
-            # print(counter, cursor_pos_grid)
-            latent = rbf_interpolate_exact(control_points, weights, cursor_pos_grid, sigma=RBF_SIGMA)
-            latents[counter] = latent
-            counter += 1
+def apply_recalculation_result(result):
+    global weights, precomputed_reconstructions, precomputed_latents, nearest_x, nearest_y
+    global grid_resolution, last_recalculated_grid_resolution
+
+    weights = result['weights']
+    midi_processor.sequences = result['sequences']
+    midi_processor.matrices = result['reconstructions']
+    precomputed_reconstructions = result['reconstructions']
+    precomputed_latents = result['latents']
+    nearest_x, nearest_y = None, None
+    grid_resolution = result['resolution']
+    last_recalculated_grid_resolution = result['resolution']
+
+    if int(round(grid_slider.val)) != result['resolution']:
+        grid_slider.set_val(result['resolution'])
+    else:
+        apply_world_grid(grid_resolution)
+
+    print(f"Precomputation complete! {result['duration']:.2f}s")
+    update_latent_display()
 
 
-    # # Reconstruct sequences using the decoder
-    print(f'Processing {latents.shape[0]} latent vectors...')
-    z = torch.tensor(latents, dtype=torch.float32)
-    # print(z.shape)
-    with torch.no_grad():
-        samples = model.sample(z, hparams.max_seq_len, 0.1, False)
-        print(f'Processing {samples.shape[0]} sequences...')
-    sequences = samples.tolist()
+def poll_recalculation_state():
+    global recalc_thread, recalc_stop_event, recalc_status, recalc_result, recalc_error
 
-    midi_processor.sequences = sequences
-    midi_processor.generate_matrices()
-    precomputed_reconstructions = midi_processor.matrices
-    
-    process_time = time.time()-start
+    with recalc_lock:
+        status = recalc_status
+        result = recalc_result
+        error = recalc_error
 
-    # save point locations and rhythms:
-    # reconstructions from the model:
-    print(f"Precomputation complete! {process_time:.2f}s")
-    with open('outputs/precomputed_reconstructions.pkl', 'wb') as f:
-        pickle.dump(precomputed_reconstructions, f)
-    print('saved reconstructions as ', 'precomputed_reconstructions.pkl')
-    # locations of control_points
-    np.save('outputs/control_points.npy', control_points)
-    print('saved control point locations')
-    # save the latent vectors in a separate numpy file:
-    with open('outputs/precomputed_latents.pkl', 'wb') as f:
-        pickle.dump(latents, f)
-    print('saved latent vectors')
-    # save midi_processor.sequences
-    with open('outputs/precomputed_sequences.pkl', 'wb') as f:
-        pickle.dump(midi_processor.sequences, f)
-    print('saved midi sequences')
+    if status == 'done':
+        apply_recalculation_result(result)
+        with recalc_lock:
+            recalc_status = 'idle'
+            recalc_result = None
+            recalc_error = None
+        recalc_thread = None
+        recalc_stop_event = None
+        set_recalculate_button_state('idle')
+    elif status == 'cancelled':
+        print('Recalculation cancelled.')
+        with recalc_lock:
+            recalc_status = 'idle'
+            recalc_result = None
+            recalc_error = None
+        recalc_thread = None
+        recalc_stop_event = None
+        set_recalculate_button_state('idle')
+    elif status == 'error':
+        print(f'Recalculation failed: {error}')
+        with recalc_lock:
+            recalc_status = 'idle'
+            recalc_result = None
+            recalc_error = None
+        recalc_thread = None
+        recalc_stop_event = None
+        set_recalculate_button_state('idle')
+    return True
 
 
-# recalculate_and_update(None)
+def start_recalculation_thread():
+    global recalc_thread, recalc_stop_event, recalc_status, recalc_result, recalc_error
+
+    control_points_snapshot = control_points.copy()
+    latent_vectors_snapshot = latent_vectors.copy()
+    resolution_snapshot = grid_resolution
+
+    with recalc_lock:
+        recalc_status = 'running'
+        recalc_result = None
+        recalc_error = None
+
+    recalc_stop_event = threading.Event()
+    recalc_thread = threading.Thread(
+        target=recalculate_worker,
+        args=(control_points_snapshot, latent_vectors_snapshot, resolution_snapshot, recalc_stop_event),
+        daemon=True,
+    )
+    recalc_thread.start()
+    set_recalculate_button_state('running')
 
 
+def recalculate_and_update(event):
+    global recalc_status
 
+    thread_running = recalc_thread is not None and recalc_thread.is_alive()
+    if thread_running:
+        if recalc_stop_event is not None and not recalc_stop_event.is_set():
+            recalc_stop_event.set()
+            with recalc_lock:
+                recalc_status = 'stopping'
+            set_recalculate_button_state('stopping')
+        return
+
+    start_recalculation_thread()
 
 
 # Connect button to recalculate_and_update function
 def on_button_click(event):
     recalculate_and_update(None)
 
-# def reinitialize(event):
-#     global latent_vectors, max_length, note_matrix, nearest_x, nearest_y
-#     latent_vectors = create_latent_vectors(data)
-#     latent_vectors = np.array(latent_vectors)
-#     print('\nLatent Vectors:')
-#     for i, vec in enumerate(latent_vectors):
-#         print(i, np.round(vec[:5], 2))
-#     recalculate_and_update(None)
-#     note_matrix = precomputed_reconstructions[(nearest_x, nearest_y)]
-#
-#     im.set_data(note_matrix)
-#     im.set_clim(vmin=note_matrix.min(), vmax=note_matrix.max())
-#     fig.canvas.draw_idle()
+
+def on_grid_slider_change(val):
+    global grid_resolution, nearest_x, nearest_y
+    grid_resolution = int(round(val))
+    nearest_x, nearest_y = None, None
+    apply_world_grid(grid_resolution)
+    fig.canvas.draw_idle()
+
+
+def on_reset_grid_click(event):
+    grid_slider.set_val(last_recalculated_grid_resolution)
+
+
+def on_load_cache_click(event):
+    load_cached_state()
+
+
 
 recalculate_button.on_clicked(on_button_click)
-# reinit_button.on_clicked(reinitialize)
+grid_slider.on_changed(on_grid_slider_change)
+reset_grid_button.on_clicked(on_reset_grid_click)
+load_cache_button.on_clicked(on_load_cache_click)
+
+recalc_timer = fig.canvas.new_timer(interval=150)
+recalc_timer.add_callback(poll_recalculation_state)
+recalc_timer.start()
 
 # Initial display
 update_latent_display()
@@ -874,6 +850,4 @@ plt.show()
 midi_processor.stop_playback()
 if CV2_AVAILABLE:
     cv2.destroyAllWindows()
-# stop_event.set()
-# thread.join()
-# print('control: ', control_points)
+

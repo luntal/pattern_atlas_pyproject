@@ -46,7 +46,7 @@ if __name__ == '__main__':
 
     optim = torch.optim.Adam(vae.parameters(), lr=hparams.learning_rate)
 
-    data = load_dataset(hparams, project_root)
+    data, metadata = load_dataset(hparams)
 
 
     # Split into train and validation

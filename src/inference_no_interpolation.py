@@ -35,17 +35,17 @@ model, hparams = load_model()
 offset = 0
 n_examples = 1
 interpolation_steps = 25
-latest_dataset = latest_in_branch('data', 'dataset-test.npz')
+latest_dataset = latest_in_branch('data', 'dataset-groove.npz')
 if latest_dataset is None:
     raise FileNotFoundError(f"No dataset files found in data/")
 print(f'Loading dataset: {latest_dataset}')
 data = np.load(latest_dataset)['data']
-# print(data['tensor'])
+
 print('data shape: ', data.shape)
-# maxi = data.shape[0]
-maxi = 20
-print('using: ', maxi, ' samples')
-data = data[50:70]
+take = 20
+skip = 0
+print('using: ', take, ' samples')
+data = data[skip:skip+take]
 # print(data)
 # sequences = None
 syncopation_measures = []

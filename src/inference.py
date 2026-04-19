@@ -3,7 +3,7 @@ import torch
 # from hparams import hparams
 from modules.model import TransformerVAE, reparameterize, ONNXWrapper
 from modules.interpolation import interpolate_latent_vectors_spherical
-from modules.utilities import seq2mat, syncopation_measure_weighted, vel_deviation_measure, note_density, play_midi
+from modules.utilities import seq2mat, syncopation_measure_weighted, vel_deviation_measure, note_density, play_midi, load_model
 from modules.midi_processor import MidiProcessor
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider, Button
@@ -23,40 +23,7 @@ spherical interpolation between 2 latent vectors.
 ############################
 # Load model with metadata
 ############################
-# ONNX = True
-ONNX = False
-# Load the saved data
-# Find the latest model in branch-specific models directory
-branch_name = safe_branch_name(get_current_branch())
-latest_model = latest_in_branch('models', 'model_*.pt')
-if latest_model is None:
-    raise FileNotFoundError(f"No model files found in models/{branch_name}/")
-print(f'Loading model: {latest_model}')
-
-checkpoint = torch.load(str(latest_model), map_location='cpu')
-
-model_state_dict = checkpoint['model_state_dict']
-# checkpoint = torch.load('model.pt')
-# model_state_dict = checkpoint['model_state_dict']
-hparams_dict = checkpoint['hparams']
-
-# Recreate the hparams object
-hparams = SimpleNamespace(**hparams_dict)
-
-if ONNX:
-    model = ONNXWrapper(hparams)
-    model.eval()
-else:
-
-    model = TransformerVAE(hparams)
-    model.load_state_dict(model_state_dict)
-    model.eval()
-    print('--' * 10)
-    print('model config: ')
-    print('model dimensions: ', hparams.d_model)
-    print('n_layers: ', hparams.n_layers)
-    print('n_heads: ', hparams.n_heads)
-    print('--' * 10)
+model, hparams = load_model()
 
 
 
@@ -71,13 +38,15 @@ seq2 = 5
 offset = 0
 n_examples = 1
 interpolation_steps = 20
-data = np.load('data/dataset-groove.npz')['data']
-# print(data['tensor'])
-print('data shape: ', data.shape)
-# maxi = data.shape[0]
-maxi = hparams.n_samples + 200
-print('using: ', maxi, ' samples')
-
+latest_dataset = latest_in_branch('data', 'dataset-groove.npz')
+if latest_dataset is None:
+    raise FileNotFoundError(f"No dataset files found in data/")
+print(f'Loading dataset: {latest_dataset}')
+data = np.load(latest_dataset)['data']
+take = 10000
+skip = 0
+print('using: ', take, ' samples')
+data = data[skip:skip+take]
 
 # sequences = None
 # syncopation_measures = []
@@ -213,8 +182,8 @@ def visualize_with_slider():
     ax_seq1_slider = plt.axes([slider_x, 0.09, slider_width, slider_height])
     ax_seq2_slider = plt.axes([slider_x, 0.06, slider_width, slider_height])
 
-    seq1_slider = Slider(ax_seq1_slider, 'Seq1', 0, maxi - 1, valinit=seq1, valstep=1)
-    seq2_slider = Slider(ax_seq2_slider, 'Seq2', 0, maxi - 1, valinit=seq2, valstep=1)
+    seq1_slider = Slider(ax_seq1_slider, 'Seq1', 0, take - 1, valinit=seq1, valstep=1)
+    seq2_slider = Slider(ax_seq2_slider, 'Seq2', 0, take - 1, valinit=seq2, valstep=1)
 
     ax_button = plt.axes([slider_x, 0.02, 0.14, 0.03])  # Position for button
     recalculate_button = Button(ax_button, 'Recalculate')
