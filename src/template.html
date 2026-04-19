@@ -1,0 +1,447 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>RBF Server</title>
+  <style>
+    body { margin: 0; font-family: Helvetica, Arial, sans-serif; background: #f5f6ef; color: #182225; }
+    .app { max-width: 1180px; margin: 0 auto; padding: 12px; display: grid; grid-template-columns: 1.6fr 1fr; gap: 12px; }
+    .panel { background: #fffdf7; border: 1px solid #d8d7cf; border-radius: 12px; padding: 10px; }
+    canvas { width: 100%; border: 1px solid #d8d7cf; border-radius: 10px; background: #fff; display: block; }
+    #field { height: 520px; }
+    #recon { height: 220px; margin-top: 10px; }
+    #latent { height: 80px; }
+    #influence { height: 120px; }
+    .row { display: grid; grid-template-columns: 90px 1fr 60px; gap: 8px; align-items: center; margin: 8px 0; }
+    .btns { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+    button { border: 1px solid #ced3cc; background: #fff; border-radius: 8px; padding: 6px 9px; cursor: pointer; }
+    button.active { background: #cbeceb; border-color: #2b7e7a; }
+    textarea { width: 100%; min-height: 100px; border-radius: 8px; border: 1px solid #ced3cc; padding: 8px; font-family: Menlo, monospace; font-size: 12px; }
+    pre { background: #f1fbfb; border: 1px solid #d2eeee; border-radius: 8px; padding: 8px; min-height: 80px; font-size: 12px; white-space: pre-wrap; }
+    .status-indicator { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 12px; font-weight: 600; }
+    .status-led { width: 10px; height: 10px; border-radius: 999px; background: #c94d44; box-shadow: 0 0 0 2px rgba(0,0,0,0.08); }
+    .status-led.connected { background: #2d9d5b; }
+    @media (max-width: 980px) { .app { grid-template-columns: 1fr; } #field { height: 420px; } }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="panel">
+      <h3>RBF Latent Field Server</h3>
+      <canvas id="field"></canvas>
+      <canvas id="recon"></canvas>
+    </div>
+    <div class="panel">
+      <h4>Latent Vector</h4>
+      <canvas id="latent"></canvas>
+      <h4>Anchor Influence</h4>
+      <canvas id="influence"></canvas>
+      <div class="row"><label>Grid</label><input id="grid" type="range" min="4" max="60" step="1" /><span id="gridVal"></span></div>
+      <div class="row"><label>Sigma</label><input id="sigma" type="range" min="0.05" max="3" step="0.01" /><span id="sigmaVal"></span></div>
+      <div class="btns">
+        <button id="modeBtn">Heat: Mag</button>
+        <button id="influenceBtn">Influence: Raw</button>
+        <button id="encodeBtn">Encode MIDI: Off</button>
+      </div>
+      <h4>MIDI Buffer JSON</h4>
+      <textarea id="midi" placeholder='{"tokens":[...]} or {"matrix":[[...], ...]}'></textarea>
+      <h4>Status</h4>
+      <div class="status-indicator"><span id="statusLed" class="status-led"></span><span id="statusText">Disconnected</span></div>
+      <pre id="status">connecting...</pre>
+    </div>
+  </div>
+<script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+<script>
+const S = {
+  cursor: [0, 0],
+  points: [],
+  heatmap: [],
+  latent: [],
+  recon: [],
+  influenceRaw: [],
+  influencePct: [],
+  grid: 30,
+  sigma: 0.3,
+  heatMode: "magnitude",
+  influenceMode: "raw",
+  encodeMidi: false,
+  halfExtent: 2.0,
+  nTiming: 4,
+  decodeStatus: "idle",
+  decodeStep: -1,
+  requestCounter: 0,
+  dragging: -1,
+};
+
+const field = document.getElementById("field");
+const recon = document.getElementById("recon");
+const latent = document.getElementById("latent");
+const influence = document.getElementById("influence");
+const statusEl = document.getElementById("status");
+const statusLed = document.getElementById("statusLed");
+const statusText = document.getElementById("statusText");
+const gridEl = document.getElementById("grid");
+const sigmaEl = document.getElementById("sigma");
+const gridVal = document.getElementById("gridVal");
+const sigmaVal = document.getElementById("sigmaVal");
+const modeBtn = document.getElementById("modeBtn");
+const influenceBtn = document.getElementById("influenceBtn");
+const encodeBtn = document.getElementById("encodeBtn");
+const midiEl = document.getElementById("midi");
+
+let socket = null;
+let frameInFlight = false;
+let queuedPayload = null;
+
+function setConnectionState(connected) {
+  statusLed.classList.toggle("connected", connected);
+  statusText.textContent = connected ? "Connected" : "Disconnected";
+}
+
+function sizeCanvas(c) {
+  const r = c.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.floor(r.width * dpr));
+  const h = Math.max(1, Math.floor(r.height * dpr));
+  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+}
+
+function toCanvas(p) {
+  const x = ((p[0] + S.halfExtent) / (2 * S.halfExtent)) * field.width;
+  const y = field.height - ((p[1] + S.halfExtent) / (2 * S.halfExtent)) * field.height;
+  return [x, y];
+}
+
+function toWorld(x, y) {
+  return [
+    (x / field.width) * (2 * S.halfExtent) - S.halfExtent,
+    ((field.height - y) / field.height) * (2 * S.halfExtent) - S.halfExtent,
+  ];
+}
+
+function drawField() {
+  sizeCanvas(field);
+  const ctx = field.getContext("2d");
+  ctx.clearRect(0, 0, field.width, field.height);
+  const hm = S.heatmap;
+  if (hm.length > 1 && hm[0].length > 1) {
+    const rows = hm.length;
+    const cols = hm[0].length;
+    const cw = field.width / cols;
+    const ch = field.height / rows;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const v = Math.max(0, Math.min(1, hm[r][c]));
+        const g = Math.floor(188 + 67 * v);
+        ctx.fillStyle = `rgb(${g},${g},${g})`;
+        ctx.fillRect(c * cw, field.height - (r + 1) * ch, cw + 1, ch + 1);
+      }
+    }
+  }
+  ctx.strokeStyle = "rgba(120,120,120,0.3)";
+  for (let i = 0; i <= S.grid; i++) {
+    const x = (i / S.grid) * field.width;
+    const y = (i / S.grid) * field.height;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, field.height); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(field.width, y); ctx.stroke();
+  }
+  S.points.forEach((p, i) => {
+    const [x, y] = toCanvas(p);
+    ctx.fillStyle = "#0f5d6f";
+    ctx.strokeStyle = "#f5fcfc";
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = "#173f3b";
+    ctx.font = "11px Menlo";
+    ctx.fillText(String(i), x + 8, y - 8);
+  });
+  const [cx, cy] = toCanvas(S.cursor);
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.moveTo(cx - 15, cy); ctx.lineTo(cx + 15, cy);
+  ctx.moveTo(cx, cy - 15); ctx.lineTo(cx, cy + 15);
+  ctx.stroke();
+  ctx.strokeStyle = "#ad442a";
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(cx - 15, cy); ctx.lineTo(cx + 15, cy);
+  ctx.moveTo(cx, cy - 15); ctx.lineTo(cx, cy + 15);
+  ctx.stroke();
+  ctx.lineWidth = 1;
+}
+
+function drawLatent() {
+  sizeCanvas(latent);
+  const ctx = latent.getContext("2d");
+  ctx.clearRect(0, 0, latent.width, latent.height);
+  if (!S.latent.length) return;
+  const w = latent.width / S.latent.length;
+  for (let i = 0; i < S.latent.length; i++) {
+    const v = Math.max(-4, Math.min(4, S.latent[i]));
+    let r;
+    let g;
+    let b;
+    if (v < 0) {
+      const t = (v + 4) / 4;
+      r = Math.floor(86 + 94 * t);
+      g = Math.floor(104 + 76 * t);
+      b = Math.floor(178 + 2 * t);
+    } else {
+      const t = v / 4;
+      r = Math.floor(180 + 52 * t);
+      g = Math.floor(180 - 96 * t);
+      b = Math.floor(180 - 88 * t);
+    }
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.fillRect(i * w, 0, Math.ceil(w), latent.height);
+  }
+}
+
+function drawInfluence() {
+  sizeCanvas(influence);
+  const ctx = influence.getContext("2d");
+  ctx.clearRect(0, 0, influence.width, influence.height);
+  const vals = S.influenceMode === "percentage" ? S.influencePct : S.influenceRaw;
+  if (!vals.length) return;
+  const bw = Math.max(4, influence.width / (vals.length * 1.4));
+  const gap = bw * 0.4;
+  vals.forEach((v, i) => {
+    const h = Math.max(0, Math.min(1, v)) * (influence.height - 20);
+    const x = i * (bw + gap);
+    ctx.fillStyle = "#2e8b55";
+    ctx.fillRect(x, influence.height - h - 16, bw, h);
+  });
+}
+
+function drawRecon() {
+  sizeCanvas(recon);
+  const ctx = recon.getContext("2d");
+  ctx.clearRect(0, 0, recon.width, recon.height);
+  if (!S.recon.length || !S.recon[0].length) return;
+  const rows = S.recon.length;
+  const cols = S.recon[0].length;
+  const cw = recon.width / cols;
+  const ch = recon.height / rows;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const v = Math.max(0, Math.min(1, S.recon[r][c]));
+      const g = Math.floor(255 - 240 * v);
+      ctx.fillStyle = `rgb(${g},${g},${g})`;
+      ctx.fillRect(c * cw, recon.height - (r + 1) * ch, cw + 1, ch + 1);
+    }
+  }
+  ctx.strokeStyle = "rgba(80,80,80,0.3)";
+  for (let c = 0; c <= cols; c += Math.max(1, S.nTiming)) {
+    const x = c * cw;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, recon.height); ctx.stroke();
+  }
+  ctx.strokeStyle = "rgba(80,80,80,0.2)";
+  for (let r = 0; r <= rows; r++) {
+    const y = recon.height - r * ch;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(recon.width, y); ctx.stroke();
+  }
+}
+
+function render() {
+  drawField(); drawLatent(); drawInfluence(); drawRecon();
+  statusEl.textContent = [
+    `cursor=(${S.cursor[0].toFixed(3)}, ${S.cursor[1].toFixed(3)})`,
+    `grid=${S.grid} sigma=${S.sigma.toFixed(2)} heat=${S.heatMode}`,
+    `latent_dim=${S.latent.length} points=${S.points.length}`,
+    `decode_status=${S.decodeStatus} decode_step=${S.decodeStep}`,
+    `encode_midi=${S.encodeMidi}`,
+  ].join("\n");
+}
+
+function payload() {
+  let midi = null;
+  const raw = midiEl.value.trim();
+  if (raw) {
+    try { midi = JSON.parse(raw); } catch { midi = null; }
+  }
+  return {
+    cursor: S.cursor,
+    draggable_points: S.points,
+    heatmap: null,
+    latent_vector: null,
+    midi_buffer: midi,
+    influence_values: null,
+    button_values: { heatmapMode: S.heatMode, influenceMode: S.influenceMode, encodeMidi: S.encodeMidi },
+    slider_values: { gridResolution: S.grid, sigma: S.sigma },
+  };
+}
+
+function flushPayload(force = false) {
+  if (!queuedPayload || !socket || !socket.connected) return;
+  if (frameInFlight && !force) return;
+  frameInFlight = true;
+  const p = queuedPayload;
+  queuedPayload = null;
+  socket.emit("frame", p);
+}
+
+function sendPayload(force = false) {
+  queuedPayload = payload();
+  if (socket && socket.connected) {
+    flushPayload(force);
+  }
+}
+
+function pointerXY(evt, canvas) {
+  const rect = canvas.getBoundingClientRect();
+  return [
+    (evt.clientX - rect.left) * (canvas.width / rect.width),
+    (evt.clientY - rect.top) * (canvas.height / rect.height),
+  ];
+}
+
+function pickPoint(x, y) {
+  let best = -1;
+  let bestDist = 1e9;
+  S.points.forEach((p, i) => {
+    const [px, py] = toCanvas(p);
+    const d = Math.hypot(px - x, py - y);
+    if (d < bestDist) { bestDist = d; best = i; }
+  });
+  return bestDist <= 16 ? best : -1;
+}
+
+field.addEventListener("pointerdown", (evt) => {
+  sizeCanvas(field);
+  const [x, y] = pointerXY(evt, field);
+  const idx = pickPoint(x, y);
+  if (idx >= 0) {
+    S.dragging = idx;
+  } else {
+    S.cursor = toWorld(x, y);
+    sendPayload();
+  }
+  render();
+  field.setPointerCapture(evt.pointerId);
+});
+
+field.addEventListener("pointermove", (evt) => {
+  if (S.dragging < 0 && evt.buttons === 0) return;
+  sizeCanvas(field);
+  const [x, y] = pointerXY(evt, field);
+  const w = toWorld(x, y);
+  if (S.dragging >= 0) S.points[S.dragging] = w; else S.cursor = w;
+  render();
+  sendPayload();
+});
+
+field.addEventListener("pointerup", (evt) => {
+  S.dragging = -1;
+  field.releasePointerCapture(evt.pointerId);
+  sendPayload();
+});
+
+gridEl.addEventListener("input", () => { S.grid = Number(gridEl.value); gridVal.textContent = String(S.grid); sendPayload(); });
+sigmaEl.addEventListener("input", () => { S.sigma = Number(sigmaEl.value); sigmaVal.textContent = S.sigma.toFixed(2); sendPayload(); });
+
+modeBtn.addEventListener("click", () => {
+  S.heatMode = S.heatMode === "magnitude" ? "confidence" : "magnitude";
+  modeBtn.textContent = S.heatMode === "magnitude" ? "Heat: Mag" : "Heat: Conf";
+  sendPayload();
+});
+
+influenceBtn.addEventListener("click", () => {
+  S.influenceMode = S.influenceMode === "raw" ? "percentage" : "raw";
+  influenceBtn.textContent = S.influenceMode === "raw" ? "Influence: Raw" : "Influence: %";
+  sendPayload();
+});
+
+encodeBtn.addEventListener("click", () => {
+  S.encodeMidi = !S.encodeMidi;
+  encodeBtn.classList.toggle("active", S.encodeMidi);
+  encodeBtn.textContent = S.encodeMidi ? "Encode MIDI: On" : "Encode MIDI: Off";
+  sendPayload();
+});
+
+window.addEventListener("resize", render);
+
+socket = io();
+
+socket.on("connect", () => {
+  setConnectionState(true);
+  statusEl.textContent = "connected to server";
+  socket.emit("bootstrap");
+});
+
+socket.on("bootstrap", (data) => {
+  S.cursor = data.cursor;
+  S.points = data.draggable_points;
+  S.heatmap = data.heatmap || [];
+  S.latent = data.latent_vector || [];
+  S.recon = data.decoded_matrix || [];
+  S.influenceRaw = data.influence_raw || [];
+  S.influencePct = data.influence_percentage || [];
+  S.grid = data.slider_values.gridResolution;
+  S.sigma = data.slider_values.sigma;
+  S.heatMode = data.button_values.heatmapMode;
+  S.influenceMode = data.button_values.influenceMode;
+  S.halfExtent = data.field_half_extent;
+  S.nTiming = data.n_timing;
+  S.decodeStatus = data.decode_status || "idle";
+  S.decodeStep = Number.isFinite(data.decode_progress_step) ? data.decode_progress_step : -1;
+  gridEl.value = String(S.grid);
+  sigmaEl.value = String(S.sigma);
+  gridVal.textContent = String(S.grid);
+  sigmaVal.textContent = S.sigma.toFixed(2);
+  modeBtn.textContent = S.heatMode === "magnitude" ? "Heat: Mag" : "Heat: Conf";
+  influenceBtn.textContent = S.influenceMode === "raw" ? "Influence: Raw" : "Influence: %";
+  render();
+  sendPayload();
+});
+
+socket.on("frame", (data) => {
+  frameInFlight = false;
+  S.cursor = data.cursor;
+  S.points = data.draggable_points;
+  S.heatmap = data.heatmap;
+  S.latent = data.latent_vector;
+  S.recon = data.decoded_matrix;
+  S.influenceRaw = data.influence_raw;
+  S.influencePct = data.influence_percentage;
+  S.heatMode = data.button_values.heatmapMode;
+  S.influenceMode = data.button_values.influenceMode;
+  S.grid = data.slider_values.gridResolution;
+  S.sigma = data.slider_values.sigma;
+  S.halfExtent = data.field_half_extent;
+  S.nTiming = data.n_timing;
+  S.decodeStatus = data.decode_status || "idle";
+  S.decodeStep = Number.isFinite(data.decode_progress_step) ? data.decode_progress_step : -1;
+  gridEl.value = String(S.grid);
+  sigmaEl.value = String(S.sigma);
+  gridVal.textContent = String(S.grid);
+  sigmaVal.textContent = S.sigma.toFixed(2);
+  modeBtn.textContent = S.heatMode === "magnitude" ? "Heat: Mag" : "Heat: Conf";
+  influenceBtn.textContent = S.influenceMode === "raw" ? "Influence: Raw" : "Influence: %";
+  render();
+  flushPayload();
+});
+
+socket.on("disconnect", () => {
+  setConnectionState(false);
+  statusEl.textContent = "disconnected from server";
+});
+
+socket.on("error", (err) => {
+  frameInFlight = false;
+  setConnectionState(false);
+  const msg = typeof err === "string" ? err : (err && err.message) ? err.message : JSON.stringify(err);
+  statusEl.textContent = `error: ${msg}`;
+  flushPayload();
+});
+
+setConnectionState(false);
+gridEl.value = String(S.grid);
+sigmaEl.value = String(S.sigma);
+gridVal.textContent = String(S.grid);
+sigmaVal.textContent = S.sigma.toFixed(2);
+render();
+</script>
+</body>
+</html>
