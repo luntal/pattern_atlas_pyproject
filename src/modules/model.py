@@ -393,13 +393,15 @@ def train_vae(
             deduped.append((1.0, deduped[-1][1]))
         return deduped
 
-    def _exp_ease(t, k=6.0):
+    def _bezier_ease(t, slope=0.5):
+        # Cubic Hermite / Bezier ease.
+        # slope=0 → smoothstep (slow at endpoints, fast in middle)
+        # slope=1 → linear
+        # Values between give a progressively smoother S-curve as slope approaches 0.
         t = min(max(float(t), 0.0), 1.0)
-        if math.isclose(k, 0.0, rel_tol=0.0, abs_tol=1e-12):
-            return t
-        return (math.exp(k * t) - 1.0) / (math.exp(k) - 1.0)
+        return slope * (2*t**3 - 3*t**2 + t) + (-2*t**3 + 3*t**2)
 
-    def _annealed_beta_at_progress(progress, points):
+    def _annealed_beta_at_progress(progress, points, slope=0.5):
         p = min(max(float(progress), 0.0), 1.0)
         for idx in range(len(points) - 1):
             x0, y0 = points[idx]
@@ -407,16 +409,17 @@ def train_vae(
             if p <= x1 or idx == len(points) - 2:
                 span = max(x1 - x0, 1e-12)
                 t = (p - x0) / span
+                eased_t = _bezier_ease(t, slope)
                 if y0 > 0.0 and y1 > 0.0:
-                    # Log-space interpolation gives a smooth exponential segment.
-                    return math.exp(math.log(y0) + (math.log(y1) - math.log(y0)) * t)
-                eased_t = _exp_ease(t)
+                    # Log-space interpolation with Bezier easing.
+                    return math.exp(math.log(y0) + (math.log(y1) - math.log(y0)) * eased_t)
                 return y0 + (y1 - y0) * eased_t
         return points[-1][1]
 
     epochs = _hparams.n_epochs
     total_train_steps = max(len(dataloader) * epochs, 1)
     annealing_points = _prepare_annealing_points(getattr(_hparams, 'annealing_list', None))
+    annealing_slope = float(getattr(_hparams, 'annealing_slope', 0.1))
     # beta_multiplier = _hparams.beta_multiplier
     free_bits = _hparams.free_bits
     loss_history = []
@@ -529,7 +532,7 @@ def train_vae(
         print('-' * 100)
         for batch in dataloader:
             normalized_step = train_step / max(total_train_steps - 1, 1)
-            weighted_beta = _annealed_beta_at_progress(normalized_step, annealing_points)
+            weighted_beta = _annealed_beta_at_progress(normalized_step, annealing_points, annealing_slope)
             global_step += 1
             train_step += 1
             # weighted_beta = beta_multiplier * annealed_beta
