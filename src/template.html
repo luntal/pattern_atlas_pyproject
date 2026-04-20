@@ -9,9 +9,9 @@
     .app { max-width: 1180px; margin: 0 auto; padding: 12px; display: grid; grid-template-columns: 1.6fr 1fr; gap: 12px; }
     .panel { background: #fffdf7; border: 1px solid #d8d7cf; border-radius: 12px; padding: 10px; }
     canvas { width: 100%; border: 1px solid #d8d7cf; border-radius: 10px; background: #fff; display: block; }
-    #field { height: 520px; }
-    #recon { height: 200px; margin-top: 10px; }
-    #latent { height: 30px; ; margin-top: 10px; }
+    #field { height: 520px; margin-bottom: 10px;}
+    #recon { height: 200px; }
+    #latent { height: 30px; ; margin-bottom: 10px; }
     #influence { height: 120px; }
     .row { display: grid; grid-template-columns: 90px 1fr 60px; gap: 8px; align-items: center; margin: 8px 0; }
     .btns { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
@@ -32,6 +32,7 @@
       <canvas id="field"></canvas>
       <h4>Latent Vector</h4>
       <canvas id="latent"></canvas>
+      <h4>Reconstruction</h4>
       <canvas id="recon"></canvas>
     </div>
     <div class="panel">

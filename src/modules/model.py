@@ -14,6 +14,7 @@ from modules.branch_paths import branch_dir, safe_branch_name, get_current_branc
 from datetime import datetime
 import os
 import shutil
+from zoneinfo import ZoneInfo
 
 def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     std = (0.5 * logvar).exp()
@@ -421,7 +422,7 @@ def train_vae(
     loss_history = []
 
     # Initialize CSV logging and generate model name with timestamp
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    timestamp = datetime.now(ZoneInfo('Europe/Berlin')).strftime('%Y-%m-%d_%H-%M-%S')
     print(f"Training timestamp: {timestamp}")
     branch_name = safe_branch_name(get_current_branch())
     log_dir = branch_dir('docs')
