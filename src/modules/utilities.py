@@ -16,31 +16,79 @@ def create_latent_vectors(input_data: np.ndarray, model):
     z = mu.detach().numpy()
     return z
 
-def load_model(previous=0, onnx=False ):
+def load_model(previous=0, onnx=False, return_checkpoint=False, checkpoint_kind=None):
+    """Load a model checkpoint from the branch-specific models directory.
+
+    checkpoint_kind selects a named checkpoint written by train_vae:
+        'best_val'   – lowest validation loss checkpoint (model_best_val.pt)
+        'best_train' – lowest training loss checkpoint  (model_best_train.pt)
+        'last'       – final epoch checkpoint           (model_last.pt)
+        None         – default: select by index using the `previous` argument
+                       (0 = latest timestamped model, 1 = previous, ...)
+    """
     print()
-    # Find models in the current branch-specific models directory.
     branch_name = safe_branch_name(get_current_branch())
     model_dir = Path('models') / branch_name
-    model_files = sorted(model_dir.glob('model_*.pt'), key=os.path.getmtime)
 
-    if not model_files:
-        raise FileNotFoundError(f"No model files found in models/{branch_name}/")
-
-    previous = max(int(previous), 0)
-    selected_index = len(model_files) - 1 - previous
-    if selected_index < 0:
-        selected_index = 0
-        print(
-            f"Requested previous={previous}, but only {len(model_files)} model(s) are available in models/{branch_name}/. "
-            f"Loading oldest model instead: {model_files[selected_index]}"
+    # Named checkpoint selection.
+    _KIND_PREFIXES = {
+        'best_val':   'model_best_val_',
+        'best_train': 'model_best_train_',
+        'last':       'model_last_',
+    }
+    if checkpoint_kind is not None:
+        if checkpoint_kind not in _KIND_PREFIXES:
+            raise ValueError(
+                f"Unknown checkpoint_kind '{checkpoint_kind}'. "
+                f"Valid options: {list(_KIND_PREFIXES.keys())}"
+            )
+        prefix = _KIND_PREFIXES[checkpoint_kind]
+        kind_files = sorted(
+            model_dir.glob(f'{prefix}*.pt'),
+            key=os.path.getmtime
         )
-        previous = len(model_files) - 1
-
-    selected_model = model_files[selected_index]
-    if previous == 0:
-        print(f'Loading latest model: {selected_model}')
+        if not kind_files:
+            raise FileNotFoundError(
+                f"No '{checkpoint_kind}' checkpoints found in models/{branch_name}/. "
+                f"Run training first, or choose a different checkpoint_kind."
+            )
+        previous = max(int(previous), 0)
+        kind_index = len(kind_files) - 1 - previous
+        if kind_index < 0:
+            kind_index = 0
+            print(
+                f"Requested previous={previous} for '{checkpoint_kind}', but only {len(kind_files)} "
+                f"checkpoint(s) found. Loading oldest instead."
+            )
+        selected_model = kind_files[kind_index]
+        print(f'Loading {checkpoint_kind} checkpoint (previous={previous}): {selected_model}')
     else:
-        print(f'Loading model with previous={previous}: {selected_model}')
+        # Legacy index-based selection over timestamped model files.
+        _all_kind_prefixes = tuple(_KIND_PREFIXES.values())
+        model_files = sorted(
+            [p for p in model_dir.glob('model_*.pt')
+             if not any(p.name.startswith(pfx) for pfx in _all_kind_prefixes)],
+            key=os.path.getmtime
+        )
+
+        if not model_files:
+            raise FileNotFoundError(f"No model files found in models/{branch_name}/")
+
+        previous = max(int(previous), 0)
+        selected_index = len(model_files) - 1 - previous
+        if selected_index < 0:
+            selected_index = 0
+            print(
+                f"Requested previous={previous}, but only {len(model_files)} model(s) are available in models/{branch_name}/. "
+                f"Loading oldest model instead: {model_files[selected_index]}"
+            )
+            previous = len(model_files) - 1
+
+        selected_model = model_files[selected_index]
+        if previous == 0:
+            print(f'Loading latest model: {selected_model}')
+        else:
+            print(f'Loading model with previous={previous}: {selected_model}')
 
     # Load the saved data
     checkpoint = torch.load(str(selected_model), map_location='cpu')
@@ -63,6 +111,8 @@ def load_model(previous=0, onnx=False ):
         print('latent_dim: ', hparams.latent_dim)
         print('--' * 10)
     model.eval()
+    if return_checkpoint:
+        return model, hparams, checkpoint
     return model, hparams
 
 def load_dataset(hparams):

@@ -19,8 +19,9 @@ if __name__ == '__main__':
 
     # retrain = True
     retrain = False
+    resume_checkpoint = None
     if retrain:
-        vae, hparams = load_model(previous=0, onnx=False)
+        vae, hparams, resume_checkpoint = load_model(previous=0, onnx=False, return_checkpoint=True)
 
         # update learning rate
         hparams.scheduler_start_lr = hparams.learning_rate
@@ -85,18 +86,31 @@ if __name__ == '__main__':
     scheduler = None
 
     if retrain:
-        if hparams.optimizer_state_dict is not None:
-            optim.load_state_dict(hparams.optimizer_state_dict)
+        resume_optim_state = None
+        if resume_checkpoint is not None:
+            resume_optim_state = resume_checkpoint.get('optimizer_state_dict', None)
+        if resume_optim_state is None:
+            resume_optim_state = getattr(hparams, 'optimizer_state_dict', None)
+
+        if resume_optim_state is not None:
+            optim.load_state_dict(resume_optim_state)
+
         if hparams.current_lr is not None:
             optim.param_groups[0]['lr'] = hparams.current_lr
     
     
     scheduler = load_scheduler(optim, loader, hparams)
 
+    if retrain and resume_checkpoint is not None:
+        resume_scheduler_state = resume_checkpoint.get('scheduler_state_dict', None)
+        if resume_scheduler_state is not None:
+            scheduler.load_state_dict(resume_scheduler_state)
+
 
     train_vae(vae, loader, hparams, optim,
               scheduler=scheduler,
               val_loader=val_loader,
+              resume_state=resume_checkpoint,
               )
 
     

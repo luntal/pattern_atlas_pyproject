@@ -1,26 +1,48 @@
 import pandas as pd
 import matplotlib.pyplot as plt
-import glob
 import os
-from modules.branch_paths import latest_in_branch, safe_branch_name, get_current_branch
+import sys
+from modules.branch_paths import branch_dir, safe_branch_name, get_current_branch
 
-# Find the latest training log in branch-specific docs directory
+# Select training log by index: 0=latest, 1=previous, 2=two before, ...
+log_index = 0
+if len(sys.argv) > 1:
+    try:
+        log_index = int(sys.argv[1])
+    except ValueError:
+        print(f"Error: log index must be an integer, got '{sys.argv[1]}'")
+        raise SystemExit(1)
+
+if log_index < 0:
+    print(f"Error: log index must be >= 0, got {log_index}")
+    raise SystemExit(1)
+
 branch_name = safe_branch_name(get_current_branch())
-latest_log = latest_in_branch('docs', 'training_log_*.csv')
-if latest_log is None:
+log_dir = branch_dir('docs', create=False)
+if not log_dir.exists():
     print(f"Warning: No training log files found in docs/{branch_name}/")
     raise SystemExit(0)
 
-print(f'Loading training log: {latest_log}')
+logs = sorted(log_dir.glob('training_log_*.csv'), key=lambda p: p.stat().st_mtime, reverse=True)
+if not logs:
+    print(f"Warning: No training log files found in docs/{branch_name}/")
+    raise SystemExit(0)
+
+if log_index >= len(logs):
+    print(f"Error: requested log index {log_index}, but only {len(logs)} log file(s) found in docs/{branch_name}/")
+    raise SystemExit(1)
+
+selected_log = logs[log_index]
+print(f'Loading training log (index {log_index}): {selected_log}')
 
 # Load the CSV file
-df = pd.read_csv(str(latest_log))
+df = pd.read_csv(str(selected_log))
 print(f'Total epochs: {len(df)}')
 print(df.head())
 
 # Create a figure with multiple subplots
 fig, axes = plt.subplots(3, 2, figsize=(15, 10))
-fig.suptitle(f'Training Metrics - {os.path.basename(latest_log)}', fontsize=16)
+fig.suptitle(f'Training Metrics - {os.path.basename(selected_log)}', fontsize=16)
 
 # Plot 1: Total Loss (Train vs Val)
 ax = axes[0, 0]

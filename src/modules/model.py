@@ -344,7 +344,7 @@ def vae_loss(logits, targets, mu, logvar, beta=1.0, free_bits=0.0, pad_token=0):
 
 def train_vae(
         model: TransformerVAE, dataloader: DataLoader, _hparams: SimpleNamespace,
-        optimizer, device=None, annealing_style='sigmoid', scheduler=None, val_loader=None):
+    optimizer, device=None, annealing_style='sigmoid', scheduler=None, val_loader=None, resume_state=None):
     
     # Device selection with priority: CUDA > MPS > CPU
     if torch.cuda.is_available():
@@ -469,6 +469,15 @@ def train_vae(
             autocast_ctx = lambda: torch.cuda.amp.autocast()
         print("Automatic Mixed Precision (AMP) enabled")
 
+        if resume_state is not None:
+            scaler_state = resume_state.get('scaler_state_dict', None)
+            if scaler_state is not None:
+                try:
+                    scaler.load_state_dict(scaler_state)
+                    print("Loaded AMP scaler state from checkpoint")
+                except Exception as e:
+                    print(f"Warning: could not load AMP scaler state: {e}")
+
         # torch.compile for PyTorch 2.0+ (significant speedup on modern GPUs)
         if hasattr(torch, 'compile') and compute_capability >= 8.0:
             compiler = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
@@ -504,8 +513,9 @@ def train_vae(
         ])
 
     prev_loss = None
-    best_loss = float('inf')
-    best_model_state = None
+    best_val_loss = float('inf')
+    best_train_loss = float('inf')
+    best_val_checkpoint = None
     model.to(device)
     # transfer optimizer state tensors to device:
     if optimizer is not None:
@@ -518,6 +528,34 @@ def train_vae(
 
     global_step = 0 + _hparams.global_step
     train_step = 0
+
+    best_val_path = os.path.join(model_dir, f'model_best_val_{timestamp}.pt')
+    best_train_path = os.path.join(model_dir, f'model_best_train_{timestamp}.pt')
+    last_path = os.path.join(model_dir, f'model_last_{timestamp}.pt')
+
+    def _checkpoint_hparams_dict():
+        hparams_dict = dict(vars(_hparams))
+        hparams_dict.pop('optimizer_state_dict', None)
+        hparams_dict.pop('scheduler_state_dict', None)
+        hparams_dict.pop('scaler_state_dict', None)
+        return hparams_dict
+
+    def _build_checkpoint(epoch, global_step_value, best_val_loss_value, best_train_loss_value, train_loss_value, val_loss_value):
+        return {
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict() if optimizer is not None else None,
+            'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+            'scaler_state_dict': scaler.state_dict() if use_amp and scaler is not None else None,
+            'metrics': {
+                'train_loss': float(train_loss_value),
+                'val_loss': float(val_loss_value) if val_loss_value is not None else None,
+                'best_train_loss': float(best_train_loss_value),
+                'best_val_loss': float(best_val_loss_value),
+            },
+            'hparams': _checkpoint_hparams_dict(),
+            'epoch': int(epoch),
+            'global_step': int(global_step_value),
+        }
 
     train_start_time = time.time()
     prev_epoch_time = time.time()
@@ -611,29 +649,65 @@ def train_vae(
         prev_epoch_time = now
         lr = optimizer.param_groups[0]['lr']
         _hparams.global_step = global_step
+        _hparams.epoch = epoch
         _hparams.global_epoch = global_step // n_batches
         _hparams.learning_rate = lr
         _hparams.weighted_beta = weighted_beta
-        _hparams.optimizer_state_dict = optimizer.state_dict()
         loss_history.append(running['loss']/n_batches)
 
-        # Track best model based on validation loss (or training loss if no validation)
-        current_loss = val_metrics['loss'] if val_loader is not None else running['loss']/n_batches
+        train_loss_epoch = (running['loss']/n_batches).item()
+        val_loss_epoch = val_metrics['loss'].item() if val_loader is not None else None
         save_cache = False
-        if current_loss < best_loss:
-            best_loss = current_loss
-            # Save best model state
-            best_model_state = {
-                'model_state_dict': model.state_dict(),
-                'hparams': vars(_hparams),
-                # 'optimizer_state_dict': optimizer.state_dict(),
-                # 'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
-                # 'loss_history': loss_history
-            }
-            # Save cache checkpoint immediately
-            cache_path = os.path.join(model_dir, 'model_cache.pt')
-            torch.save(best_model_state, cache_path)
+
+        # Always save the latest full resume checkpoint.
+        last_checkpoint = _build_checkpoint(
+            epoch=epoch,
+            global_step_value=global_step,
+            best_val_loss_value=best_val_loss,
+            best_train_loss_value=best_train_loss,
+            train_loss_value=train_loss_epoch,
+            val_loss_value=val_loss_epoch,
+        )
+        torch.save(last_checkpoint, last_path)
+
+        # Track and save best train checkpoint.
+        if train_loss_epoch < best_train_loss:
+            best_train_loss = train_loss_epoch
+            best_train_checkpoint = _build_checkpoint(
+                epoch=epoch,
+                global_step_value=global_step,
+                best_val_loss_value=best_val_loss,
+                best_train_loss_value=best_train_loss,
+                train_loss_value=train_loss_epoch,
+                val_loss_value=val_loss_epoch,
+            )
+            torch.save(best_train_checkpoint, best_train_path)
             save_cache = True
+
+        # Track and save best validation checkpoint when validation is available.
+        if val_loader is not None and val_loss_epoch is not None and val_loss_epoch < best_val_loss:
+            best_val_loss = val_loss_epoch
+            best_val_checkpoint = _build_checkpoint(
+                epoch=epoch,
+                global_step_value=global_step,
+                best_val_loss_value=best_val_loss,
+                best_train_loss_value=best_train_loss,
+                train_loss_value=train_loss_epoch,
+                val_loss_value=val_loss_epoch,
+            )
+            torch.save(best_val_checkpoint, best_val_path)
+            save_cache = True
+
+        # If no validation loader exists, best_val follows best_train for compatibility.
+        if val_loader is None and train_loss_epoch <= best_train_loss:
+            best_val_checkpoint = _build_checkpoint(
+                epoch=epoch,
+                global_step_value=global_step,
+                best_val_loss_value=best_train_loss,
+                best_train_loss_value=best_train_loss,
+                train_loss_value=train_loss_epoch,
+                val_loss_value=val_loss_epoch,
+            )
 
         prev_loss = min(running['loss']/n_batches, prev_loss) if prev_loss is not None else running['loss']/n_batches
 
@@ -680,27 +754,40 @@ def train_vae(
 
         
 
-    # Save the best model at the end of training
-    if best_model_state is not None:
-        torch.save(best_model_state, model_name)
-        print(f"\nBest model saved to {model_name} (loss: {best_loss:.4f})")
+    # Save the primary best model at the end of training.
+    if best_val_checkpoint is not None:
+        torch.save(best_val_checkpoint, model_name)
+        if val_loader is not None:
+            print(f"\nBest validation model saved to {model_name} (val loss: {best_val_loss:.4f})")
+        else:
+            print(f"\nBest training model saved to {model_name} (train loss: {best_train_loss:.4f})")
     else:
         # Fallback: save current model if no best was found
-        save_model(_hparams, model, model_name, scheduler, optimizer, loss_history)
+        save_model(_hparams, model, model_name, scheduler, optimizer, scaler=scaler, loss_history=loss_history)
         print(f"\nModel saved to {model_name}")
+
+    print(f"Best-train checkpoint: {best_train_path}")
+    print(f"Best-val checkpoint:   {best_val_path}")
+    print(f"Last checkpoint:       {last_path}")
 
     print(f"Training took {(time.time() - train_start_time)/60:.2f} minutes")
     print(f'Training log saved to {log_file}')
 
-def save_model(_hparams, model, model_name='../models/model.pt', scheduler=None, optimizer=None, loss_history=None):
-    _hparams.scheduler_state_dict = scheduler.state_dict() if scheduler is not None else None
-    _hparams.optimizer_state_dict = optimizer.state_dict() if optimizer is not None else None
+def save_model(_hparams, model, model_name='../models/model.pt', scheduler=None, optimizer=None, scaler=None, loss_history=None):
     if loss_history is not None:
         _hparams.loss_history = loss_history
 
+    hparams_dict = dict(vars(_hparams))
+    hparams_dict.pop('optimizer_state_dict', None)
+    hparams_dict.pop('scheduler_state_dict', None)
+    hparams_dict.pop('scaler_state_dict', None)
+
     save_dict = {
         'model_state_dict': model.state_dict(),
-        'hparams': vars(_hparams)  # Convert SimpleNamespace to dict
+        'optimizer_state_dict': optimizer.state_dict() if optimizer is not None else None,
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+        'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
+        'hparams': hparams_dict  # Convert SimpleNamespace to dict
     }
 
     torch.save(save_dict, model_name)
