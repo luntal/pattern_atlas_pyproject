@@ -25,7 +25,7 @@ spherical interpolation between 2 latent vectors.
 # Load model with metadata
 ##########################
 
-model, hparams = load_model(0)
+model, hparams = load_model(1)
 
 
 ###########################

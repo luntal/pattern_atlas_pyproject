@@ -164,6 +164,7 @@ class Decoder(nn.Module):
         z = z.to(device)
         B = z.size(0)
         device = device or next(self.parameters()).device
+        max_beat_index = self.beat_embedding.num_embeddings - 1
         cur_tokens = torch.full((B, 1), self.sos_token, dtype=torch.long, device=device)
         beat_tokens = torch.zeros((B, 1), dtype=torch.long, device=device)
         memory = self.z_to_mem(z).view(B, self.n_memory_tokens, self.emb_size)
@@ -198,6 +199,7 @@ class Decoder(nn.Module):
             beat_tokens = torch.cumsum(is_step, dim=1)  # [B, T]
             beat_tokens += 1
             beat_tokens[:, 0] = 0
+            beat_tokens = beat_tokens.clamp(min=0, max=max_beat_index)
 
             finished |= (next_tok.squeeze(1) == self.eos_token)
         return cur_tokens[:, 1:]
@@ -220,7 +222,12 @@ class TransformerVAE(nn.Module):
         # mask the input eos token
         decoder_input[decoder_input == 2] = 0
         # decoder_input = torch.where(decoder_input == 2, torch.zeros_like(decoder_input), decoder_input)
-        beat_tokens_enc = make_beat_tokens(tokens, step_token=int(self.step_token), pad_token=int(self.pad_token))
+        beat_tokens_enc = make_beat_tokens(
+            tokens,
+            step_token=int(self.step_token),
+            pad_token=int(self.pad_token),
+            total_steps=int(self.decoder.beat_embedding.num_embeddings),
+        )
 
         beat0 = torch.zeros((B, 1), dtype=torch.long, device=tokens.device)
         beat_tokens_dec = torch.cat([beat0, beat_tokens_enc[:, :-1]], dim=1)
@@ -263,7 +270,12 @@ class EncoderWrapper(nn.Module):
         else:
             tokens = tokens.to(device=next(self.encoder.parameters()).device, dtype=torch.long)
 
-        beat_tokens = make_beat_tokens(tokens, step_token=int(self.hparams.step_token), pad_token=int(self.hparams.pad_token))
+        beat_tokens = make_beat_tokens(
+            tokens,
+            step_token=int(self.hparams.step_token),
+            pad_token=int(self.hparams.pad_token),
+            total_steps=int(self.hparams.total_steps),
+        )
         mu, _ = self.encoder(tokens, beat_tokens)
         if self.return_numpy:
             mu = mu.detach().cpu().numpy()
@@ -271,16 +283,17 @@ class EncoderWrapper(nn.Module):
 
 
 
-def make_beat_tokens(tokens: torch.Tensor, step_token: int, pad_token: int) -> torch.Tensor:
-        # tokens: [B, T] (long)
-        is_step = (tokens == step_token).to(torch.long)  # [B, T] in {0,1}
-        beat_tokens = torch.cumsum(is_step, dim=1)  # [B, T]
-        beat_tokens += 1
-        beat_tokens[:,0] = 0
-        # padding with zeros
-        pad_mask = (tokens == pad_token)
-        beat_tokens = beat_tokens.masked_fill(pad_mask, 0)
-        return beat_tokens
+def make_beat_tokens(tokens: torch.Tensor, step_token: int, pad_token: int, total_steps: int) -> torch.Tensor:
+    # tokens: [B, T] (long)
+    is_step = (tokens == step_token).to(torch.long)  # [B, T] in {0,1}
+    beat_tokens = torch.cumsum(is_step, dim=1)  # [B, T]
+    beat_tokens += 1
+    beat_tokens[:, 0] = 0
+    beat_tokens = beat_tokens.clamp(min=0, max=max(int(total_steps) - 1, 0))
+    # padding with zeros
+    pad_mask = (tokens == pad_token)
+    beat_tokens = beat_tokens.masked_fill(pad_mask, 0)
+    return beat_tokens
 
 
 
