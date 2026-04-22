@@ -44,8 +44,14 @@ if __name__ == '__main__':
 
     total_params = sum(p.numel() for p in vae.parameters() if p.requires_grad)
     print(f'Total parameters in VAE: {total_params}')
+    weight_decay = getattr(hparams, 'weight_decay', 0.0)
+    print(f'Optimizer weight decay: {weight_decay}')
 
-    optim = torch.optim.Adam(vae.parameters(), lr=hparams.learning_rate)
+    optim = torch.optim.AdamW(
+        vae.parameters(),
+        lr=hparams.learning_rate,
+        weight_decay=weight_decay,
+    )
 
     data, metadata = load_dataset(hparams)
 

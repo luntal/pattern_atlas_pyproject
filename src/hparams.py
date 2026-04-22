@@ -35,6 +35,7 @@ hyper_params = {
     'batch_size': 30,
     'n_epochs': 20,
     'learning_rate': 4e-4,
+    'weight_decay': 1e-4,
     'scheduler_start_lr': 4e-4,
     'scheduler_end_lr': 4e-5,
     'scheduler_exp_curve_factor': -8.0,
@@ -46,7 +47,11 @@ hyper_params = {
     'global_step': 0,
     'global_epoch': 0, # num of trained epochs
     'annealing_steps_norm': 1, # normalized amount of steps. 1 equals number of steps in all epochs, 0.5 equals number of steps in half of the epochs, etc.
-    'annealing_list': [[0,0],[0.3,0],[1,0.1]], # list of [normalized_position, beta_value] pairs. Normalized step is between 0 and 1, where 1 is the last training step. Beta value is the annealed beta at that point; segments are exponentially smoothed between points.
+    'annealing_list': 
+    [[0,0],
+     [0.3,0],
+     [1,0.1],
+     ], # list of [normalized_position, beta_value] pairs. Normalized step is between 0 and 1, where 1 is the last training step. Beta value is the annealed beta at that point; segments are exponentially smoothed between points.
     'annealing_slope': 0.05, # slope of exponential smoothing between annealing points. 0 means linear, higher values mean more step-like changes.
     # 'current_lr': 0.0,
     'weighted_beta': 0.0,
