@@ -3,7 +3,7 @@ d_base = 256
 ranges = {
     'specials': 3,
     'step': 1,
-    'pitch': 24,
+    'pitch': 54,
     'velocity': 32,
     'timing': 33,
 }
@@ -57,7 +57,7 @@ hyper_params = {
 
     'steps_per_bar': 32,
     'total_steps': 32 * 2,
-    'height': 24,
+    'height': ranges['pitch'],
     'width': 32,
     'channels': 1,
     'vocab_size': vocab_size,

@@ -1,4 +1,5 @@
 # import glob
+import csv
 from pathlib import Path
 import pretty_midi
 import numpy as np
@@ -15,7 +16,30 @@ import random
 from dataclasses import dataclass, field
 from typing import List, Tuple
 import re
+from modules.midi_mappings import (
+    chromatic_to_generic,
+    groove_midi_to_groove_midi_merged,
+    fan_out_merged_step,
+)
 
+
+def _load_compressed_generic_chromatic_labels() -> dict:
+    """Load chromatic pitch (0..53) -> sound label from compressed generic mapping CSV."""
+    csv_path = Path(__file__).resolve().parents[2] / 'static' / 'generic_midi_mapping_compressed.csv'
+    labels = {}
+    try:
+        with open(csv_path, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                chromatic_str = row.get('Chromatic MIDI Pitch', '').strip()
+                sound = row.get('Sound', '').strip()
+                if chromatic_str == '' or sound == '':
+                    continue
+                labels[int(chromatic_str)] = sound
+    except Exception:
+        # Keep visualization functional even if CSV is missing or malformed.
+        return {}
+    return labels
 
 @dataclass
 class ExtractionStats:
@@ -447,7 +471,7 @@ class MidiProcessor:
     def extract(
             self, midi_folder_path=None, skip=0, take=0, clip=False,
             randomize_velocity=0, qnt_strength=1, qnt_randomness=0, pitch_randomness=False,
-            roland=True, drums_only=False, filter_duplicates=True, remap=False, jump=1):
+            roland=True, drums_only=False, filter_duplicates=True, remap=False, jump=1, generic_midi_mapping=False):
         """
         Extracts sequences from MIDI files and save as list of tokens
         currently sequences are 2 bars long, 16th notes per bar
@@ -493,10 +517,12 @@ class MidiProcessor:
         allowed_time_signatures = {(4, 4), (2, 4), (2, 2)}
 
         statistics = ExtractionStats()
-
-
-
         for file_idx, filename in enumerate(selection):
+            file_variant_index = sum(ord(ch) for ch in Path(filename).name)
+            fanout_state = {
+                'merged_cursors': {},
+                'pitch_usage': {},
+            }
             try:
                 midi_data = pretty_midi.PrettyMIDI(filename)
             except Exception as e:
@@ -605,12 +631,12 @@ class MidiProcessor:
                     if result is None:
                         continue
                     pitch, vel = result
-                    
 
-                    
-
-
-
+                    if generic_midi_mapping:
+                        # Use raw MIDI pitch before the 0-23 wrapping performed by note_checks.
+                        merged_note = groove_midi_to_groove_midi_merged(note.pitch)
+                    else:
+                        merged_note = None
 
                     # retrieve the notes
                     window_size_in_16th = self.hparams.width
@@ -668,11 +694,42 @@ class MidiProcessor:
                         'first_note_in_window': first_note_in_window,
                         'window_note_interval': window_note_interval,
                         'window_note_interval_in_16th': window_note_interval_in_16th,
+                        'merged_note': merged_note,
                         'window_dev_norm': window_dev_norm
                     }
                     prev_note_start = note.start
                     notes_advanced.append(advanced_note)
 
+
+                # Apply feature-based fan-out to assign final chromatic pitches (0-53).
+                if generic_midi_mapping and notes_advanced:
+                    window_groups: dict[int, dict[int, list[int]]] = {}
+                    for i, n in enumerate(notes_advanced):
+                        c_window = n['c_window']
+                        c_step = n['current_time_idx_16th']
+                        window_groups.setdefault(c_window, {}).setdefault(c_step, []).append(i)
+
+                    for c_window in sorted(window_groups.keys()):
+                        # Keep merged->chromatic mapping stable within each 2-bar window.
+                        window_fixed_map: dict[int, int] = {}
+                        step_groups = window_groups[c_window]
+                        for step_idx in sorted(step_groups.keys()):
+                            step_indices = step_groups[step_idx]
+                            step_events = [
+                                {'merged_note': notes_advanced[i]['merged_note'],
+                                 'velocity': notes_advanced[i]['velocity']}
+                                for i in step_indices
+                            ]
+                            fanned = fan_out_merged_step(
+                                step_events,
+                                variant_index=file_variant_index,
+                                state=fanout_state,
+                                fixed_map=window_fixed_map,
+                            )
+                            for list_idx, fanned_event in zip(step_indices, fanned):
+                                notes_advanced[list_idx]['pitch_token'] = (
+                                    fanned_event['chromatic_note'] + min_pitch_token
+                                )
 
                 # self.seq_advanced.append(notes_advanced)
                 token_list, metadata = self.notes_advanced_to_token_sequences_stream(
@@ -836,7 +893,7 @@ class MidiProcessor:
             print(f"Generated {len(self.matrices)} matrices, shape: {self.matrices[0].shape}")
 
 
-    def visualize(self, playback=False, print_tokens=False):
+    def visualize(self, playback=False, print_tokens=False, generic_midi_mapping=False):
         """
         Turn sequences into matrices and visualize them with matplotlib
         """
@@ -893,13 +950,20 @@ class MidiProcessor:
         ax.set_xticklabels(np.arange(0, matrix_width, 4*n_timing)//n_timing+1)
 
         pitches = sorted(pitch_counts.keys())
-        # Convert pitch indices to MIDI note numbers for labels (pitch range 0-23 -> MIDI 36-59)
-        midi_notes = [p + 36 for p in pitches]
-        drum_names = [get_drum_name_from_24_pitch(mn) for mn in midi_notes]
+        compressed_labels = _load_compressed_generic_chromatic_labels()
+
+        def format_pitch_label(pitch_idx):
+            if pitch_idx in compressed_labels:
+                return f"{pitch_idx}: {compressed_labels[pitch_idx]}"
+            # Fallback for non-compressed 24-pitch setups.
+            midi_note = pitch_idx + 36
+            return f"{midi_note}: {get_drum_name_from_24_pitch(midi_note)}"
+
+        y_labels = [format_pitch_label(p) for p in pitches]
 
         ax.set_yticks(np.arange(-0.5, mats[0].shape[0], 1), minor=True)
         ax.set_yticks(np.arange(0, len(pitches)))
-        ax.set_yticklabels([f"{mn}: {dn}" for mn, dn in zip(midi_notes, drum_names)], fontsize=8)
+        ax.set_yticklabels(y_labels, fontsize=8)
         ax.grid(which='minor', color='gray', linestyle='-', linewidth=0.5)
         # plt.colorbar(im, ax=ax, label='Value (0=Black, 1=White)')
 
@@ -910,9 +974,9 @@ class MidiProcessor:
         # Create horizontal bar chart
         ax_hist.barh(pitches, counts, color='steelblue', alpha=0.7)
         ax_hist.set_yticks(pitches)
-        ax_hist.set_yticklabels([f"{mn}: {dn}" for mn, dn in zip(midi_notes, drum_names)], fontsize=8)
+        ax_hist.set_yticklabels(y_labels, fontsize=8)
         ax_hist.set_xlabel('Count', fontsize=10)
-        ax_hist.set_ylabel('Pitch (MIDI Note)', fontsize=10)
+        ax_hist.set_ylabel('Pitch (Chromatic Index)', fontsize=10)
         ax_hist.set_title('Pitch Occurrences\nin Dataset', fontsize=10)
         ax_hist.grid(axis='x', alpha=0.3)
         # Do not invert y-axis, keep natural order (low pitches at bottom)
@@ -970,7 +1034,7 @@ class MidiProcessor:
             return True
 
         if playback:
-            self.playback(fig, update_playback_line)
+            self.playback(fig, update_playback_line, generic_midi_mapping=generic_midi_mapping)
             # Set up timer to update playback line every 50ms
             timer = fig.canvas.new_timer(interval=50)
             timer.add_callback(update_playback_line)
@@ -989,7 +1053,7 @@ class MidiProcessor:
             self.stop_event.set()
             self.thread.join()
 
-    def playback(self, fig=None, update_callback=None):
+    def playback(self, fig=None, update_callback=None, generic_midi_mapping=False):
         port = mido.get_output_names()[0]
         bpm = 100
         beat_length = 60 / bpm
@@ -998,10 +1062,19 @@ class MidiProcessor:
         self.stop_event = threading.Event()
 
         self.stop_event.clear()  # Ensure the event is not set before starting
-        self.thread = threading.Thread(target=self.play_midi, args=(self.playback_position, self.stop_event, output_port, sixteenth_note_length))
+        self.thread = threading.Thread(
+            target=self.play_midi,
+            args=(
+                self.playback_position,
+                self.stop_event,
+                output_port,
+                sixteenth_note_length,
+                generic_midi_mapping,
+            ),
+        )
         self.thread.start()
 
-    def play_midi(self, playback_position, stop_event, output_port, sixteenth_note_length):
+    def play_midi(self, playback_position, stop_event, output_port, sixteenth_note_length, generic_midi_mapping=False):
         def play_single_note(pitch, vel, delay=0):
             time.sleep(delay)
             output_port.send(mido.Message('note_on', note=pitch , velocity=vel))
@@ -1046,7 +1119,13 @@ class MidiProcessor:
                             deviation *= (sixteenth_note_length / 2) * deviation_strength
                             delay = sixteenth_note_length + deviation
                             if self.hparams.min_pitch_token <= token < self.hparams.max_pitch_token:
-                                pitch = token - self.hparams.min_pitch_token + 36
+                                chromatic_pitch = token - self.hparams.min_pitch_token
+                                if generic_midi_mapping:
+                                    pitch = chromatic_to_generic(chromatic_pitch)
+                                else:
+                                    pitch = chromatic_pitch + 36
+                                if pitch < 0 or pitch > 127:
+                                    continue
                                 # output_port.send(mido.Message('note_on', note=pitch , velocity=int(vel)))
                                 # play_single_note(pitch, int(vel), delay)
 

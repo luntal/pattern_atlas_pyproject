@@ -17,7 +17,7 @@ if __name__ == "__main__":
     scores = '/Users/alexanderlunt/Nextcloud/KI-Labor/Forschung KI-Labor/_Trainingsdaten/MIDI-Files/scores'
     piano = '/Users/alexanderlunt/Programmierung/datasets/piano'
     lakh = '/Users/alexanderlunt/Nextcloud/KI-Labor/Forschung KI-Labor/_Trainingsdaten/MIDI-Files/LakhMidiDataset-Clean'
-    abs_path = lakh
+    abs_path = groove
 
     # Initialize processor
     processor = MidiProcessor(hparams)
@@ -37,9 +37,9 @@ if __name__ == "__main__":
 
     if task == 'extract':
         # Set drums_only=True when extracting from multi-instrument datasets like Lakh
-        processor.extract(midi_folder_path=abs_path, skip=0, take=1000, clip=False,
+        processor.extract(midi_folder_path=abs_path, skip=0, take=0, clip=False,
                           randomize_velocity=0, qnt_strength=0, qnt_randomness=0, pitch_randomness=False,
-                          drums_only=True, filter_duplicates=True, jump=10)
+                          drums_only=False, filter_duplicates=True, jump=1, generic_midi_mapping=True)
         processor.save(dataset_name=dataset_name)
 
     elif task == 'only_visualize':
@@ -50,4 +50,4 @@ if __name__ == "__main__":
         
         processor.generate_matrices()
         # print(processor.sequences[0])
-        processor.visualize(playback=True, print_tokens=True)
+        processor.visualize(playback=True, print_tokens=True, generic_midi_mapping=True)
