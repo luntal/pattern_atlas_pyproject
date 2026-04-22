@@ -9,7 +9,34 @@
     .app { max-width: 1180px; margin: 0 auto; padding: 12px; display: grid; grid-template-columns: 1.6fr 1fr; gap: 12px; }
     .panel { background: #fffdf7; border: 1px solid #d8d7cf; border-radius: 12px; padding: 10px; }
     canvas { width: 100%; border: 1px solid #d8d7cf; border-radius: 10px; background: #fff; display: block; }
-    #field { height: 520px; margin-bottom: 10px;}
+    .field-wrap { position: relative; width: 100%; aspect-ratio: 1 / 1; margin-bottom: 10px; }
+    .field-wrap.map-aspect { aspect-ratio: var(--map-aspect, 2000 / 857); }
+    #field {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      margin-bottom: 0;
+      z-index: 1;
+    }
+    #worldOverlay {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      border-radius: 10px;
+      z-index: 2;
+    }
+    #fieldOverlay {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      margin-bottom: 0;
+      background: transparent;
+      z-index: 3;
+    }
     #recon { height: 200px; }
     #latent { height: 30px; ; margin-bottom: 10px; }
     #influence { height: 120px; }
@@ -24,14 +51,18 @@
     .status-led.connected { background: #2d9d5b; }
     .select-row { display: grid; grid-template-columns: 90px 1fr; gap: 8px; align-items: center; margin: 8px 0; }
     select { border: 1px solid #ced3cc; border-radius: 8px; background: #fff; padding: 6px; }
-    @media (max-width: 980px) { .app { grid-template-columns: 1fr; } #field { height: 420px; } }
+    @media (max-width: 980px) { .app { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
   <div class="app">
     <div class="panel">
       <h3>RBF Latent Field Server</h3>
-      <canvas id="field"></canvas>
+      <div class="field-wrap">
+        <canvas id="field"></canvas>
+        <svg id="worldOverlay" aria-hidden="true"></svg>
+        <canvas id="fieldOverlay"></canvas>
+      </div>
       <h4>Latent Vector</h4>
       <canvas id="latent"></canvas>
       <h4>Reconstruction</h4>
@@ -40,6 +71,7 @@
     <div class="panel">
       <h4>Anchor Influence</h4>
       <canvas id="influence"></canvas>
+      <div class="select-row"><label>Hovered</label><div id="hoveredAnchorName">-</div></div>
       <div class="row"><label>Grid</label><input id="grid" type="range" min="4" max="60" step="1" /><span id="gridVal"></span></div>
       <div class="row"><label>Sigma</label><input id="sigma" type="range" min="0.05" max="3" step="0.01" /><span id="sigmaVal"></span></div>
       <div class="btns">
@@ -47,6 +79,7 @@
         <button id="influenceBtn">Influence: Raw</button>
         <button id="decodeBtn">Decode: Off</button>
         <button id="quantizeBtn">Mode: Continuous</button>
+        <button id="mapBtn">Map: Off</button>
       </div>
       <h4>Model Checkpoint</h4>
       <div class="select-row"><label for="checkpointMode">Mode</label><select id="checkpointMode"></select></div>
@@ -80,11 +113,14 @@ const S = {
   dragging: -1,
   quantized: false,
   quantizedCell: -1,
+  mapMode: false,
   snappedCursor: [0, 0],
   snappedPoints: [],
+  overlayStatus: "loading",
 };
 
 const field = document.getElementById("field");
+const fieldOverlay = document.getElementById("fieldOverlay");
 const recon = document.getElementById("recon");
 const latent = document.getElementById("latent");
 const influence = document.getElementById("influence");
@@ -99,9 +135,13 @@ const modeBtn = document.getElementById("modeBtn");
 const influenceBtn = document.getElementById("influenceBtn");
 const decodeBtn = document.getElementById("decodeBtn");
 const quantizeBtn = document.getElementById("quantizeBtn");
+const mapBtn = document.getElementById("mapBtn");
 const checkpointModeEl = document.getElementById("checkpointMode");
 const checkpointStampEl = document.getElementById("checkpointStamp");
 const modelStatusEl = document.getElementById("modelStatus");
+const hoveredAnchorNameEl = document.getElementById("hoveredAnchorName");
+const worldOverlay = document.getElementById("worldOverlay");
+const fieldWrap = document.querySelector(".field-wrap");
 
 let modelCatalog = { modes: {} };
 let modelSelection = { mode: "none", previous: 0, timestamp: null };
@@ -111,6 +151,55 @@ let pendingModelSwitch = null;
 let socket = null;
 let frameInFlight = false;
 let queuedPayload = null;
+let worldOverlayLoaded = false;
+let anchorLabels = [];
+let hoveredAnchorIndex = -1;
+
+function anchorBaseName(rawLabel, fallbackIndex) {
+  const raw = String(rawLabel || "").trim();
+  if (!raw) return `Anchor ${fallbackIndex}`;
+  const leaf = raw.split(/[\\/]/).pop() || raw;
+  const noExt = leaf.replace(/\.[^.]+$/, "");
+  return noExt || `Anchor ${fallbackIndex}`;
+}
+
+function setHoveredAnchor(index) {
+  const next = Number.isInteger(index) ? index : -1;
+  if (next === hoveredAnchorIndex) return;
+  hoveredAnchorIndex = next;
+  if (hoveredAnchorIndex < 0) {
+    hoveredAnchorNameEl.textContent = "-";
+    return;
+  }
+  const label = anchorLabels[hoveredAnchorIndex];
+  hoveredAnchorNameEl.textContent = anchorBaseName(label, hoveredAnchorIndex);
+}
+
+function applyFieldAspectMode(triggerFrame = false) {
+  const mapMode = !!S.mapMode;
+  fieldWrap.classList.toggle("map-aspect", mapMode);
+  mapBtn.classList.toggle("active", mapMode);
+  mapBtn.textContent = mapMode ? "Map: On" : "Map: Off";
+
+  if (mapMode) {
+    worldOverlay.style.display = "block";
+    if (!worldOverlayLoaded) {
+      S.overlayStatus = "loading";
+      loadWorldOverlay();
+    } else {
+      S.overlayStatus = "loaded";
+    }
+  } else {
+    worldOverlay.style.display = "none";
+    S.overlayStatus = worldOverlayLoaded ? "hidden" : "loading";
+  }
+
+  S.quantizedCell = -1;
+  render();
+  if (triggerFrame) {
+    sendPayload(true);
+  }
+}
 
 function setConnectionState(connected) {
   statusLed.classList.toggle("connected", connected);
@@ -126,15 +215,15 @@ function sizeCanvas(c) {
 }
 
 function toCanvas(p) {
-  const x = ((p[0] + S.halfExtent) / (2 * S.halfExtent)) * field.width;
-  const y = field.height - ((p[1] + S.halfExtent) / (2 * S.halfExtent)) * field.height;
+  const x = ((p[0] + S.halfExtent) / (2 * S.halfExtent)) * fieldOverlay.width;
+  const y = fieldOverlay.height - ((p[1] + S.halfExtent) / (2 * S.halfExtent)) * fieldOverlay.height;
   return [x, y];
 }
 
 function toWorld(x, y) {
   return [
-    (x / field.width) * (2 * S.halfExtent) - S.halfExtent,
-    ((field.height - y) / field.height) * (2 * S.halfExtent) - S.halfExtent,
+    (x / fieldOverlay.width) * (2 * S.halfExtent) - S.halfExtent,
+    ((fieldOverlay.height - y) / fieldOverlay.height) * (2 * S.halfExtent) - S.halfExtent,
   ];
 }
 
@@ -175,12 +264,18 @@ function drawField() {
       }
     }
   }
+}
+
+function drawFieldOverlay() {
+  sizeCanvas(fieldOverlay);
+  const ctx = fieldOverlay.getContext("2d");
+  ctx.clearRect(0, 0, fieldOverlay.width, fieldOverlay.height);
   ctx.strokeStyle = "rgba(120,120,120,0.3)";
   for (let i = 0; i <= S.grid; i++) {
-    const x = (i / S.grid) * field.width;
-    const y = (i / S.grid) * field.height;
-    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, field.height); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(field.width, y); ctx.stroke();
+    const x = (i / S.grid) * fieldOverlay.width;
+    const y = (i / S.grid) * fieldOverlay.height;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, fieldOverlay.height); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(fieldOverlay.width, y); ctx.stroke();
   }
   S.points.forEach((p, i) => {
     const [x, y] = toCanvas(p);
@@ -211,6 +306,55 @@ function drawField() {
   ctx.moveTo(cx, cy - crossSize); ctx.lineTo(cx, cy + crossSize);
   ctx.stroke();
   ctx.lineWidth = 1;
+}
+
+function loadWorldOverlay() {
+  if (worldOverlayLoaded) return;
+
+  fetch("/assets/world.svg", { cache: "no-cache" })
+    .then((resp) => {
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      return resp.text();
+    })
+    .then((svgText) => {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(svgText, "image/svg+xml");
+      const sourceSvg = doc.querySelector("svg");
+      if (!sourceSvg) {
+        throw new Error("SVG root not found");
+      }
+
+      const viewBox = sourceSvg.getAttribute("viewBox") || "0 0 2000 857";
+      worldOverlay.setAttribute("viewBox", viewBox);
+      worldOverlay.setAttribute("preserveAspectRatio", "none");
+      worldOverlay.innerHTML = sourceSvg.innerHTML;
+
+      const vb = viewBox.trim().split(/\s+/).map(Number);
+      if (vb.length === 4 && Number.isFinite(vb[2]) && Number.isFinite(vb[3]) && vb[2] > 0 && vb[3] > 0) {
+        fieldWrap.style.setProperty("--map-aspect", `${vb[2]} / ${vb[3]}`);
+      }
+
+      worldOverlay.querySelectorAll("path, polygon, polyline, line").forEach((el) => {
+        el.setAttribute("fill", "none");
+        el.setAttribute("fill-opacity", "0");
+        el.setAttribute("stroke", "rgba(24, 34, 37, 0.58)");
+        el.setAttribute("stroke-width", "0.9");
+        el.setAttribute("vector-effect", "non-scaling-stroke");
+      });
+
+      worldOverlayLoaded = true;
+      S.overlayStatus = S.mapMode ? "loaded" : "hidden";
+      worldOverlay.style.display = S.mapMode ? "block" : "none";
+      render();
+    })
+    .catch((err) => {
+      S.overlayStatus = `error (${String(err && err.message ? err.message : err)})`;
+      worldOverlayLoaded = false;
+      console.warn("World overlay failed to load:", err);
+      render();
+    });
 }
 
 function drawLatent() {
@@ -286,12 +430,14 @@ function drawRecon() {
 }
 
 function render() {
-  drawField(); drawLatent(); drawInfluence(); drawRecon();
+  drawField(); drawFieldOverlay(); drawLatent(); drawInfluence(); drawRecon();
   statusEl.textContent = [
     `cursor=(${S.cursor[0].toFixed(3)}, ${S.cursor[1].toFixed(3)})`,
     `grid=${S.grid} sigma=${S.sigma.toFixed(2)} heat=${S.heatMode}`,
     `latent_dim=${S.latent.length} points=${S.points.length}`,
     `decode_status=${S.decodeStatus} decode_step=${S.decodeStep}`,
+    `aspect=${S.mapMode ? "map" : "square"}`,
+    `overlay=${S.overlayStatus}`,
   ].join("\n");
 }
 
@@ -404,9 +550,9 @@ function pickPoint(x, y) {
   return bestDist <= 16 ? best : -1;
 }
 
-field.addEventListener("pointerdown", (evt) => {
-  sizeCanvas(field);
-  const [x, y] = pointerXY(evt, field);
+fieldOverlay.addEventListener("pointerdown", (evt) => {
+  sizeCanvas(fieldOverlay);
+  const [x, y] = pointerXY(evt, fieldOverlay);
   const idx = pickPoint(x, y);
   if (idx >= 0) {
     S.dragging = idx;
@@ -421,13 +567,20 @@ field.addEventListener("pointerdown", (evt) => {
     }
   }
   render();
-  field.setPointerCapture(evt.pointerId);
+  fieldOverlay.setPointerCapture(evt.pointerId);
 });
 
-field.addEventListener("pointermove", (evt) => {
+fieldOverlay.addEventListener("pointermove", (evt) => {
+  sizeCanvas(fieldOverlay);
+  const [x, y] = pointerXY(evt, fieldOverlay);
+  const hovered = pickPoint(x, y);
+  if (S.dragging >= 0) {
+    setHoveredAnchor(S.dragging);
+  } else {
+    setHoveredAnchor(hovered);
+  }
   if (S.dragging < 0 && evt.buttons === 0) return;
-  sizeCanvas(field);
-  const [x, y] = pointerXY(evt, field);
+
   const raw = toWorld(x, y);
   if (S.dragging >= 0) {
     S.points[S.dragging] = raw;
@@ -450,9 +603,15 @@ field.addEventListener("pointermove", (evt) => {
   }
 });
 
-field.addEventListener("pointerup", (evt) => {
+fieldOverlay.addEventListener("pointerleave", () => {
+  if (S.dragging < 0) {
+    setHoveredAnchor(-1);
+  }
+});
+
+fieldOverlay.addEventListener("pointerup", (evt) => {
   S.dragging = -1;
-  field.releasePointerCapture(evt.pointerId);
+  fieldOverlay.releasePointerCapture(evt.pointerId);
   sendPayload();
 });
 
@@ -490,6 +649,11 @@ quantizeBtn.addEventListener("click", () => {
   quantizeBtn.classList.toggle("active", S.quantized);
   quantizeBtn.textContent = S.quantized ? "Mode: Quantized" : "Mode: Continuous";
   sendPayload();
+});
+
+mapBtn.addEventListener("click", () => {
+  S.mapMode = !S.mapMode;
+  applyFieldAspectMode(true);
 });
 
 checkpointModeEl.addEventListener("change", () => {
@@ -548,6 +712,8 @@ socket.on("bootstrap", (data) => {
   S.nTiming = data.n_timing;
   S.decodeStatus = data.decode_status || "idle";
   S.decodeStep = Number.isFinite(data.decode_progress_step) ? data.decode_progress_step : -1;
+  anchorLabels = Array.isArray(data.labels) ? data.labels : [];
+  setHoveredAnchor(-1);
   modelCatalog = data.model_options || { modes: {} };
   modelSelection = data.model_selection || { mode: "none", previous: 0, timestamp: null };
   gridEl.value = String(S.grid);
@@ -558,6 +724,7 @@ socket.on("bootstrap", (data) => {
   influenceBtn.textContent = S.influenceMode === "raw" ? "Influence: Raw" : "Influence: %";
   decodeBtn.classList.toggle("active", S.decodeEnabled);
   decodeBtn.textContent = S.decodeEnabled ? "Decode: On" : "Decode: Off";
+  applyFieldAspectMode(false);
   renderModelSelectors();
   render();
   sendPayload(true);
@@ -580,6 +747,14 @@ socket.on("frame", (data) => {
   S.nTiming = data.n_timing;
   S.decodeStatus = data.decode_status || "idle";
   S.decodeStep = Number.isFinite(data.decode_progress_step) ? data.decode_progress_step : -1;
+  if (Array.isArray(data.labels)) {
+    anchorLabels = data.labels;
+    if (hoveredAnchorIndex >= anchorLabels.length) {
+      setHoveredAnchor(-1);
+    } else if (hoveredAnchorIndex >= 0) {
+      setHoveredAnchor(hoveredAnchorIndex);
+    }
+  }
   // Keep model selection authoritative from bootstrap/select_model to avoid
   // stale frame responses reverting dropdown state mid-switch.
   if (!pendingModelSwitch && data.model_options) {
@@ -596,6 +771,7 @@ socket.on("frame", (data) => {
   influenceBtn.textContent = S.influenceMode === "raw" ? "Influence: Raw" : "Influence: %";
   decodeBtn.classList.toggle("active", S.decodeEnabled);
   decodeBtn.textContent = S.decodeEnabled ? "Decode: On" : "Decode: Off";
+  applyFieldAspectMode(false);
   renderModelSelectors();
   render();
   flushPayload();
@@ -621,6 +797,8 @@ gridEl.value = String(S.grid);
 sigmaEl.value = String(S.sigma);
 gridVal.textContent = String(S.grid);
 sigmaVal.textContent = S.sigma.toFixed(2);
+S.mapMode = false;
+applyFieldAspectMode(false);
 updateModelStatus();
 render();
 </script>

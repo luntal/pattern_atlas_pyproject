@@ -8,7 +8,7 @@ import re
 
 import numpy as np
 import torch
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, send_from_directory
 from flask_socketio import SocketIO, emit
 
 from modules.branch_paths import get_current_branch, safe_branch_name
@@ -791,6 +791,7 @@ def create_app(sample_count: int = 10, sample_seed: int = 42):
     controller = RBFServerController(sample_count=sample_count, sample_seed=sample_seed)
     app = Flask(__name__, template_folder=os.path.dirname(__file__))
     socketio = SocketIO(app, cors_allowed_origins="*")
+    assets_dir = (Path(__file__).resolve().parent.parent / "assets").resolve()
 
     def decode_broadcast_loop():
         while True:
@@ -810,6 +811,10 @@ def create_app(sample_count: int = 10, sample_seed: int = 42):
     @app.get("/")
     def index():
         return render_template("template.html")
+
+    @app.get("/assets/<path:filename>")
+    def assets(filename: str):
+        return send_from_directory(str(assets_dir), filename)
 
     @app.get("/api/health")
     def health():
@@ -871,7 +876,7 @@ def create_app(sample_count: int = 10, sample_seed: int = 42):
 
 def main():
     host = os.environ.get("RBF_SERVER_HOST", "0.0.0.0")
-    port = _safe_int(os.environ.get("RBF_SERVER_PORT", "5009"), 5009)
+    port = _safe_int(os.environ.get("RBF_SERVER_PORT", "5006"), 5006)
     sample_count = _safe_int(os.environ.get("RBF_SAMPLE_COUNT", "10"), 10)
     sample_seed = _safe_int(os.environ.get("RBF_SAMPLE_SEED", "42"), 42)
     app, socketio = create_app(sample_count=sample_count, sample_seed=sample_seed)
