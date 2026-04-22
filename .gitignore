@@ -86,3 +86,4 @@ docs/**/training_log_*.csv
 data/*.npz
 data/**/*.npz
 midifiles/
+static/

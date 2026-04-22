@@ -26,7 +26,7 @@ import time
 import numpy as np
 
 from hparams import hparams
-
+from modules.branch_paths import latest_in_branch, safe_branch_name, get_current_branch
 
 
 
@@ -35,7 +35,8 @@ def _project_root() -> Path:
 
 
 def _data_dir() -> Path:
-	return _project_root() / "data"
+	branch_name = safe_branch_name(get_current_branch())
+	return _project_root() / "data" / branch_name
 
 
 def _load_npz_from_data(filename: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -237,7 +238,7 @@ def augment_dataset(
 
 	for idx, seq in enumerate(data):
 		now = time.time()
-		if now - last_progress_time >= 10:
+		if now - last_progress_time >= 5:
 			print(f"Processed {idx}/{n_total} source files")
 			last_progress_time = now
 
@@ -324,6 +325,6 @@ def augment_dataset(
 
 if __name__ == "__main__":
 	# Edit these as needed.
-	INPUT_FILE = "dataset-lakh.npz"
-	OUTPUT_FILE = "dataset-lakh-augmented.npz"
-	augment_dataset(input_filename=INPUT_FILE, output_filename=OUTPUT_FILE, keep_percentage=40)
+	INPUT_FILE = "dataset-groove-rnd.npz"
+	OUTPUT_FILE = "dataset-groove-augmented-rnd.npz"
+	augment_dataset(input_filename=INPUT_FILE, output_filename=OUTPUT_FILE, keep_percentage=20)

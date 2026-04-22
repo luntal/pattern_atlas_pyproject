@@ -1,15 +1,19 @@
 import numpy as np
 from pathlib import Path
 from hparams import hparams
+from modules.branch_paths import branch_dir, get_current_branch,safe_branch_name
 
-DATA_DIR = Path(__file__).resolve().parent.parent / 'data'
+current_branch = safe_branch_name(get_current_branch())
+DATA_DIR = Path(__file__).resolve().parent.parent / 'data' / current_branch
+
 
 # List of .npz files to merge
 files_to_merge = [
     DATA_DIR / 'dataset-groove.npz',
     DATA_DIR / 'dataset-groove-augmented.npz',
+    DATA_DIR / 'dataset-groove-augmented-rnd.npz',
     DATA_DIR / 'dataset-lakh.npz',
-    DATA_DIR / 'dataset-lakh-augmented.npz',
+    # DATA_DIR / 'dataset-lakh-augmented.npz',
 ]
 
 save_path = DATA_DIR / 'dataset-merged.npz'

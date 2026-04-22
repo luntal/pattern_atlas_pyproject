@@ -58,9 +58,6 @@ functions
 ---
 ### training
 
-- VAE Training on gpu
-- Epoch 2000/2000 | Step 120/120 | step_time: 0.08s
-- Loss 0.2872 | rec 0.2133 | kl 0.0739 | Epoch_time: 9.90s | saved cache: False | lr: 0.0000000004
-----------------------------------------------------------------------------------------------------
-- Training took 331.98 minutes
-- model saved to model.pt
+- [text](../models/exp/model_2026-04-20_22-37-21.pt)
+- overfitting with latnet to memory expansion
+- 

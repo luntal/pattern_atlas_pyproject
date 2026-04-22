@@ -508,7 +508,7 @@ class MidiProcessor:
                 continue
 
             print('-------------------------------------')
-            print(filename)
+            print(file_idx, filename)
 
             # Only accept files with allowed time signatures.
             # If no explicit signature exists, MIDI convention implies 4/4.
@@ -680,6 +680,7 @@ class MidiProcessor:
                     self.hparams.width,
                     10,
                     max_window_exclusive=n_patterns,
+                    jump=jump,
                 )
                 self.metadata.extend(metadata)
 
@@ -1070,6 +1071,7 @@ class MidiProcessor:
         steps_per_window=32,
         min_seq_len=0,
         max_window_exclusive=None,
+        jump=1,
     ):
         step_token = self.hparams.step_token
         eos_token = self.hparams.eos_token
@@ -1104,6 +1106,10 @@ class MidiProcessor:
 
             # Keep only full 2-bar windows when requested.
             if max_window_exclusive is not None and w >= max_window_exclusive:
+                continue
+
+            # Skip windows that are not multiples of jump.
+            if w % jump != 0:
                 continue
     
             # Window change: close previous, start new
