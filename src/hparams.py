@@ -69,7 +69,7 @@ hyper_params = {
     'n_heads': 4,
     'n_layers': 4,
     'ff_dim': d_base * 2,
-    'dropout': 0.02,
+    'dropout': 0.1,
     'max_seq_len': 256,
 
     # tokens:

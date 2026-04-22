@@ -25,7 +25,7 @@ spherical interpolation between 2 latent vectors.
 # Load model with metadata
 ##########################
 
-model, hparams = load_model(13)
+model, hparams = load_model(0, checkpoint_kind='best_val')
 
 
 ###########################
@@ -69,7 +69,7 @@ class Globals:
         # self.stop_event.clear()  # Ensure the event is not set before starting
         self.sequences = None
         self.midi_processor = MidiProcessor(_hparams)
-        self.midi_processor.playback()
+        self.midi_processor.playback(generic_midi_mapping=True)
 
         self.mp = MidiProcessor(_hparams)
 

@@ -3,12 +3,15 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass
+from pathlib import Path
+import re
 
 import numpy as np
 import torch
 from flask import Flask, render_template, request
 from flask_socketio import SocketIO, emit
 
+from modules.branch_paths import get_current_branch, safe_branch_name
 from modules.radial_basis_function import compute_rbf_weights, rbf_interpolate_exact
 from modules.utilities import load_dataset, load_model, pick_reproducible_samples
 
@@ -55,7 +58,7 @@ class RealtimeDecoderManager:
         self.device = next(decoder.parameters()).device
         self.max_len = int(hparams.max_seq_len)
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._current_job_id = 0
         self._cancel_event = None
         self._latest_generation = 0
@@ -213,7 +216,7 @@ class RealtimeDecoderManager:
 
 
 class CudaRBFRuntime:
-    def __init__(self):
+    def __init__(self, previous: int = 0, checkpoint_kind: str | None = None):
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
             device_name = "CUDA"
@@ -224,7 +227,7 @@ class CudaRBFRuntime:
             self.device = torch.device("cpu")
             device_name = "CPU"
         print(f"Using device: {device_name} ({self.device})")
-        self.model, self.hparams = load_model(previous=0, onnx=False)
+        self.model, self.hparams = load_model(previous=previous, onnx=False, checkpoint_kind=checkpoint_kind)
         self.model = self.model.to(self.device)
         self.model.eval()
         self.decoder = self.model.decoder
@@ -395,32 +398,71 @@ class CudaRBFRuntime:
 
 
 class RBFServerController:
+    MODE_LABELS = {
+        "best_val": "best_val",
+        "best_train": "best_train",
+        "last": "last",
+        "none": "None",
+    }
+
+    MODE_PREFIX = {
+        "best_val": "model_best_val_",
+        "best_train": "model_best_train_",
+        "last": "model_last_",
+        "none": "model_",
+    }
+
+    TIMESTAMP_PATTERN = r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}"
+
+    @classmethod
+    def _mode_files_static(cls, mode: str) -> list[Path]:
+        branch_name = safe_branch_name(get_current_branch())
+        model_dir = Path("models") / branch_name
+        if not model_dir.exists():
+            return []
+
+        if mode == "none":
+            kind_prefixes = (
+                cls.MODE_PREFIX["best_val"],
+                cls.MODE_PREFIX["best_train"],
+                cls.MODE_PREFIX["last"],
+            )
+            files = [
+                p for p in model_dir.glob("model_*.pt")
+                if not any(p.name.startswith(prefix) for prefix in kind_prefixes)
+                and re.fullmatch(rf"model_{cls.TIMESTAMP_PATTERN}\.pt", p.name)
+            ]
+        else:
+            prefix = cls.MODE_PREFIX[mode]
+            files = [
+                p for p in model_dir.glob(f"{prefix}*.pt")
+                if re.fullmatch(rf"{re.escape(prefix)}{cls.TIMESTAMP_PATTERN}\.pt", p.name)
+            ]
+
+        return sorted(files, key=os.path.getmtime)
+
     def __init__(self, sample_count: int = 10, sample_seed: int = 42):
-        self.runtime = CudaRBFRuntime()
+        self.sample_count = int(sample_count)
+        self.sample_seed = int(sample_seed)
+        self.selected_mode = "none"
+        self.selected_previous = 0
+
+        for candidate in ["none", "best_val", "best_train", "last"]:
+            if self._mode_files_static(candidate):
+                self.selected_mode = candidate
+                break
+
+        checkpoint_kind = None if self.selected_mode == "none" else self.selected_mode
+
+        self.runtime = CudaRBFRuntime(previous=self.selected_previous, checkpoint_kind=checkpoint_kind)
         self.hparams = self.runtime.hparams
         self._lock = threading.Lock()
         self.decoder_manager = RealtimeDecoderManager(self.runtime.decoder, self.hparams)
 
-        data, metadata = load_dataset(self.hparams)
-        data, metadata, _ = pick_reproducible_samples(
-            data,
-            metadata,
-            sample_count=sample_count,
-            sample_seed=sample_seed,
-        )
-        tokens = torch.from_numpy(data).to(self.runtime.device, dtype=torch.long)
-        beat_tokens = torch.cumsum((tokens == int(self.hparams.step_token)).to(torch.long), dim=1)
-        beat_tokens += 1
-        beat_tokens[:, 0] = 0
-        beat_tokens = beat_tokens.masked_fill(tokens == int(self.hparams.pad_token), 0)
-        with torch.no_grad():
-            mu, _ = self.runtime.encoder(tokens, beat_tokens)
-        self.latent_vectors = mu.detach().cpu().numpy().astype(np.float32)
+        self.model_catalog = self._build_model_catalog()
+        self._normalize_selection_to_catalog()
 
-        self.labels = [
-            os.path.basename(str(item[0])) if isinstance(item, (list, tuple)) and len(item) > 0 else str(item)
-            for item in metadata
-        ]
+        self._load_latent_pool()
         control_points = self._make_initial_control_points(len(self.latent_vectors), field_half_extent=2.0)
         self.field_half_extent = 2.0
         self.weights = compute_rbf_weights(control_points, self.latent_vectors, sigma=0.30)
@@ -440,6 +482,120 @@ class RBFServerController:
             grid_resolution=30,
             sigma=0.30,
         )
+
+    def _branch_model_dir(self) -> Path:
+        branch_name = safe_branch_name(get_current_branch())
+        return Path("models") / branch_name
+
+    def _mode_files(self, mode: str) -> list[Path]:
+        return self._mode_files_static(mode)
+
+    def _selected_timestamp(self) -> str | None:
+        items = self.model_catalog.get("modes", {}).get(self.selected_mode, {}).get("items", [])
+        if 0 <= int(self.selected_previous) < len(items):
+            return items[int(self.selected_previous)].get("timestamp")
+        return None
+
+    def _timestamp_from_file(self, mode: str, path: Path) -> str:
+        stem = path.stem
+        prefix = self.MODE_PREFIX[mode]
+        if stem.startswith(prefix):
+            return stem[len(prefix):]
+        return stem
+
+    def _normalize_selection_to_catalog(self):
+        modes = self.model_catalog.get("modes", {})
+        current = modes.get(self.selected_mode, {})
+        if not current.get("enabled", False):
+            for fallback in ["best_val", "best_train", "last", "none"]:
+                if modes.get(fallback, {}).get("enabled", False):
+                    self.selected_mode = fallback
+                    self.selected_previous = 0
+                    current = modes.get(self.selected_mode, {})
+                    break
+
+        items = current.get("items", [])
+        if items:
+            max_prev = len(items) - 1
+            self.selected_previous = max(0, min(int(self.selected_previous), max_prev))
+        else:
+            self.selected_previous = 0
+
+    def _build_model_catalog(self) -> dict:
+        catalog = {"modes": {}}
+        for mode in ["best_val", "best_train", "last", "none"]:
+            files = self._mode_files(mode)
+            items = []
+            for previous, path in enumerate(reversed(files)):
+                items.append({
+                    "timestamp": self._timestamp_from_file(mode, path),
+                    "previous": previous,
+                })
+            catalog["modes"][mode] = {
+                "label": self.MODE_LABELS[mode],
+                "enabled": len(items) > 0,
+                "items": items,
+            }
+        return catalog
+
+    def _load_latent_pool(self):
+        data, metadata = load_dataset(self.hparams)
+        data, metadata, _ = pick_reproducible_samples(
+            data,
+            metadata,
+            sample_count=self.sample_count,
+            sample_seed=self.sample_seed,
+        )
+        tokens = torch.from_numpy(data).to(self.runtime.device, dtype=torch.long)
+        beat_tokens = torch.cumsum((tokens == int(self.hparams.step_token)).to(torch.long), dim=1)
+        beat_tokens += 1
+        beat_tokens[:, 0] = 0
+        beat_tokens = beat_tokens.masked_fill(tokens == int(self.hparams.pad_token), 0)
+        with torch.no_grad():
+            mu, _ = self.runtime.encoder(tokens, beat_tokens)
+        self.latent_vectors = mu.detach().cpu().numpy().astype(np.float32)
+
+        self.labels = [
+            os.path.basename(str(item[0])) if isinstance(item, (list, tuple)) and len(item) > 0 else str(item)
+            for item in metadata
+        ]
+
+    def reload_model(self, mode: str, previous: int = 0):
+        if mode not in self.MODE_LABELS:
+            raise ValueError(f"Unknown mode '{mode}'.")
+
+        files = self._mode_files(mode)
+        if not files:
+            raise ValueError(f"No checkpoints available for mode '{mode}'.")
+
+        previous = max(0, int(previous))
+        if previous >= len(files):
+            previous = len(files) - 1
+
+        checkpoint_kind = None if mode == "none" else mode
+        self.runtime = CudaRBFRuntime(previous=previous, checkpoint_kind=checkpoint_kind)
+        self.hparams = self.runtime.hparams
+        self.decoder_manager = RealtimeDecoderManager(self.runtime.decoder, self.hparams)
+        self._load_latent_pool()
+
+        self.selected_mode = mode
+        self.selected_previous = previous
+        self.model_catalog = self._build_model_catalog()
+        self._normalize_selection_to_catalog()
+
+        control_points = self._make_initial_control_points(len(self.latent_vectors), field_half_extent=self.field_half_extent)
+        self.state.control_points = control_points
+        self.state.cursor = np.zeros(2, dtype=np.float32)
+        self.state.latent_vector = None
+        self.recon_cols = int(self.hparams.width * self.hparams.n_timing)
+        self.reconstruction_matrix = np.zeros((int(self.hparams.height), self.recon_cols), dtype=np.float32)
+        self.decode_status = "idle"
+        self.decode_progress_step = -1
+        self._last_weights_signature = None
+        self._last_heatmap_signature = None
+        self._last_triggered_latent_signature = None
+        self.weights = compute_rbf_weights(control_points, self.latent_vectors, sigma=self.state.sigma)
+        self._cached_heatmap = np.zeros((self.state.grid_resolution, self.state.grid_resolution), dtype=np.float32)
 
     def _make_initial_control_points(self, n_points: int, field_half_extent: float) -> np.ndarray:
         if n_points <= 0:
@@ -525,6 +681,12 @@ class RBFServerController:
             "height": int(self.hparams.height),
             "decode_status": self.decode_status,
             "decode_progress_step": int(self.decode_progress_step),
+            "model_options": self.model_catalog,
+            "model_selection": {
+                "mode": self.selected_mode,
+                "previous": int(self.selected_previous),
+                "timestamp": self._selected_timestamp(),
+            },
             "frontend_echo": {
                 "cursor": self.state.last_frontend_payload.get("cursor") if self.state.last_frontend_payload else None,
                 "draggable_points": self.state.last_frontend_payload.get("draggable_points") if self.state.last_frontend_payload else None,
@@ -676,6 +838,26 @@ def create_app(sample_count: int = 10, sample_seed: int = 42):
         response = controller.process_frame(payload)
         emit("bootstrap", response)
 
+    @socketio.on("select_model")
+    def on_select_model(payload):
+        payload = payload or {}
+        try:
+            mode = str(payload.get("mode", controller.selected_mode)).lower()
+            previous = int(payload.get("previous", 0))
+            with controller._lock:
+                controller.reload_model(mode=mode, previous=previous)
+                controller._refresh_decoder_update()
+                encode_midi = False
+                midi_buffer = None
+                if controller.state.last_frontend_payload is not None:
+                    button_values = controller.state.last_frontend_payload.get("button_values") or {}
+                    encode_midi = bool(button_values.get("encodeMidi", False))
+                    midi_buffer = controller.state.last_frontend_payload.get("midi_buffer")
+                response = controller._build_response(midi_buffer=midi_buffer, encode_midi=encode_midi)
+            emit("bootstrap", response)
+        except Exception as exc:
+            emit("error", {"message": str(exc)})
+
     @socketio.on("frame")
     def on_frame(payload):
         try:
@@ -689,7 +871,7 @@ def create_app(sample_count: int = 10, sample_seed: int = 42):
 
 def main():
     host = os.environ.get("RBF_SERVER_HOST", "0.0.0.0")
-    port = _safe_int(os.environ.get("RBF_SERVER_PORT", "5006"), 5006)
+    port = _safe_int(os.environ.get("RBF_SERVER_PORT", "5009"), 5009)
     sample_count = _safe_int(os.environ.get("RBF_SAMPLE_COUNT", "10"), 10)
     sample_seed = _safe_int(os.environ.get("RBF_SAMPLE_SEED", "42"), 42)
     app, socketio = create_app(sample_count=sample_count, sample_seed=sample_seed)

@@ -23,12 +23,13 @@ if __name__ == '__main__':
     if retrain:
         vae, hparams, resume_checkpoint = load_model(previous=0, onnx=False, return_checkpoint=True)
 
+        hparams.n_epochs = 20 # override n_epochs for retraining
         # update learning rate
         hparams.scheduler_start_lr = hparams.learning_rate
-        hparams.scheduler_end_lr = hparams.learning_rate * 0.6
+        hparams.scheduler_end_lr = hparams.learning_rate * 0.9
         # update annealing list to continue from current beta
         w_beta_start = hparams.weighted_beta
-        w_beta_end = w_beta_start * 1.2
+        w_beta_end = w_beta_start
         hparams.annealing_list = [[0, w_beta_start], [1,w_beta_end]]
         
     else:
@@ -101,10 +102,10 @@ if __name__ == '__main__':
         if resume_optim_state is not None:
             optim.load_state_dict(resume_optim_state)
 
-        if hparams.current_lr is not None:
-            optim.param_groups[0]['lr'] = hparams.current_lr
-    
-    
+        if hparams.learning_rate is not None:
+            optim.param_groups[0]['lr'] = hparams.learning_rate
+
+
     scheduler = load_scheduler(optim, loader, hparams)
 
     if retrain and resume_checkpoint is not None:

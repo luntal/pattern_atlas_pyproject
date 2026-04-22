@@ -22,6 +22,8 @@
     .status-indicator { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 12px; font-weight: 600; }
     .status-led { width: 10px; height: 10px; border-radius: 999px; background: #c94d44; box-shadow: 0 0 0 2px rgba(0,0,0,0.08); }
     .status-led.connected { background: #2d9d5b; }
+    .select-row { display: grid; grid-template-columns: 90px 1fr; gap: 8px; align-items: center; margin: 8px 0; }
+    select { border: 1px solid #ced3cc; border-radius: 8px; background: #fff; padding: 6px; }
     @media (max-width: 980px) { .app { grid-template-columns: 1fr; } #field { height: 420px; } }
   </style>
 </head>
@@ -46,6 +48,10 @@
         <button id="decodeBtn">Decode: Off</button>
         <button id="quantizeBtn">Mode: Continuous</button>
       </div>
+      <h4>Model Checkpoint</h4>
+      <div class="select-row"><label for="checkpointMode">Mode</label><select id="checkpointMode"></select></div>
+      <div class="select-row"><label for="checkpointStamp">Timestamp</label><select id="checkpointStamp"></select></div>
+      <div class="select-row"><label>Loaded</label><div id="modelStatus">(unknown)</div></div>
       <h4>Status</h4>
       <div class="status-indicator"><span id="statusLed" class="status-led"></span><span id="statusText">Disconnected</span></div>
       <pre id="status">connecting...</pre>
@@ -93,6 +99,14 @@ const modeBtn = document.getElementById("modeBtn");
 const influenceBtn = document.getElementById("influenceBtn");
 const decodeBtn = document.getElementById("decodeBtn");
 const quantizeBtn = document.getElementById("quantizeBtn");
+const checkpointModeEl = document.getElementById("checkpointMode");
+const checkpointStampEl = document.getElementById("checkpointStamp");
+const modelStatusEl = document.getElementById("modelStatus");
+
+let modelCatalog = { modes: {} };
+let modelSelection = { mode: "none", previous: 0, timestamp: null };
+let suppressModelEvents = false;
+let pendingModelSwitch = null;
 
 let socket = null;
 let frameInFlight = false;
@@ -281,6 +295,67 @@ function render() {
   ].join("\n");
 }
 
+function prettyModeLabel(mode) {
+  if (mode === "none") return "None";
+  return mode;
+}
+
+function updateModelStatus() {
+  const mode = prettyModeLabel(modelSelection.mode || "none");
+  const stamp = modelSelection.timestamp || "(no timestamp)";
+  modelStatusEl.textContent = `${mode} @ ${stamp}`;
+}
+
+function renderModelSelectors() {
+  suppressModelEvents = true;
+
+  const modes = modelCatalog.modes || {};
+  const modeOrder = ["best_val", "best_train", "last", "none"];
+  checkpointModeEl.innerHTML = "";
+
+  modeOrder.forEach((mode) => {
+    const info = modes[mode] || { enabled: false };
+    const opt = document.createElement("option");
+    opt.value = mode;
+    opt.textContent = prettyModeLabel(mode);
+    opt.disabled = !info.enabled;
+    checkpointModeEl.appendChild(opt);
+  });
+
+  let selectedMode = modelSelection.mode;
+  if (!modes[selectedMode] || !modes[selectedMode].enabled) {
+    const fallback = modeOrder.find((m) => modes[m] && modes[m].enabled);
+    selectedMode = fallback || "none";
+  }
+  checkpointModeEl.value = selectedMode;
+  modelSelection.mode = selectedMode;
+
+  const items = (modes[selectedMode] && modes[selectedMode].items) ? modes[selectedMode].items : [];
+  checkpointStampEl.innerHTML = "";
+  items.forEach((item, idx) => {
+    const opt = document.createElement("option");
+    opt.value = String(item.previous);
+    opt.textContent = item.timestamp || `index ${idx}`;
+    checkpointStampEl.appendChild(opt);
+  });
+
+  checkpointStampEl.disabled = items.length === 0;
+  if (items.length > 0) {
+    const wanted = String(modelSelection.previous ?? 0);
+    const hasWanted = items.some((item) => String(item.previous) === wanted);
+    checkpointStampEl.value = hasWanted ? wanted : String(items[0].previous);
+    modelSelection.previous = Number(checkpointStampEl.value);
+    modelSelection.timestamp = (items.find((it) => String(it.previous) === checkpointStampEl.value) || items[0]).timestamp;
+  } else {
+    modelSelection.previous = 0;
+    modelSelection.timestamp = null;
+  }
+
+  updateModelStatus();
+
+  suppressModelEvents = false;
+}
+
 function payload() {
   return {
     cursor: S.snappedCursor,
@@ -417,6 +492,31 @@ quantizeBtn.addEventListener("click", () => {
   sendPayload();
 });
 
+checkpointModeEl.addEventListener("change", () => {
+  if (suppressModelEvents) return;
+  const mode = checkpointModeEl.value;
+  modelSelection.mode = mode;
+  modelSelection.previous = 0;
+  pendingModelSwitch = { mode, previous: 0 };
+  renderModelSelectors();
+  frameInFlight = false;
+  queuedPayload = null;
+  socket.emit("select_model", { mode, previous: 0 });
+});
+
+checkpointStampEl.addEventListener("change", () => {
+  if (suppressModelEvents) return;
+  const mode = checkpointModeEl.value;
+  const previous = Number(checkpointStampEl.value || 0);
+  modelSelection.mode = mode;
+  modelSelection.previous = previous;
+  pendingModelSwitch = { mode, previous };
+  renderModelSelectors();
+  frameInFlight = false;
+  queuedPayload = null;
+  socket.emit("select_model", { mode, previous });
+});
+
 window.addEventListener("resize", render);
 
 socket = io();
@@ -428,6 +528,8 @@ socket.on("connect", () => {
 });
 
 socket.on("bootstrap", (data) => {
+  frameInFlight = false;
+  pendingModelSwitch = null;
   S.cursor = data.cursor;
   S.snappedCursor = data.cursor;
   S.points = data.draggable_points;
@@ -446,6 +548,8 @@ socket.on("bootstrap", (data) => {
   S.nTiming = data.n_timing;
   S.decodeStatus = data.decode_status || "idle";
   S.decodeStep = Number.isFinite(data.decode_progress_step) ? data.decode_progress_step : -1;
+  modelCatalog = data.model_options || { modes: {} };
+  modelSelection = data.model_selection || { mode: "none", previous: 0, timestamp: null };
   gridEl.value = String(S.grid);
   sigmaEl.value = String(S.sigma);
   gridVal.textContent = String(S.grid);
@@ -454,8 +558,9 @@ socket.on("bootstrap", (data) => {
   influenceBtn.textContent = S.influenceMode === "raw" ? "Influence: Raw" : "Influence: %";
   decodeBtn.classList.toggle("active", S.decodeEnabled);
   decodeBtn.textContent = S.decodeEnabled ? "Decode: On" : "Decode: Off";
+  renderModelSelectors();
   render();
-  sendPayload();
+  sendPayload(true);
 });
 
 socket.on("frame", (data) => {
@@ -475,6 +580,14 @@ socket.on("frame", (data) => {
   S.nTiming = data.n_timing;
   S.decodeStatus = data.decode_status || "idle";
   S.decodeStep = Number.isFinite(data.decode_progress_step) ? data.decode_progress_step : -1;
+  // Keep model selection authoritative from bootstrap/select_model to avoid
+  // stale frame responses reverting dropdown state mid-switch.
+  if (!pendingModelSwitch && data.model_options) {
+    modelCatalog = data.model_options;
+  }
+  if (!pendingModelSwitch && data.model_selection) {
+    modelSelection = data.model_selection;
+  }
   gridEl.value = String(S.grid);
   sigmaEl.value = String(S.sigma);
   gridVal.textContent = String(S.grid);
@@ -483,6 +596,7 @@ socket.on("frame", (data) => {
   influenceBtn.textContent = S.influenceMode === "raw" ? "Influence: Raw" : "Influence: %";
   decodeBtn.classList.toggle("active", S.decodeEnabled);
   decodeBtn.textContent = S.decodeEnabled ? "Decode: On" : "Decode: Off";
+  renderModelSelectors();
   render();
   flushPayload();
 });
@@ -494,9 +608,11 @@ socket.on("disconnect", () => {
 
 socket.on("error", (err) => {
   frameInFlight = false;
+  pendingModelSwitch = null;
   setConnectionState(false);
   const msg = typeof err === "string" ? err : (err && err.message) ? err.message : JSON.stringify(err);
   statusEl.textContent = `error: ${msg}`;
+  updateModelStatus();
   flushPayload();
 });
 
@@ -505,6 +621,7 @@ gridEl.value = String(S.grid);
 sigmaEl.value = String(S.sigma);
 gridVal.textContent = String(S.grid);
 sigmaVal.textContent = S.sigma.toFixed(2);
+updateModelStatus();
 render();
 </script>
 </body>
