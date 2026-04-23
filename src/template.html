@@ -99,7 +99,12 @@
           <option value="nearest_anchor">Nearest anchor</option>
           <option value="last_valid_latent">Last valid</option>
           <option value="user_defined_anchor0">Anchor 0 fallback (hidden)</option>
+          <option value="user_defined_anchor0_refined">Anchor 0 fallback (hidden, refined blend)</option>
         </select>
+      </div>
+      <div id="refinedBlendControls" style="display:none">
+        <div class="row"><label>Blend Low</label><input id="blendLow" type="range" min="0.00001" max="0.1" step="0.0001" /><span id="blendLowVal"></span></div>
+        <div class="row"><label>Blend High</label><input id="blendHigh" type="range" min="0.05" max="1.5" step="0.01" /><span id="blendHighVal"></span></div>
       </div>
       <div class="render-progress-wrap">
         <div class="render-progress-track"><div id="renderProgressFill" class="render-progress-fill"></div></div>
@@ -130,6 +135,8 @@ const S = {
   influenceMode: "raw",
   bpmInterpMode: "gaussian_blend",
   latentFallbackMode: "preserve_current_behavior",
+  refinedBlendLow: 0.0002,
+  refinedBlendHigh: 0.45,
   decodeEnabled: false,
   halfExtent: 2.0,
   nTiming: 4,
@@ -174,6 +181,11 @@ const renderBtn = document.getElementById("renderBtn");
 const renderProgressFill = document.getElementById("renderProgressFill");
 const renderProgressText = document.getElementById("renderProgressText");
 const latentFallbackEl = document.getElementById("latentFallbackSelect");
+const blendLowEl = document.getElementById("blendLow");
+const blendHighEl = document.getElementById("blendHigh");
+const blendLowVal = document.getElementById("blendLowVal");
+const blendHighVal = document.getElementById("blendHighVal");
+const refinedBlendControlsEl = document.getElementById("refinedBlendControls");
 const checkpointModeEl = document.getElementById("checkpointMode");
 const checkpointStampEl = document.getElementById("checkpointStamp");
 const modelStatusEl = document.getElementById("modelStatus");
@@ -206,6 +218,15 @@ function anchorBaseName(rawLabel, fallbackIndex) {
   return composed || `Anchor ${fallbackIndex}`;
 }
 
+function updateRefinedBlendVisibility() {
+  const show = S.latentFallbackMode === "user_defined_anchor0_refined";
+  refinedBlendControlsEl.style.display = show ? "" : "none";
+}
+
+function isHiddenAnchor0Mode(mode) {
+  return mode === "user_defined_anchor0" || mode === "user_defined_anchor0_refined";
+}
+
 function setHoveredAnchor(index) {
   const next = Number.isInteger(index) ? index : -1;
   if (next === hoveredAnchorIndex) return;
@@ -215,7 +236,7 @@ function setHoveredAnchor(index) {
     return;
   }
   const label = anchorLabels[hoveredAnchorIndex];
-  const fallbackIndex = (S.latentFallbackMode === "user_defined_anchor0") ? hoveredAnchorIndex + 1 : hoveredAnchorIndex;
+  const fallbackIndex = isHiddenAnchor0Mode(S.latentFallbackMode) ? hoveredAnchorIndex + 1 : hoveredAnchorIndex;
   hoveredAnchorNameEl.textContent = anchorBaseName(label, fallbackIndex);
 }
 
@@ -262,6 +283,8 @@ function setRenderingUiState() {
     mapBtn,
     checkpointModeEl,
     checkpointStampEl,
+    blendLowEl,
+    blendHighEl,
   ].forEach((el) => {
     el.disabled = disableControls;
     el.classList.toggle("controls-disabled", disableControls);
@@ -374,7 +397,7 @@ function drawFieldOverlay() {
   }
   S.points.forEach((p, i) => {
     const [x, y] = toCanvas(p);
-    const displayIdx = (S.latentFallbackMode === "user_defined_anchor0") ? i + 1 : i;
+    const displayIdx = isHiddenAnchor0Mode(S.latentFallbackMode) ? i + 1 : i;
     ctx.fillStyle = "#0f5d6f";
     ctx.strokeStyle = "#f5fcfc";
     ctx.lineWidth = 2;
@@ -617,7 +640,7 @@ function payload() {
       decodeEnabled: S.decodeEnabled,
       renderEnabled: S.renderEnabled,
     },
-    slider_values: { gridResolution: S.grid, sigma: S.sigma },
+    slider_values: { gridResolution: S.grid, sigma: S.sigma, refinedBlendLow: S.refinedBlendLow, refinedBlendHigh: S.refinedBlendHigh },
   };
 }
 
@@ -746,6 +769,23 @@ latentFallbackEl.addEventListener("change", () => {
   S.latentFallbackMode = latentFallbackEl.value;
   S.dragging = -1;
   setHoveredAnchor(-1);
+  updateRefinedBlendVisibility();
+  sendPayload();
+});
+
+blendLowEl.addEventListener("input", () => {
+  let lo = Number(blendLowEl.value);
+  if (lo >= S.refinedBlendHigh) { lo = S.refinedBlendHigh - 0.0001; blendLowEl.value = lo.toFixed(4); }
+  S.refinedBlendLow = lo;
+  blendLowVal.textContent = lo.toFixed(4);
+  sendPayload();
+});
+
+blendHighEl.addEventListener("input", () => {
+  let hi = Number(blendHighEl.value);
+  if (hi <= S.refinedBlendLow) { hi = S.refinedBlendLow + 0.01; blendHighEl.value = hi.toFixed(2); }
+  S.refinedBlendHigh = hi;
+  blendHighVal.textContent = hi.toFixed(2);
   sendPayload();
 });
 
@@ -829,6 +869,8 @@ socket.on("bootstrap", (data) => {
   S.influencePct = data.influence_percentage || [];
   S.grid = data.slider_values.gridResolution;
   S.sigma = data.slider_values.sigma;
+  if (Number.isFinite(data.slider_values.refinedBlendLow)) S.refinedBlendLow = data.slider_values.refinedBlendLow;
+  if (Number.isFinite(data.slider_values.refinedBlendHigh)) S.refinedBlendHigh = data.slider_values.refinedBlendHigh;
   S.heatMode = data.button_values.heatmapMode;
   S.influenceMode = data.button_values.influenceMode;
   S.bpmInterpMode = (data.button_values.bpmInterpMode === "exact_rbf") ? "exact_rbf" : "gaussian_blend";
@@ -853,6 +895,10 @@ socket.on("bootstrap", (data) => {
   sigmaEl.value = String(S.sigma);
   gridVal.textContent = String(S.grid);
   sigmaVal.textContent = S.sigma.toFixed(2);
+  blendLowEl.value = String(S.refinedBlendLow);
+  blendHighEl.value = String(S.refinedBlendHigh);
+  blendLowVal.textContent = S.refinedBlendLow.toFixed(4);
+  blendHighVal.textContent = S.refinedBlendHigh.toFixed(2);
   modeBtn.textContent = S.heatMode === "magnitude" ? "Heat: Mag" : "Heat: Conf";
   influenceBtn.textContent = S.influenceMode === "raw" ? "Influence: Raw" : "Influence: %";
   bpmInterpBtn.textContent = S.bpmInterpMode === "exact_rbf" ? "BPM: Exact" : "BPM: Gaussian";
@@ -861,6 +907,7 @@ socket.on("bootstrap", (data) => {
   decodeBtn.textContent = S.decodeEnabled ? "Decode: On" : "Decode: Off";
   currentBpmEl.textContent = formatCurrentBpm(S.currentBpm);
   setRenderingUiState();
+  updateRefinedBlendVisibility();
   applyFieldAspectMode(false);
   renderModelSelectors();
   render();
@@ -885,12 +932,9 @@ socket.on("frame", (data) => {
   S.renderEnabled = !!data.button_values.renderEnabled;
   S.grid = data.slider_values.gridResolution;
   S.sigma = data.slider_values.sigma;
+  if (Number.isFinite(data.slider_values.refinedBlendLow)) S.refinedBlendLow = data.slider_values.refinedBlendLow;
+  if (Number.isFinite(data.slider_values.refinedBlendHigh)) S.refinedBlendHigh = data.slider_values.refinedBlendHigh;
   S.halfExtent = data.field_half_extent;
-  S.nTiming = data.n_timing;
-  S.decodeStatus = data.decode_status || "idle";
-  S.decodeStep = Number.isFinite(data.decode_progress_step) ? data.decode_progress_step : -1;
-  S.renderStatus = data.render_status || "idle";
-  S.renderCompleted = Number.isFinite(data.render_completed) ? data.render_completed : S.renderCompleted;
   S.renderTotal = Number.isFinite(data.render_total) ? data.render_total : S.renderTotal;
   S.renderOutputPath = data.render_output_path || S.renderOutputPath;
   S.renderError = data.render_error || null;
@@ -927,6 +971,10 @@ socket.on("frame", (data) => {
   sigmaEl.value = String(S.sigma);
   gridVal.textContent = String(S.grid);
   sigmaVal.textContent = S.sigma.toFixed(2);
+  blendLowEl.value = String(S.refinedBlendLow);
+  blendHighEl.value = String(S.refinedBlendHigh);
+  blendLowVal.textContent = S.refinedBlendLow.toFixed(4);
+  blendHighVal.textContent = S.refinedBlendHigh.toFixed(2);
   modeBtn.textContent = S.heatMode === "magnitude" ? "Heat: Mag" : "Heat: Conf";
   influenceBtn.textContent = S.influenceMode === "raw" ? "Influence: Raw" : "Influence: %";
   bpmInterpBtn.textContent = S.bpmInterpMode === "exact_rbf" ? "BPM: Exact" : "BPM: Gaussian";
@@ -935,6 +983,7 @@ socket.on("frame", (data) => {
   decodeBtn.textContent = S.decodeEnabled ? "Decode: On" : "Decode: Off";
   currentBpmEl.textContent = formatCurrentBpm(S.currentBpm);
   setRenderingUiState();
+  updateRefinedBlendVisibility();
   applyFieldAspectMode(false);
   renderModelSelectors();
   render();
@@ -959,10 +1008,15 @@ socket.on("error", (err) => {
 setConnectionState(false);
 gridEl.value = String(S.grid);
 sigmaEl.value = String(S.sigma);
+blendLowEl.value = String(S.refinedBlendLow);
+blendHighEl.value = String(S.refinedBlendHigh);
+blendLowVal.textContent = S.refinedBlendLow.toFixed(4);
+blendHighVal.textContent = S.refinedBlendHigh.toFixed(2);
 gridVal.textContent = String(S.grid);
 sigmaVal.textContent = S.sigma.toFixed(2);
 S.mapMode = false;
 setRenderingUiState();
+updateRefinedBlendVisibility();
 applyFieldAspectMode(false);
 updateModelStatus();
 render();

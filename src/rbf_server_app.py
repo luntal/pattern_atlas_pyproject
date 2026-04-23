@@ -55,18 +55,30 @@ class FrontendState:
     latent_vector: np.ndarray | None = None
     current_bpm: float = 0.0
     last_frontend_payload: dict | None = None
+    refined_blend_low: float = 0.0002
+    refined_blend_high: float = 0.45
 
 
 _FALLBACK_BLEND_LOW = 0.001
 _FALLBACK_BLEND_HIGH = 0.20
 _FALLBACK_EPS = 1e-9
+_ANCHOR_HIT_EPS = 1e-4
 _LATENT_FALLBACK_MODES = (
     "preserve_current_behavior",
     "mean_latent",
     "nearest_anchor",
     "last_valid_latent",
     "user_defined_anchor0",
+    "user_defined_anchor0_refined",
 )
+_ANCHOR0_HIDDEN_FALLBACK_MODES = {
+    "user_defined_anchor0",
+    "user_defined_anchor0_refined",
+}
+
+
+def _uses_hidden_anchor0_mode(mode: str) -> bool:
+    return str(mode) in _ANCHOR0_HIDDEN_FALLBACK_MODES
 
 
 def _smoothstep01(t: float) -> float:
@@ -80,6 +92,15 @@ def _blend_factor_from_influence(influence_sum: float) -> float:
     if influence_sum >= _FALLBACK_BLEND_HIGH:
         return 1.0
     t = (float(influence_sum) - _FALLBACK_BLEND_LOW) / (_FALLBACK_BLEND_HIGH - _FALLBACK_BLEND_LOW)
+    return _smoothstep01(t)
+
+
+def _blend_factor_custom(influence_sum: float, low: float, high: float) -> float:
+    if influence_sum <= low:
+        return 0.0
+    if influence_sum >= high:
+        return 1.0
+    t = (float(influence_sum) - float(low)) / (float(high) - float(low))
     return _smoothstep01(t)
 
 
@@ -131,6 +152,8 @@ class FullFieldRenderManager:
         grid_resolution: int,
         field_half_extent: float,
         branch_name: str,
+        refined_blend_low: float = 0.0002,
+        refined_blend_high: float = 0.45,
     ):
         with self._lock:
             self._current_job_id += 1
@@ -167,6 +190,8 @@ class FullFieldRenderManager:
                 int(grid_resolution),
                 float(field_half_extent),
                 safe_branch_name(branch_name),
+                float(refined_blend_low),
+                float(refined_blend_high),
                 cancel_event,
             ),
             daemon=True,
@@ -238,6 +263,8 @@ class FullFieldRenderManager:
         grid_resolution: int,
         field_half_extent: float,
         branch_name: str,
+        refined_blend_low: float,
+        refined_blend_high: float,
         cancel_event: threading.Event,
     ):
         total = int(grid_resolution) * int(grid_resolution)
@@ -251,7 +278,7 @@ class FullFieldRenderManager:
         cell_size = (2.0 * field_half_extent) / max(1, int(grid_resolution))
 
         # Determine which control-point set and latent data to use per fallback mode.
-        use_ex0 = (latent_fallback_mode == "user_defined_anchor0"
+        use_ex0 = (_uses_hidden_anchor0_mode(latent_fallback_mode)
                    and weights_ex0 is not None
                    and len(control_points) >= 2)
         interp_points = control_points[1:] if use_ex0 else control_points
@@ -276,6 +303,23 @@ class FullFieldRenderManager:
 
             if latent_fallback_mode == "user_defined_anchor0":
                 fallback_vec = anchor0_latent if anchor0_latent is not None else fallback_mean_latent
+            elif latent_fallback_mode == "user_defined_anchor0_refined":
+                if influence.size == 0:
+                    fallback_vec = anchor0_latent if anchor0_latent is not None else fallback_mean_latent
+                else:
+                    nearest_idx = int(np.argmin(np.linalg.norm(interp_points - cursor.reshape(1, 2), axis=1)))
+                    nearest_dist = float(np.linalg.norm(interp_points[nearest_idx] - cursor))
+                    if nearest_dist <= _ANCHOR_HIT_EPS:
+                        target_vec = interp_latent_vectors[nearest_idx].astype(np.float32)
+                    else:
+                        denom = max(influence_sum, _FALLBACK_EPS)
+                        target_vec = (influence.reshape(-1, 1) * interp_latent_vectors).sum(axis=0) / denom
+                        target_vec = target_vec.astype(np.float32)
+                    base_vec = anchor0_latent if anchor0_latent is not None else fallback_mean_latent
+                    if base_vec is None:
+                        return target_vec
+                    alpha = _blend_factor_custom(influence_sum, refined_blend_low, refined_blend_high)
+                    return _lerp_vector(base_vec, target_vec, alpha)
             elif latent_fallback_mode == "mean_latent":
                 fallback_vec = fallback_mean_latent
             elif latent_fallback_mode == "nearest_anchor":
@@ -298,6 +342,20 @@ class FullFieldRenderManager:
                     -(np.linalg.norm(interp_points - cursor.reshape(1, 2), axis=1) ** 2) / (2 * sigma ** 2)
                 ).astype(np.float32)
                 influence_sum = float(np.sum(infl))
+                if latent_fallback_mode == "user_defined_anchor0_refined":
+                    if infl.size == 0:
+                        target_bpm = float(anchor0_bpm)
+                    else:
+                        nearest_idx = int(np.argmin(np.linalg.norm(interp_points - cursor.reshape(1, 2), axis=1)))
+                        nearest_dist = float(np.linalg.norm(interp_points[nearest_idx] - cursor))
+                        if nearest_dist <= _ANCHOR_HIT_EPS:
+                            target_bpm = float(interp_anchor_bpms[nearest_idx])
+                        else:
+                            denom = max(influence_sum, _FALLBACK_EPS)
+                            target_bpm = float(np.sum(infl * interp_anchor_bpms) / denom)
+                    alpha = _blend_factor_custom(influence_sum, refined_blend_low, refined_blend_high)
+                    return _lerp_scalar(float(anchor0_bpm), target_bpm, alpha)
+
                 if bpm_interp_mode == "gaussian_blend":
                     denom = max(influence_sum, _FALLBACK_EPS)
                     rbf_bpm = float(np.sum(infl * interp_anchor_bpms) / denom)
@@ -349,6 +407,7 @@ class FullFieldRenderManager:
                 str(output_path),
                 sequences_1d=np.asarray(sequences_flat, dtype=np.int64),
                 bpms_1d=np.asarray(bpms, dtype=np.float32),
+                control_points=control_points.astype(np.float32),
                 sequence_length=int(sequence_len),
                 grid_resolution=int(grid_resolution),
                 traversal_order="row_major",
@@ -769,6 +828,28 @@ class RBFServerController:
             alpha = _blend_factor_from_influence(influence_sum)
             return _lerp_vector(anchor0_latent, rbf_vec, alpha)
 
+        if mode == "user_defined_anchor0_refined":
+            # Exclude anchor 0 and blend directly between anchor-0 latent and
+            # normalized visible-anchor latent contribution.
+            anchor0_latent = self.latent_vectors[0].astype(np.float32)
+            if len(points) < 2:
+                return anchor0_latent
+            sub_points = points[1:]
+            sub_latents = self.latent_vectors[1:]
+            influence = self._compute_influence_raw(sub_points, cursor, sigma)
+            influence_sum = float(np.sum(influence))
+            if influence.size > 0:
+                nearest_idx = int(np.argmin(np.linalg.norm(sub_points - cursor.reshape(1, 2), axis=1)))
+                nearest_dist = float(np.linalg.norm(sub_points[nearest_idx] - cursor))
+                if nearest_dist <= _ANCHOR_HIT_EPS:
+                    return sub_latents[nearest_idx].astype(np.float32)
+
+            denom = max(influence_sum, _FALLBACK_EPS)
+            visible_target = (influence.reshape(-1, 1) * sub_latents).sum(axis=0) / denom
+            visible_target = visible_target.astype(np.float32)
+            alpha = _blend_factor_custom(influence_sum, self.state.refined_blend_low, self.state.refined_blend_high)
+            return _lerp_vector(anchor0_latent, visible_target, alpha)
+
         # Remaining modes operate over the full control-point set.
         influence = self._compute_influence_raw(points, cursor, sigma)
         influence_sum = float(np.sum(influence))
@@ -1064,12 +1145,27 @@ class RBFServerController:
         mode: str,
         fallback_mode: str = "preserve_current_behavior",
     ) -> float:
-        # For user_defined_anchor0, interpolate BPM over anchors [1:] and blend smoothly to anchor 0 BPM.
-        if fallback_mode == "user_defined_anchor0" and len(control_points) >= 2:
+        # For hidden-anchor-0 modes, interpolate over anchors [1:] and blend to anchor 0 BPM.
+        if _uses_hidden_anchor0_mode(fallback_mode) and len(control_points) >= 2:
             sub_points = control_points[1:]
             sub_bpms = anchor_bpms[1:]
             sub_influence = self._compute_influence_raw(sub_points, cursor, sigma)
             influence_sum = float(np.sum(sub_influence))
+            if fallback_mode == "user_defined_anchor0_refined":
+                if sub_influence.size > 0:
+                    nearest_idx = int(np.argmin(np.linalg.norm(sub_points - cursor.reshape(1, 2), axis=1)))
+                    nearest_dist = float(np.linalg.norm(sub_points[nearest_idx] - cursor))
+                    if nearest_dist <= _ANCHOR_HIT_EPS:
+                        target_bpm = float(sub_bpms[nearest_idx])
+                    else:
+                        denom = max(influence_sum, _FALLBACK_EPS)
+                        target_bpm = float(np.sum(sub_influence * sub_bpms) / denom)
+                else:
+                    target_bpm = float(anchor_bpms[0]) if anchor_bpms.size > 0 else 120.0
+                fallback_bpm = float(anchor_bpms[0]) if anchor_bpms.size > 0 else 120.0
+                alpha = _blend_factor_custom(influence_sum, self.state.refined_blend_low, self.state.refined_blend_high)
+                return _lerp_scalar(fallback_bpm, target_bpm, alpha)
+
             if mode == "gaussian_blend":
                 denom = max(influence_sum, _FALLBACK_EPS)
                 rbf_bpm = float(np.sum(sub_influence * sub_bpms) / denom)
@@ -1128,9 +1224,9 @@ class RBFServerController:
         cursor = self.state.cursor
         sigma = self.state.sigma
         influence_mode = self.state.influence_mode
-        hidden_anchor0_mode = self.state.latent_fallback_mode == "user_defined_anchor0" and len(points) > 1
+        hidden_anchor0_mode = _uses_hidden_anchor0_mode(self.state.latent_fallback_mode) and len(points) > 1
 
-        # In user_defined_anchor0 mode, anchor 0 is internal-only fallback and hidden from UI.
+        # In hidden-anchor-0 modes, anchor 0 is internal-only fallback and hidden from UI.
         influence_points = points[1:] if hidden_anchor0_mode else points
         influence_raw = self._compute_influence_raw(influence_points, cursor, sigma)
         total = float(np.sum(influence_raw))
@@ -1163,6 +1259,8 @@ class RBFServerController:
             "slider_values": {
                 "gridResolution": self.state.grid_resolution,
                 "sigma": sigma,
+                "refinedBlendLow": self.state.refined_blend_low,
+                "refinedBlendHigh": self.state.refined_blend_high,
             },
             "labels": response_labels,
             "anchor_bpms": response_anchor_bpms.tolist(),
@@ -1237,11 +1335,18 @@ class RBFServerController:
             decode_enabled = bool(button_values.get("decodeEnabled", self.state.decode_enabled))
             render_enabled = bool(button_values.get("renderEnabled", self.state.render_enabled))
 
+            raw_blend_low = _safe_float(slider_values.get("refinedBlendLow"), self.state.refined_blend_low)
+            raw_blend_high = _safe_float(slider_values.get("refinedBlendHigh"), self.state.refined_blend_high)
+            refined_blend_low = float(max(1e-5, min(0.1, raw_blend_low)))
+            refined_blend_high = float(max(0.05, min(1.5, raw_blend_high)))
+            if refined_blend_high <= refined_blend_low:
+                refined_blend_high = refined_blend_low + 0.01
+
             # Rebuild full internal control points when UI hides anchor 0 in user_defined mode.
             expected_shape = self.state.control_points.shape
             points = self.state.control_points
             if raw_points.ndim == 2 and raw_points.shape[1] == 2:
-                if latent_fallback_mode == "user_defined_anchor0":
+                if _uses_hidden_anchor0_mode(latent_fallback_mode):
                     full_n = int(expected_shape[0])
                     if raw_points.shape == expected_shape:
                         # Transition frame can still carry full-N points from previous mode.
@@ -1265,6 +1370,8 @@ class RBFServerController:
             self.state.latent_fallback_mode = latent_fallback_mode
             self.state.decode_enabled = decode_enabled
             self.state.render_enabled = render_enabled
+            self.state.refined_blend_low = refined_blend_low
+            self.state.refined_blend_high = refined_blend_high
 
             weights_signature = self._make_weights_signature(points, sigma)
             if weights_signature != self._last_weights_signature:
@@ -1340,6 +1447,8 @@ class RBFServerController:
                     grid_resolution=grid,
                     field_half_extent=self.field_half_extent,
                     branch_name=get_current_branch(),
+                    refined_blend_low=self.state.refined_blend_low,
+                    refined_blend_high=self.state.refined_blend_high,
                 )
             elif prev_render_enabled and (not self.state.render_enabled) and self.render_status == "rendering":
                 # Cancel current render when toggle is switched off.
@@ -1374,7 +1483,7 @@ class RBFServerController:
                 self.decode_progress_step = -1
                 self._last_triggered_latent_signature = None
 
-            if latent_fallback_mode == "user_defined_anchor0" and len(points) > 1 and self.weights_ex0 is not None:
+            if _uses_hidden_anchor0_mode(latent_fallback_mode) and len(points) > 1 and self.weights_ex0 is not None:
                 heatmap_points = points[1:]
                 heatmap_weights = self.weights_ex0
             else:
