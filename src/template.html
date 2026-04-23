@@ -159,8 +159,12 @@ function anchorBaseName(rawLabel, fallbackIndex) {
   const raw = String(rawLabel || "").trim();
   if (!raw) return `Anchor ${fallbackIndex}`;
   const leaf = raw.split(/[\\/]/).pop() || raw;
-  const noExt = leaf.replace(/\.[^.]+$/, "");
-  return noExt || `Anchor ${fallbackIndex}`;
+  const bpmSuffixMatch = leaf.match(/\s*\(bpm:\s*[^)]+\)\s*$/i);
+  const bpmSuffix = bpmSuffixMatch ? bpmSuffixMatch[0].trim() : "";
+  const core = bpmSuffix ? leaf.slice(0, bpmSuffixMatch.index).trim() : leaf;
+  const coreNoExt = core.replace(/\.[^.]+$/, "");
+  const composed = bpmSuffix ? `${coreNoExt} ${bpmSuffix}` : coreNoExt;
+  return composed || `Anchor ${fallbackIndex}`;
 }
 
 function setHoveredAnchor(index) {
@@ -339,8 +343,8 @@ function loadWorldOverlay() {
       worldOverlay.querySelectorAll("path, polygon, polyline, line").forEach((el) => {
         el.setAttribute("fill", "none");
         el.setAttribute("fill-opacity", "0");
-        el.setAttribute("stroke", "rgba(24, 34, 37, 0.58)");
-        el.setAttribute("stroke-width", "0.9");
+        el.setAttribute("stroke", "rgba(24, 34, 37, 0.3)");
+        el.setAttribute("stroke-width", "0.5");
         el.setAttribute("vector-effect", "non-scaling-stroke");
       });
 

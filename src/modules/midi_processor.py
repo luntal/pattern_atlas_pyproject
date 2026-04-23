@@ -50,6 +50,8 @@ class ExtractionStats:
     skipped_no_drums: int = 0
     sequences_before_filter: int = 0
     failed_files: List[Tuple[str, str]] = field(default_factory=list)
+    one_bar_patterns: int = 0
+    skipped_too_short: int = 0
 
 
 def get_randomness(value, strength=1, invert=False):
@@ -452,6 +454,8 @@ class MidiProcessor:
         print(f'Files in selection: {stats.files_count}')
         print(f'Files skipped (invalid/corrupt): {stats.skipped_invalid}')
         print(f'Files skipped (time signature): {stats.skipped_time_signature}')
+        print(f'Files skipped (too short): {stats.skipped_too_short}')
+        print(f'Files with 1-bar patterns: {stats.one_bar_patterns}')
         if drums_only:
             print(f'Files skipped (no drums): {stats.skipped_no_drums}')
         print(f'Total sequences extracted: {stats.sequences_before_filter}')
@@ -601,8 +605,26 @@ class MidiProcessor:
                 len_in_bars = np.ceil(last_note_16th_index / 16)
                 offset = False
                 
-                if len_in_bars < 2:
+                if len_in_bars == 1:
+                    # Exactly 1 bar: duplicate it into bar 2 to form a valid 2-bar window.
+                    bar_offset_seconds = 16 * seconds_per_16th_note
+                    duplicated = [
+                        pretty_midi.Note(
+                            velocity=n.velocity,
+                            pitch=n.pitch,
+                            start=n.start + bar_offset_seconds,
+                            end=n.end + bar_offset_seconds,
+                        )
+                        for n in sorted_midi_notes
+                    ]
+                    sorted_midi_notes = sorted_midi_notes + duplicated
+                    last_note_16th_index = int(sorted_midi_notes[-1].start // seconds_per_16th_note)
+                    len_in_bars = np.ceil(last_note_16th_index / 16)
+                    print('1-bar pattern duplicated to 2 bars.')
+                    statistics.one_bar_patterns += 1
+                elif len_in_bars < 2:
                     print('Too short sequence!')
+                    statistics.skipped_too_short += 1
                     continue
                 print(
                     f'bpm: {bpm:.2f}, seconds_per_beat: {seconds_per_beat:.2f}, seconds_per_16th_note: {seconds_per_16th_note:.2f}')
@@ -691,6 +713,7 @@ class MidiProcessor:
                         'note_interval': note_interval,
                         'note_interval_in_16th': note_interval_in_16th,
                         'filename': filename,
+                        'bpm': bpm,
                         'first_note_in_window': first_note_in_window,
                         'window_note_interval': window_note_interval,
                         'window_note_interval_in_16th': window_note_interval_in_16th,
@@ -936,11 +959,11 @@ class MidiProcessor:
         def get_title(idx):
             title = f"Matrix {idx + 1} of {len(mats)}"
             if idx < len(self.metadata):
-                filename, bar_index = self.metadata[idx]
+                filename, bar_index, window_bpm = self.metadata[idx]
                 # Extract just the filename without path
                 import os
                 basename = os.path.basename(filename)
-                title += f"\n{basename} - Bar {bar_index * 2}"
+                title += f"\n{basename} - Bar {bar_index * 2} (BPM: {window_bpm})"
             return title
 
         ax.set_title(get_title(current_matrix))
@@ -1174,7 +1197,7 @@ class MidiProcessor:
     
             if len(current_seq) >= min_seq_len:
                 sequences.append(current_seq)
-                metadata.append((notes_advanced[0]["filename"], current_window))
+                metadata.append((notes_advanced[0]["filename"], current_window, notes_advanced[0]["bpm"]))
     
             current_seq = []
             last_step_in_window = None

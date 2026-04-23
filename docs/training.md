@@ -112,3 +112,73 @@ View logs with:
 python src/training_log.py       # latest log
 python src/training_log.py 1     # previous log
 ```
+
+---
+
+# Training Setup Parameters
+
+## Learning Rate Scheduler
+
+The scheduler is a custom `LambdaLR` that decays the learning rate smoothly from `scheduler_start_lr` to `scheduler_end_lr` over the entire training run (all epochs × steps per epoch). The decay curve is controlled by `scheduler_exp_curve_factor`.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `scheduler_start_lr` | `4e-4` | Learning rate at step 0. Should match the initial `learning_rate`. |
+| `scheduler_end_lr` | `4e-5` | Learning rate at the final step. |
+| `scheduler_exp_curve_factor` | `-8.0` | Exponent that shapes the decay curve. `0` → linear decay. Negative values produce a fast initial drop followed by a slow tail (concave-up). Positive values produce a slow start followed by a sharp drop at the end. |
+
+**Why use a scheduler?** A high initial learning rate allows rapid progress in early epochs while a low final rate lets the optimizer settle into a precise minimum without overshooting. The exponential curve concentrates most of the decay early, which tends to work well for transformer-based models.
+
+**Curve formula** (progress ∈ [0, 1]):
+
+$$\text{lr}(p) = \text{lr}_\text{start} + (\text{lr}_\text{end} - \text{lr}_\text{start}) \cdot \frac{e^{c \cdot p} - 1}{e^{c} - 1}$$
+
+where $c$ is `scheduler_exp_curve_factor`. When $c = 0$ the formula collapses to linear interpolation.
+
+---
+
+## KL Annealing
+
+KL annealing controls the weight of the KL-divergence term in the VAE loss ($\beta$) as a function of training progress. Without annealing, a strong KL penalty early in training pushes the model toward the prior before the decoder has learned anything useful, causing **posterior collapse** — the encoder outputs near-zero KL and the decoder ignores the latent code entirely.
+
+The annealing schedule is defined as a piecewise curve specified in `annealing_list`. Each entry is a `[normalized_position, beta_value]` pair. Normalized position 0 is the first training step and 1 is the last.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `annealing_list` | `[[0,0],[0.1,0.1],[0.4,0.6],[1.0,0.6]]` | Piecewise control points for the beta schedule. |
+| `annealing_slope` | `0.05` | Controls the sharpness of transitions between control points. `0` → linear. Higher values produce a more step-like (sigmoid-shaped) transition. |
+| `annealing_steps_norm` | `1` | Scales the total number of annealing steps. `1` = full training duration, `0.5` = first half only. |
+| `weighted_beta` | `0.0` | Tracks the current annealed beta during training. Written to checkpoints so retraining can resume the schedule correctly. |
+
+**Interpolation between control points** uses a Bezier-eased cubic Hermite curve in the beta dimension:
+- If both adjacent beta values are positive, interpolation is done in log-space for a perceptually uniform curve.
+- Otherwise, linear interpolation in beta-space is used.
+
+**Typical schedule interpretation** (default values):
+- Steps 0–10 %: beta ramps from 0 → 0.1 (decoder warms up freely).
+- Steps 10–40 %: beta ramps from 0.1 → 0.6 (KL penalty gradually applied).
+- Steps 40–100 %: beta held at 0.6 (stable regularisation for the remainder of training).
+
+---
+
+## Free Bits
+
+| Parameter | Default | Description |
+|---|---|---|
+| `free_bits` | `0.1` | Minimum KL contribution per latent dimension (in nats). |
+
+Each latent dimension is individually clamped from below at `free_bits` before summing to the total KL loss. Dimensions that already contribute more than `free_bits` nats are unaffected.
+
+**Why use free bits?** Even with annealing, certain latent dimensions can collapse to near-zero KL and carry no information. The free-bits constraint prevents the model from "switching off" individual dimensions by ensuring each one must encode at least a small amount of information, leading to a richer and more usable latent space.
+
+---
+
+## Weight Decay
+
+| Parameter | Default | Description |
+|---|---|---|
+| `weight_decay` | `1e-4` | L2 regularisation coefficient applied by the AdamW optimizer. |
+
+Weight decay penalises large parameter magnitudes by adding $\lambda \|\theta\|^2$ to the effective loss. In AdamW this is decoupled from the gradient-based adaptive update, meaning it applies uniformly to all parameters regardless of their gradient history — unlike the original Adam with L2 regularisation, which under-regularises parameters with large gradient variance.
+
+**Why use weight decay?** It discourages the model from relying on a small number of very large weights, improving generalisation and reducing sensitivity to individual training examples. At `1e-4` the effect is mild and primarily acts as a stability mechanism rather than aggressive regularisation.

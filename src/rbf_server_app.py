@@ -555,10 +555,20 @@ class RBFServerController:
             mu, _ = self.runtime.encoder(tokens, beat_tokens)
         self.latent_vectors = mu.detach().cpu().numpy().astype(np.float32)
 
-        self.labels = [
-            os.path.basename(str(item[0])) if isinstance(item, (list, tuple)) and len(item) > 0 else str(item)
-            for item in metadata
-        ]
+        labels = []
+        for item in metadata:
+            if isinstance(item, (list, tuple, np.ndarray)) and len(item) > 0:
+                filename = os.path.basename(str(item[0]))
+                filename_no_ext = os.path.splitext(filename)[0]
+                bpm = item[2] if len(item) > 2 else None
+                bpm_value = _safe_float(bpm, -1.0)
+                if bpm_value > 0:
+                    labels.append(f"{filename_no_ext} (bpm: {bpm_value:.2f})")
+                else:
+                    labels.append(filename_no_ext)
+            else:
+                labels.append(str(item))
+        self.labels = labels
 
     def reload_model(self, mode: str, previous: int = 0):
         if mode not in self.MODE_LABELS:
@@ -875,8 +885,31 @@ def create_app(sample_count: int = 10, sample_seed: int = 42):
 
 
 def main():
+    AUTOMATIC_PORT_SELECTION = True
+    if AUTOMATIC_PORT_SELECTION:
+        # Automatic mode: CUDA machines default to 5006, others to 5009.
+        if torch.cuda.is_available():
+            port = 5006
+        else:
+            port = 5009
+        user_input_string = str(port)
+        user_input_int = port
+        print(f"Automatic port selection enabled. CUDA available: {torch.cuda.is_available()}. Base port: {port}")
+    else:
+        user_input = input('Enter a port number between 1024 and 65535: ')
+        user_input_string = user_input.strip()
+        user_input_int = _safe_int(user_input_string, None)
+        if user_input_int is not None and 1024 <= user_input_int <= 65535:
+            port = user_input_int
+        else:
+            print(f"Invalid port number '{user_input_string}'. Falling back to default port 5006.")
+            port = 5006
+        print(f"user input string: '{user_input_string}', user input int: {user_input_int}, final port: {port}")
+
+
+
     host = os.environ.get("RBF_SERVER_HOST", "0.0.0.0")
-    port = _safe_int(os.environ.get("RBF_SERVER_PORT", "5006"), 5006)
+    port = _safe_int(os.environ.get("RBF_SERVER_PORT", user_input_string), user_input_int)
     sample_count = _safe_int(os.environ.get("RBF_SAMPLE_COUNT", "10"), 10)
     sample_seed = _safe_int(os.environ.get("RBF_SAMPLE_SEED", "42"), 42)
     app, socketio = create_app(sample_count=sample_count, sample_seed=sample_seed)
