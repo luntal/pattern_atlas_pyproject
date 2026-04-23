@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import threading
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 import re
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import torch
@@ -45,10 +47,323 @@ class FrontendState:
     heatmap_mode: str = "magnitude"
     influence_mode: str = "raw"
     decode_enabled: bool = False
+    render_enabled: bool = False
+    bpm_interp_mode: str = "gaussian_blend"
+    latent_fallback_mode: str = "preserve_current_behavior"
     grid_resolution: int = 30
     sigma: float = 0.30
     latent_vector: np.ndarray | None = None
+    current_bpm: float = 0.0
     last_frontend_payload: dict | None = None
+
+
+_FALLBACK_BLEND_LOW = 0.001
+_FALLBACK_BLEND_HIGH = 0.20
+_FALLBACK_EPS = 1e-9
+_LATENT_FALLBACK_MODES = (
+    "preserve_current_behavior",
+    "mean_latent",
+    "nearest_anchor",
+    "last_valid_latent",
+    "user_defined_anchor0",
+)
+
+
+def _smoothstep01(t: float) -> float:
+    t_clamped = max(0.0, min(1.0, float(t)))
+    return t_clamped * t_clamped * (3.0 - 2.0 * t_clamped)
+
+
+def _blend_factor_from_influence(influence_sum: float) -> float:
+    if influence_sum <= _FALLBACK_BLEND_LOW:
+        return 0.0
+    if influence_sum >= _FALLBACK_BLEND_HIGH:
+        return 1.0
+    t = (float(influence_sum) - _FALLBACK_BLEND_LOW) / (_FALLBACK_BLEND_HIGH - _FALLBACK_BLEND_LOW)
+    return _smoothstep01(t)
+
+
+def _lerp_vector(fallback_vec: np.ndarray, rbf_vec: np.ndarray, alpha: float) -> np.ndarray:
+    a = float(max(0.0, min(1.0, alpha)))
+    return ((1.0 - a) * fallback_vec + a * rbf_vec).astype(np.float32)
+
+
+def _lerp_scalar(fallback_value: float, rbf_value: float, alpha: float) -> float:
+    a = float(max(0.0, min(1.0, alpha)))
+    return float((1.0 - a) * float(fallback_value) + a * float(rbf_value))
+
+
+class FullFieldRenderManager:
+    def __init__(self, runtime: "CudaRBFRuntime", hparams):
+        self.runtime = runtime
+        self.hparams = hparams
+        self._lock = threading.RLock()
+        self._current_job_id = 0
+        self._cancel_event = None
+        self._latest_generation = 0
+        self._last_consumed_generation = -1
+
+        self._status = "idle"
+        self._completed = 0
+        self._total = 0
+        self._output_path = None
+        self._error = None
+
+    def is_rendering(self) -> bool:
+        with self._lock:
+            return self._status == "rendering"
+
+    def request_render(
+        self,
+        control_points: np.ndarray,
+        anchor_bpms: np.ndarray,
+        latent_weights: np.ndarray,
+        bpm_weights: np.ndarray,
+        bpm_interp_mode: str,
+        latent_fallback_mode: str,
+        fallback_mean_latent: np.ndarray | None,
+        latent_vectors_snapshot: np.ndarray,
+        weights_ex0: np.ndarray | None,
+        bpm_weights_ex0: np.ndarray | None,
+        anchor0_latent: np.ndarray | None,
+        anchor0_bpm: float,
+        sigma: float,
+        grid_resolution: int,
+        field_half_extent: float,
+        branch_name: str,
+    ):
+        with self._lock:
+            self._current_job_id += 1
+            job_id = self._current_job_id
+            if self._cancel_event is not None:
+                self._cancel_event.set()
+            cancel_event = threading.Event()
+            self._cancel_event = cancel_event
+            total = int(grid_resolution) * int(grid_resolution)
+            self._status = "rendering"
+            self._completed = 0
+            self._total = total
+            self._output_path = None
+            self._error = None
+            self._latest_generation += 1
+
+        thread = threading.Thread(
+            target=self._render_job,
+            args=(
+                job_id,
+                control_points.astype(np.float32, copy=True),
+                anchor_bpms.astype(np.float32, copy=True),
+                latent_weights.astype(np.float32, copy=True),
+                bpm_weights.astype(np.float32, copy=True),
+                str(bpm_interp_mode),
+                str(latent_fallback_mode),
+                fallback_mean_latent.astype(np.float32, copy=True) if fallback_mean_latent is not None else None,
+                latent_vectors_snapshot.astype(np.float32, copy=True),
+                weights_ex0.astype(np.float32, copy=True) if weights_ex0 is not None else None,
+                bpm_weights_ex0.astype(np.float32, copy=True) if bpm_weights_ex0 is not None else None,
+                anchor0_latent.astype(np.float32, copy=True) if anchor0_latent is not None else None,
+                float(anchor0_bpm),
+                float(sigma),
+                int(grid_resolution),
+                float(field_half_extent),
+                safe_branch_name(branch_name),
+                cancel_event,
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+    def cancel_render(self):
+        with self._lock:
+            if self._cancel_event is not None:
+                self._cancel_event.set()
+
+    def consume_latest_update(self):
+        with self._lock:
+            if self._latest_generation == self._last_consumed_generation:
+                return None
+            self._last_consumed_generation = self._latest_generation
+            return {
+                "status": self._status,
+                "completed": int(self._completed),
+                "total": int(self._total),
+                "output_path": self._output_path,
+                "error": self._error,
+            }
+
+    def _publish_update(
+        self,
+        job_id: int,
+        status: str,
+        completed: int,
+        total: int,
+        output_path: str | None = None,
+        error: str | None = None,
+    ):
+        with self._lock:
+            if job_id != self._current_job_id:
+                return
+            self._status = status
+            self._completed = int(completed)
+            self._total = int(total)
+            self._output_path = output_path
+            self._error = error
+            self._latest_generation += 1
+
+    def _normalize_tokens(self, tokens: np.ndarray, target_len: int, pad_token: int) -> np.ndarray:
+        out = np.asarray(tokens, dtype=np.int64).reshape(-1)
+        if out.size > target_len:
+            out = out[:target_len]
+        elif out.size < target_len:
+            pad = np.full((target_len - out.size,), int(pad_token), dtype=np.int64)
+            out = np.concatenate([out, pad], axis=0)
+        return out
+
+    def _render_job(
+        self,
+        job_id: int,
+        control_points: np.ndarray,
+        anchor_bpms: np.ndarray,
+        latent_weights: np.ndarray,
+        bpm_weights: np.ndarray,
+        bpm_interp_mode: str,
+        latent_fallback_mode: str,
+        fallback_mean_latent: np.ndarray | None,
+        latent_vectors_snapshot: np.ndarray,
+        weights_ex0: np.ndarray | None,
+        bpm_weights_ex0: np.ndarray | None,
+        anchor0_latent: np.ndarray | None,
+        anchor0_bpm: float,
+        sigma: float,
+        grid_resolution: int,
+        field_half_extent: float,
+        branch_name: str,
+        cancel_event: threading.Event,
+    ):
+        total = int(grid_resolution) * int(grid_resolution)
+        sequence_len = 256
+        pad_token = int(self.hparams.pad_token)
+        sequences_flat = []
+        bpms = []
+        completed = 0
+        last_valid_latent: np.ndarray | None = None
+
+        cell_size = (2.0 * field_half_extent) / max(1, int(grid_resolution))
+
+        # Determine which control-point set and latent data to use per fallback mode.
+        use_ex0 = (latent_fallback_mode == "user_defined_anchor0"
+                   and weights_ex0 is not None
+                   and len(control_points) >= 2)
+        interp_points = control_points[1:] if use_ex0 else control_points
+        interp_weights = weights_ex0 if use_ex0 else latent_weights
+        interp_bpm_weights = bpm_weights_ex0 if use_ex0 else bpm_weights
+        interp_anchor_bpms = anchor_bpms[1:] if use_ex0 else anchor_bpms
+        interp_latent_vectors = latent_vectors_snapshot[1:] if use_ex0 else latent_vectors_snapshot
+
+        def _cell_latent(cursor: np.ndarray) -> np.ndarray:
+            nonlocal last_valid_latent
+            if latent_fallback_mode == "preserve_current_behavior":
+                return rbf_interpolate_exact(control_points, latent_weights, cursor, sigma=sigma).astype(np.float32)
+
+            influence = np.exp(
+                -(np.linalg.norm(interp_points - cursor.reshape(1, 2), axis=1) ** 2) / (2 * sigma ** 2)
+            ).astype(np.float32)
+            influence_sum = float(np.sum(influence))
+            rbf_vec = rbf_interpolate_exact(interp_points, interp_weights, cursor, sigma=sigma).astype(np.float32)
+
+            if latent_fallback_mode == "last_valid_latent" and influence_sum >= _FALLBACK_BLEND_HIGH:
+                last_valid_latent = rbf_vec.copy()
+
+            if latent_fallback_mode == "user_defined_anchor0":
+                fallback_vec = anchor0_latent if anchor0_latent is not None else fallback_mean_latent
+            elif latent_fallback_mode == "mean_latent":
+                fallback_vec = fallback_mean_latent
+            elif latent_fallback_mode == "nearest_anchor":
+                denom = max(influence_sum, _FALLBACK_EPS)
+                fallback_vec = (influence.reshape(-1, 1) * interp_latent_vectors).sum(axis=0) / denom
+                fallback_vec = fallback_vec.astype(np.float32)
+            elif latent_fallback_mode == "last_valid_latent":
+                fallback_vec = last_valid_latent if last_valid_latent is not None else fallback_mean_latent
+            else:
+                return rbf_vec
+
+            if fallback_vec is None:
+                return rbf_vec
+            alpha = _blend_factor_from_influence(influence_sum)
+            return _lerp_vector(fallback_vec, rbf_vec, alpha)
+
+        def _cell_bpm(cursor: np.ndarray) -> float:
+            if use_ex0:
+                infl = np.exp(
+                    -(np.linalg.norm(interp_points - cursor.reshape(1, 2), axis=1) ** 2) / (2 * sigma ** 2)
+                ).astype(np.float32)
+                influence_sum = float(np.sum(infl))
+                if bpm_interp_mode == "gaussian_blend":
+                    denom = max(influence_sum, _FALLBACK_EPS)
+                    rbf_bpm = float(np.sum(infl * interp_anchor_bpms) / denom)
+                elif interp_bpm_weights is not None:
+                    bpm = rbf_interpolate_exact(interp_points, interp_bpm_weights, cursor, sigma=sigma)
+                    rbf_bpm = float(np.asarray(bpm).reshape(-1)[0])
+                else:
+                    rbf_bpm = float(interp_anchor_bpms[0]) if interp_anchor_bpms.size > 0 else 120.0
+                alpha = _blend_factor_from_influence(influence_sum)
+                return _lerp_scalar(float(anchor0_bpm), rbf_bpm, alpha)
+
+            if bpm_interp_mode == "gaussian_blend":
+                dists = np.linalg.norm(control_points - cursor.reshape(1, 2), axis=1)
+                influence = np.exp(-(dists ** 2) / (2 * sigma ** 2)).astype(np.float32)
+                denom = float(np.sum(influence))
+                if denom > 0.0:
+                    return float(np.sum(influence * anchor_bpms) / denom)
+                return float(anchor_bpms[0]) if anchor_bpms.size > 0 else 120.0
+            bpm = rbf_interpolate_exact(control_points, bpm_weights, cursor, sigma=sigma)
+            return float(np.asarray(bpm).reshape(-1)[0])
+
+        try:
+            for row in range(int(grid_resolution)):
+                wy = -field_half_extent + (row + 0.5) * cell_size
+                for col in range(int(grid_resolution)):
+                    if cancel_event.is_set():
+                        self._publish_update(job_id, "cancelled", completed, total)
+                        return
+
+                    wx = -field_half_extent + (col + 0.5) * cell_size
+                    cursor = np.asarray([wx, wy], dtype=np.float32)
+
+                    latent = _cell_latent(cursor)
+                    matrix = self.runtime.decode_latent_to_matrix(latent)
+                    tokens = self.runtime._tokens_from_matrix_buffer(matrix)
+                    normalized = self._normalize_tokens(tokens, sequence_len, pad_token)
+                    sequences_flat.extend(normalized.tolist())
+                    bpms.append(_cell_bpm(cursor))
+
+                    completed += 1
+                    self._publish_update(job_id, "rendering", completed, total)
+
+            timestamp = datetime.now(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d_%H-%M-%S")
+            output_dir = Path("outputs") / branch_name
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = output_dir / f"field_render_{timestamp}.npz"
+
+            np.savez_compressed(
+                str(output_path),
+                sequences_1d=np.asarray(sequences_flat, dtype=np.int64),
+                bpms_1d=np.asarray(bpms, dtype=np.float32),
+                sequence_length=int(sequence_len),
+                grid_resolution=int(grid_resolution),
+                traversal_order="row_major",
+                bpm_interp_mode=str(bpm_interp_mode),
+                latent_fallback_mode=str(latent_fallback_mode),
+                sigma=float(sigma),
+                field_half_extent=float(field_half_extent),
+                total_points=int(total),
+                branch=branch_name,
+                timestamp=timestamp,
+            )
+
+            self._publish_update(job_id, "done", completed, total, output_path=str(output_path))
+        except Exception as exc:
+            self._publish_update(job_id, "error", completed, total, error=str(exc))
 
 
 class RealtimeDecoderManager:
@@ -414,6 +729,74 @@ class RBFServerController:
 
     TIMESTAMP_PATTERN = r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}"
 
+    def _compute_bpm_weights(self, control_points: np.ndarray, sigma: float) -> np.ndarray:
+        bpm_targets = self.anchor_bpms.reshape(-1, 1).astype(np.float32)
+        try:
+            # Use zero ridge first so anchors reproduce their source BPM exactly.
+            return compute_rbf_weights(control_points, bpm_targets, sigma=sigma, lambd=0.0)
+        except np.linalg.LinAlgError:
+            # Fall back to tiny ridge regularization for numerical stability.
+            return compute_rbf_weights(control_points, bpm_targets, sigma=sigma, lambd=1e-6)
+
+    def _recompute_fallback_caches(self):
+        """Recompute caches used by fallback modes. Call after loading a new latent pool."""
+        if len(self.latent_vectors) > 0:
+            self._fallback_mean_latent: np.ndarray = np.mean(self.latent_vectors, axis=0).astype(np.float32)
+        else:
+            self._fallback_mean_latent = np.zeros(1, dtype=np.float32)
+
+    def _compute_latent_with_fallback(
+        self,
+        cursor: np.ndarray,
+        points: np.ndarray,
+        weights: np.ndarray,
+        sigma: float,
+        mode: str,
+    ) -> np.ndarray:
+        """Interpolate a latent vector with selected fallback behaviour for low-influence regions."""
+        if mode == "preserve_current_behavior":
+            return rbf_interpolate_exact(points, weights, cursor, sigma=sigma).astype(np.float32)
+
+        if mode == "user_defined_anchor0":
+            # Exclude anchor 0 from interpolation; blend smoothly toward anchor 0 latent.
+            anchor0_latent = self.latent_vectors[0].astype(np.float32)
+            if len(points) < 2 or self.weights_ex0 is None:
+                return anchor0_latent
+            sub_points = points[1:]
+            influence = self._compute_influence_raw(sub_points, cursor, sigma)
+            influence_sum = float(np.sum(influence))
+            rbf_vec = rbf_interpolate_exact(sub_points, self.weights_ex0, cursor, sigma=sigma).astype(np.float32)
+            alpha = _blend_factor_from_influence(influence_sum)
+            return _lerp_vector(anchor0_latent, rbf_vec, alpha)
+
+        # Remaining modes operate over the full control-point set.
+        influence = self._compute_influence_raw(points, cursor, sigma)
+        influence_sum = float(np.sum(influence))
+        rbf_vec = rbf_interpolate_exact(points, weights, cursor, sigma=sigma).astype(np.float32)
+
+        # Keep last-valid cache in pure RBF zone only.
+        if mode == "last_valid_latent" and influence_sum >= _FALLBACK_BLEND_HIGH:
+            self._fallback_last_valid_latent = rbf_vec.copy()
+
+        fallback_vec: np.ndarray
+        if mode == "mean_latent":
+            fallback_vec = self._fallback_mean_latent.astype(np.float32)
+        elif mode == "nearest_anchor":
+            # Soft-nearest fallback: smooth Gaussian-weighted blend across anchors.
+            denom = max(float(np.sum(influence)), _FALLBACK_EPS)
+            fallback_vec = (influence.reshape(-1, 1) * self.latent_vectors).sum(axis=0) / denom
+            fallback_vec = fallback_vec.astype(np.float32)
+        elif mode == "last_valid_latent":
+            if self._fallback_last_valid_latent is not None:
+                fallback_vec = self._fallback_last_valid_latent.astype(np.float32)
+            else:
+                fallback_vec = self._fallback_mean_latent.astype(np.float32)
+        else:
+            return rbf_vec
+
+        alpha = _blend_factor_from_influence(influence_sum)
+        return _lerp_vector(fallback_vec, rbf_vec, alpha)
+
     @classmethod
     def _mode_files_static(cls, mode: str) -> list[Path]:
         branch_name = safe_branch_name(get_current_branch())
@@ -458,6 +841,7 @@ class RBFServerController:
         self.hparams = self.runtime.hparams
         self._lock = threading.Lock()
         self.decoder_manager = RealtimeDecoderManager(self.runtime.decoder, self.hparams)
+        self.render_manager = FullFieldRenderManager(self.runtime, self.hparams)
 
         self.model_catalog = self._build_model_catalog()
         self._normalize_selection_to_catalog()
@@ -466,6 +850,10 @@ class RBFServerController:
         control_points = self._make_initial_control_points(len(self.latent_vectors), field_half_extent=2.0)
         self.field_half_extent = 2.0
         self.weights = compute_rbf_weights(control_points, self.latent_vectors, sigma=0.30)
+        self.bpm_weights = self._compute_bpm_weights(control_points, sigma=0.30)
+        self.weights_ex0: np.ndarray | None = None
+        self.bpm_weights_ex0: np.ndarray | None = None
+        self._fallback_last_valid_latent: np.ndarray | None = None
         self._last_weights_signature = None
         self._last_heatmap_signature = None
         self._cached_heatmap = np.zeros((30, 30), dtype=np.float32)
@@ -473,14 +861,22 @@ class RBFServerController:
         self.reconstruction_matrix = np.zeros((int(self.hparams.height), self.recon_cols), dtype=np.float32)
         self.decode_status = "idle"
         self.decode_progress_step = -1
+        self.render_status = "idle"
+        self.render_completed = 0
+        self.render_total = 0
+        self.render_output_path = None
+        self.render_error = None
         self._last_triggered_latent_signature = None
         self.state = FrontendState(
             cursor=np.zeros(2, dtype=np.float32),
             control_points=control_points,
             heatmap_mode="magnitude",
             influence_mode="raw",
+            bpm_interp_mode="gaussian_blend",
+            render_enabled=False,
             grid_resolution=30,
             sigma=0.30,
+            current_bpm=float(self.anchor_bpms[0]) if len(self.anchor_bpms) > 0 else 0.0,
         )
 
     def _branch_model_dir(self) -> Path:
@@ -555,6 +951,7 @@ class RBFServerController:
             mu, _ = self.runtime.encoder(tokens, beat_tokens)
         self.latent_vectors = mu.detach().cpu().numpy().astype(np.float32)
 
+        bpms = []
         labels = []
         for item in metadata:
             if isinstance(item, (list, tuple, np.ndarray)) and len(item) > 0:
@@ -563,12 +960,17 @@ class RBFServerController:
                 bpm = item[2] if len(item) > 2 else None
                 bpm_value = _safe_float(bpm, -1.0)
                 if bpm_value > 0:
-                    labels.append(f"{filename_no_ext} (bpm: {bpm_value:.2f})")
+                    labels.append(f"{filename_no_ext} (BPM: {bpm_value:.2f})")
+                    bpms.append(float(bpm_value))
                 else:
                     labels.append(filename_no_ext)
+                    bpms.append(120.0)
             else:
                 labels.append(str(item))
+                bpms.append(120.0)
         self.labels = labels
+        self.anchor_bpms = np.asarray(bpms, dtype=np.float32)
+        self._recompute_fallback_caches()
 
     def reload_model(self, mode: str, previous: int = 0):
         if mode not in self.MODE_LABELS:
@@ -586,6 +988,7 @@ class RBFServerController:
         self.runtime = CudaRBFRuntime(previous=previous, checkpoint_kind=checkpoint_kind)
         self.hparams = self.runtime.hparams
         self.decoder_manager = RealtimeDecoderManager(self.runtime.decoder, self.hparams)
+        self.render_manager = FullFieldRenderManager(self.runtime, self.hparams)
         self._load_latent_pool()
 
         self.selected_mode = mode
@@ -597,14 +1000,27 @@ class RBFServerController:
         self.state.control_points = control_points
         self.state.cursor = np.zeros(2, dtype=np.float32)
         self.state.latent_vector = None
+        self.state.render_enabled = False
+        self.state.bpm_interp_mode = "gaussian_blend"
+        self.state.latent_fallback_mode = "preserve_current_behavior"
+        self.state.current_bpm = float(self.anchor_bpms[0]) if len(self.anchor_bpms) > 0 else 0.0
         self.recon_cols = int(self.hparams.width * self.hparams.n_timing)
         self.reconstruction_matrix = np.zeros((int(self.hparams.height), self.recon_cols), dtype=np.float32)
         self.decode_status = "idle"
         self.decode_progress_step = -1
+        self.render_status = "idle"
+        self.render_completed = 0
+        self.render_total = 0
+        self.render_output_path = None
+        self.render_error = None
         self._last_weights_signature = None
         self._last_heatmap_signature = None
         self._last_triggered_latent_signature = None
+        self.weights_ex0 = None
+        self.bpm_weights_ex0 = None
+        self._fallback_last_valid_latent = None
         self.weights = compute_rbf_weights(control_points, self.latent_vectors, sigma=self.state.sigma)
+        self.bpm_weights = self._compute_bpm_weights(control_points, sigma=self.state.sigma)
         self._cached_heatmap = np.zeros((self.state.grid_resolution, self.state.grid_resolution), dtype=np.float32)
 
     def _make_initial_control_points(self, n_points: int, field_half_extent: float) -> np.ndarray:
@@ -638,11 +1054,52 @@ class RBFServerController:
         dists = np.linalg.norm(control_points - cursor.reshape(1, 2), axis=1)
         return np.exp(-(dists ** 2) / (2 * sigma ** 2)).astype(np.float32)
 
+    def _interpolate_bpm(
+        self,
+        control_points: np.ndarray,
+        anchor_bpms: np.ndarray,
+        bpm_weights: np.ndarray,
+        cursor: np.ndarray,
+        sigma: float,
+        mode: str,
+        fallback_mode: str = "preserve_current_behavior",
+    ) -> float:
+        # For user_defined_anchor0, interpolate BPM over anchors [1:] and blend smoothly to anchor 0 BPM.
+        if fallback_mode == "user_defined_anchor0" and len(control_points) >= 2:
+            sub_points = control_points[1:]
+            sub_bpms = anchor_bpms[1:]
+            sub_influence = self._compute_influence_raw(sub_points, cursor, sigma)
+            influence_sum = float(np.sum(sub_influence))
+            if mode == "gaussian_blend":
+                denom = max(influence_sum, _FALLBACK_EPS)
+                rbf_bpm = float(np.sum(sub_influence * sub_bpms) / denom)
+            elif self.bpm_weights_ex0 is not None:
+                bpm = rbf_interpolate_exact(sub_points, self.bpm_weights_ex0, cursor, sigma=sigma)
+                rbf_bpm = float(np.asarray(bpm).reshape(-1)[0])
+            else:
+                rbf_bpm = float(sub_bpms[0]) if sub_bpms.size > 0 else 120.0
+
+            fallback_bpm = float(anchor_bpms[0]) if anchor_bpms.size > 0 else 120.0
+            alpha = _blend_factor_from_influence(influence_sum)
+            return _lerp_scalar(fallback_bpm, rbf_bpm, alpha)
+
+        if mode == "gaussian_blend":
+            influence = self._compute_influence_raw(control_points, cursor, sigma)
+            denom = float(np.sum(influence))
+            if denom > 0.0:
+                return float(np.sum(influence * anchor_bpms) / denom)
+            if anchor_bpms.size > 0:
+                return float(anchor_bpms[0])
+            return 120.0
+
+        bpm = rbf_interpolate_exact(control_points, bpm_weights, cursor, sigma=sigma)
+        return float(np.asarray(bpm).reshape(-1)[0])
+
     def _make_weights_signature(self, points: np.ndarray, sigma: float):
         return (points.shape, np.round(points, 4).tobytes(), round(float(sigma), 4))
 
-    def _make_heatmap_signature(self, points: np.ndarray, sigma: float, grid: int, mode: str):
-        return (points.shape, np.round(points, 4).tobytes(), round(float(sigma), 4), int(grid), str(mode))
+    def _make_heatmap_signature(self, points: np.ndarray, sigma: float, grid: int, mode: str, fallback_mode: str = ""):
+        return (points.shape, np.round(points, 4).tobytes(), round(float(sigma), 4), int(grid), str(mode), str(fallback_mode))
 
     def _refresh_decoder_update(self) -> bool:
         decode_update = self.decoder_manager.consume_latest_update()
@@ -653,19 +1110,39 @@ class RBFServerController:
         self.decode_progress_step = int(decode_update["progress_step"])
         return True
 
+    def _refresh_render_update(self) -> bool:
+        render_update = self.render_manager.consume_latest_update()
+        if render_update is None:
+            return False
+        self.render_status = render_update["status"]
+        self.render_completed = int(render_update["completed"])
+        self.render_total = int(render_update["total"])
+        self.render_output_path = render_update["output_path"]
+        self.render_error = render_update["error"]
+        if self.render_status in {"done", "cancelled", "error", "idle"}:
+            self.state.render_enabled = False
+        return True
+
     def _build_response(self, midi_buffer, encode_midi: bool) -> dict:
         points = self.state.control_points
         cursor = self.state.cursor
         sigma = self.state.sigma
         influence_mode = self.state.influence_mode
-        influence_raw = self._compute_influence_raw(points, cursor, sigma)
+        hidden_anchor0_mode = self.state.latent_fallback_mode == "user_defined_anchor0" and len(points) > 1
+
+        # In user_defined_anchor0 mode, anchor 0 is internal-only fallback and hidden from UI.
+        influence_points = points[1:] if hidden_anchor0_mode else points
+        influence_raw = self._compute_influence_raw(influence_points, cursor, sigma)
         total = float(np.sum(influence_raw))
         influence_pct = influence_raw / total if total > 0.0 else np.zeros_like(influence_raw)
+        response_points = points[1:] if hidden_anchor0_mode else points
+        response_labels = self.labels[1:] if hidden_anchor0_mode else self.labels
+        response_anchor_bpms = self.anchor_bpms[1:] if hidden_anchor0_mode else self.anchor_bpms
 
         return {
             "request_id": (self.state.last_frontend_payload or {}).get("client_request_id"),
             "cursor": cursor.tolist(),
-            "draggable_points": points.tolist(),
+            "draggable_points": response_points.tolist(),
             "heatmap": self._cached_heatmap.tolist(),
             "latent_vector": self.state.latent_vector.tolist() if self.state.latent_vector is not None else [],
             "midi_buffer": midi_buffer,
@@ -676,14 +1153,20 @@ class RBFServerController:
             "button_values": {
                 "heatmapMode": self.state.heatmap_mode,
                 "influenceMode": self.state.influence_mode,
+                "bpmInterpMode": self.state.bpm_interp_mode,
+                "latentFallbackMode": self.state.latent_fallback_mode,
                 "encodeMidi": encode_midi,
                 "decodeEnabled": self.state.decode_enabled,
+                "renderEnabled": self.state.render_enabled,
             },
+            "anchor0_locked": False,
             "slider_values": {
                 "gridResolution": self.state.grid_resolution,
                 "sigma": sigma,
             },
-            "labels": self.labels,
+            "labels": response_labels,
+            "anchor_bpms": response_anchor_bpms.tolist(),
+            "current_bpm": float(self.state.current_bpm),
             "cuda_ready": True,
             "field_half_extent": self.field_half_extent,
             "n_timing": int(self.hparams.n_timing),
@@ -691,6 +1174,11 @@ class RBFServerController:
             "height": int(self.hparams.height),
             "decode_status": self.decode_status,
             "decode_progress_step": int(self.decode_progress_step),
+            "render_status": self.render_status,
+            "render_completed": int(self.render_completed),
+            "render_total": int(self.render_total),
+            "render_output_path": self.render_output_path,
+            "render_error": self.render_error,
             "model_options": self.model_catalog,
             "model_selection": {
                 "mode": self.selected_mode,
@@ -712,6 +1200,7 @@ class RBFServerController:
     def snapshot_response(self) -> dict:
         with self._lock:
             self._refresh_decoder_update()
+            self._refresh_render_update()
             encode_midi = False
             midi_buffer = None
             if self.state.last_frontend_payload is not None:
@@ -723,14 +1212,13 @@ class RBFServerController:
     def process_frame(self, payload: dict | None) -> dict:
         payload = payload or {}
         with self._lock:
+            self._refresh_render_update()
             self.state.last_frontend_payload = payload
             slider_values = payload.get("slider_values") or {}
             button_values = payload.get("button_values") or {}
 
             cursor = np.asarray(payload.get("cursor", self.state.cursor), dtype=np.float32).reshape(2)
-            points = np.asarray(payload.get("draggable_points", self.state.control_points), dtype=np.float32)
-            if points.shape != self.state.control_points.shape:
-                points = self.state.control_points
+            raw_points = np.asarray(payload.get("draggable_points", self.state.control_points), dtype=np.float32)
 
             grid = int(max(4, min(60, _safe_int(slider_values.get("gridResolution"), self.state.grid_resolution))))
             sigma = float(max(0.05, min(3.0, _safe_float(slider_values.get("sigma"), self.state.sigma))))
@@ -740,7 +1228,32 @@ class RBFServerController:
             influence_mode = str(button_values.get("influenceMode", self.state.influence_mode))
             if influence_mode not in {"raw", "percentage"}:
                 influence_mode = "raw"
+            bpm_interp_mode = str(button_values.get("bpmInterpMode", self.state.bpm_interp_mode))
+            if bpm_interp_mode not in {"exact_rbf", "gaussian_blend"}:
+                bpm_interp_mode = "gaussian_blend"
+            latent_fallback_mode = str(button_values.get("latentFallbackMode", self.state.latent_fallback_mode))
+            if latent_fallback_mode not in _LATENT_FALLBACK_MODES:
+                latent_fallback_mode = "preserve_current_behavior"
             decode_enabled = bool(button_values.get("decodeEnabled", self.state.decode_enabled))
+            render_enabled = bool(button_values.get("renderEnabled", self.state.render_enabled))
+
+            # Rebuild full internal control points when UI hides anchor 0 in user_defined mode.
+            expected_shape = self.state.control_points.shape
+            points = self.state.control_points
+            if raw_points.ndim == 2 and raw_points.shape[1] == 2:
+                if latent_fallback_mode == "user_defined_anchor0":
+                    full_n = int(expected_shape[0])
+                    if raw_points.shape == expected_shape:
+                        # Transition frame can still carry full-N points from previous mode.
+                        points = raw_points
+                    elif full_n > 0 and raw_points.shape[0] == full_n - 1:
+                        # Hidden-anchor UI payload (N-1): restore full internal array by
+                        # keeping anchor 0 from prior state and prepending it.
+                        points = np.vstack([self.state.control_points[0:1], raw_points]).astype(np.float32)
+                elif raw_points.shape == expected_shape:
+                    points = raw_points
+
+            prev_render_enabled = bool(self.state.render_enabled)
 
             self.state.cursor = cursor
             self.state.control_points = points
@@ -748,11 +1261,33 @@ class RBFServerController:
             self.state.sigma = sigma
             self.state.heatmap_mode = heat_mode
             self.state.influence_mode = influence_mode
+            self.state.bpm_interp_mode = bpm_interp_mode
+            self.state.latent_fallback_mode = latent_fallback_mode
             self.state.decode_enabled = decode_enabled
+            self.state.render_enabled = render_enabled
 
             weights_signature = self._make_weights_signature(points, sigma)
             if weights_signature != self._last_weights_signature:
                 self.weights = compute_rbf_weights(points, self.latent_vectors, sigma=sigma)
+                self.bpm_weights = self._compute_bpm_weights(points, sigma=sigma)
+                # Precompute ex0 weights for user_defined_anchor0 mode (anchors [1:]).
+                if len(points) >= 2:
+                    sub_pts = points[1:]
+                    try:
+                        self.weights_ex0 = compute_rbf_weights(sub_pts, self.latent_vectors[1:], sigma=sigma)
+                    except np.linalg.LinAlgError:
+                        self.weights_ex0 = None
+                    sub_bpms = self.anchor_bpms[1:].reshape(-1, 1).astype(np.float32)
+                    try:
+                        self.bpm_weights_ex0 = compute_rbf_weights(sub_pts, sub_bpms, sigma=sigma, lambd=0.0)
+                    except np.linalg.LinAlgError:
+                        try:
+                            self.bpm_weights_ex0 = compute_rbf_weights(sub_pts, sub_bpms, sigma=sigma, lambd=1e-6)
+                        except np.linalg.LinAlgError:
+                            self.bpm_weights_ex0 = None
+                else:
+                    self.weights_ex0 = None
+                    self.bpm_weights_ex0 = None
                 self._last_weights_signature = weights_signature
 
             provided_latent = payload.get("latent_vector")
@@ -763,7 +1298,58 @@ class RBFServerController:
                 if latent_vector.size != expected_dim:
                     raise ValueError(f"latent_vector must have length {expected_dim}, got {latent_vector.size}")
             else:
-                latent_vector = rbf_interpolate_exact(points, self.weights, cursor, sigma=sigma).astype(np.float32)
+                latent_vector = self._compute_latent_with_fallback(
+                    cursor=cursor,
+                    points=points,
+                    weights=self.weights,
+                    sigma=sigma,
+                    mode=latent_fallback_mode,
+                )
+
+            self.state.current_bpm = self._interpolate_bpm(
+                control_points=points,
+                anchor_bpms=self.anchor_bpms,
+                bpm_weights=self.bpm_weights,
+                cursor=cursor,
+                sigma=sigma,
+                mode=self.state.bpm_interp_mode,
+                fallback_mode=latent_fallback_mode,
+            )
+
+            if (not prev_render_enabled) and self.state.render_enabled:
+                # Start a new background render with current interpolation settings.
+                self.state.decode_enabled = False
+                self.decode_status = "idle"
+                self.decode_progress_step = -1
+                self._last_triggered_latent_signature = None
+                self.reconstruction_matrix.fill(0.0)
+                self.render_manager.request_render(
+                    control_points=points,
+                    anchor_bpms=self.anchor_bpms,
+                    latent_weights=self.weights,
+                    bpm_weights=self.bpm_weights,
+                    bpm_interp_mode=self.state.bpm_interp_mode,
+                    latent_fallback_mode=latent_fallback_mode,
+                    fallback_mean_latent=self._fallback_mean_latent.copy(),
+                    latent_vectors_snapshot=self.latent_vectors.copy(),
+                    weights_ex0=self.weights_ex0.copy() if self.weights_ex0 is not None else None,
+                    bpm_weights_ex0=self.bpm_weights_ex0.copy() if self.bpm_weights_ex0 is not None else None,
+                    anchor0_latent=self.latent_vectors[0].copy() if len(self.latent_vectors) > 0 else None,
+                    anchor0_bpm=float(self.anchor_bpms[0]) if len(self.anchor_bpms) > 0 else 120.0,
+                    sigma=sigma,
+                    grid_resolution=grid,
+                    field_half_extent=self.field_half_extent,
+                    branch_name=get_current_branch(),
+                )
+            elif prev_render_enabled and (not self.state.render_enabled) and self.render_status == "rendering":
+                # Cancel current render when toggle is switched off.
+                self.render_manager.cancel_render()
+
+            self._refresh_render_update()
+
+            if self.render_status == "rendering":
+                # Keep UI responsive by preventing decode work during full-field rendering.
+                self.state.decode_enabled = False
 
             encode_midi = bool(button_values.get("encodeMidi", False))
             midi_buffer = payload.get("midi_buffer")
@@ -788,9 +1374,15 @@ class RBFServerController:
                 self.decode_progress_step = -1
                 self._last_triggered_latent_signature = None
 
-            heatmap_signature = self._make_heatmap_signature(points, sigma, grid, heat_mode)
+            if latent_fallback_mode == "user_defined_anchor0" and len(points) > 1 and self.weights_ex0 is not None:
+                heatmap_points = points[1:]
+                heatmap_weights = self.weights_ex0
+            else:
+                heatmap_points = points
+                heatmap_weights = self.weights
+            heatmap_signature = self._make_heatmap_signature(heatmap_points, sigma, grid, heat_mode, latent_fallback_mode)
             if heatmap_signature != self._last_heatmap_signature:
-                self._cached_heatmap = self._compute_heatmap(points, self.weights, sigma, grid, heat_mode)
+                self._cached_heatmap = self._compute_heatmap(heatmap_points, heatmap_weights, sigma, grid, heat_mode)
                 self._last_heatmap_signature = heatmap_signature
             heatmap = self._cached_heatmap
 
@@ -816,7 +1408,21 @@ def create_app(sample_count: int = 10, sample_seed: int = 42):
                 socketio.emit("frame", response)
             socketio.sleep(0.03)
 
+    def render_broadcast_loop():
+        while True:
+            response = None
+            with controller._lock:
+                if controller._refresh_render_update():
+                    response = controller._build_response(
+                        midi_buffer=(controller.state.last_frontend_payload or {}).get("midi_buffer"),
+                        encode_midi=bool(((controller.state.last_frontend_payload or {}).get("button_values") or {}).get("encodeMidi", False)),
+                    )
+            if response is not None:
+                socketio.emit("frame", response)
+            socketio.sleep(0.03)
+
     socketio.start_background_task(decode_broadcast_loop)
+    socketio.start_background_task(render_broadcast_loop)
 
     @app.get("/")
     def index():
@@ -842,8 +1448,11 @@ def create_app(sample_count: int = 10, sample_seed: int = 42):
             "button_values": {
                 "heatmapMode": controller.state.heatmap_mode,
                 "influenceMode": controller.state.influence_mode,
+                "bpmInterpMode": controller.state.bpm_interp_mode,
+                "latentFallbackMode": controller.state.latent_fallback_mode,
                 "encodeMidi": False,
                 "decodeEnabled": False,
+                "renderEnabled": False,
             },
             "slider_values": {
                 "gridResolution": controller.state.grid_resolution,
