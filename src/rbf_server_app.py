@@ -1518,8 +1518,10 @@ class RBFServerController:
                     refined_blend_low=self.state.refined_blend_low,
                     refined_blend_high=self.state.refined_blend_high,
                 )
-            elif prev_render_enabled and (not self.state.render_enabled) and self.render_status == "rendering":
+            elif prev_render_enabled and (not self.state.render_enabled):
                 # Cancel current render when toggle is switched off.
+                # Do not gate by cached render_status: a quick toggle can land
+                # between status updates and otherwise miss cancellation.
                 self.render_manager.cancel_render()
 
             self._refresh_render_update()

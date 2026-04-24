@@ -206,10 +206,13 @@ let modelCatalog = { modes: {} };
 let modelSelection = { mode: "none", previous: 0, timestamp: null };
 let suppressModelEvents = false;
 let pendingModelSwitch = null;
+let renderHeartbeatId = null;
+let pendingRenderDisable = false;
 
 let socket = null;
 let frameInFlight = false;
 let queuedPayload = null;
+let frameWatchdogId = null;
 let worldOverlayLoaded = false;
 let anchorLabels = [];
 let hoveredAnchorIndex = -1;
@@ -271,7 +274,11 @@ function setRenderingUiState() {
 
   renderBtn.classList.toggle("rendering", isRendering);
   renderBtn.classList.toggle("idle", !isRendering);
-  renderBtn.textContent = isRendering ? "Render: Cancel" : "Render: Start";
+  if (pendingRenderDisable && isRendering) {
+    renderBtn.textContent = "Render: Cancelling...";
+  } else {
+    renderBtn.textContent = isRendering ? "Render: Cancel" : "Render: Start";
+  }
 
   const total = Math.max(0, Number(S.renderTotal) || 0);
   const completed = Math.max(0, Number(S.renderCompleted) || 0);
@@ -279,7 +286,7 @@ function setRenderingUiState() {
   renderProgressFill.style.width = `${pct}%`;
 
   if (S.renderStatus === "rendering") {
-    renderProgressText.textContent = `${completed}/${total}`;
+    renderProgressText.textContent = total > 0 ? `${completed}/${total}` : "Starting...";
   } else if (S.renderStatus === "done") {
     renderProgressText.textContent = `Done (${completed}/${total})`;
   } else if (S.renderStatus === "cancelled") {
@@ -313,6 +320,20 @@ function setRenderingUiState() {
   });
 
   fieldOverlay.style.pointerEvents = disableControls ? "none" : "auto";
+}
+
+function syncRenderHeartbeat() {
+  const shouldPoll = S.renderEnabled || S.renderStatus === "rendering";
+  if (shouldPoll && renderHeartbeatId === null) {
+    renderHeartbeatId = setInterval(() => {
+      // Poll progress via normal frame responses; this keeps UI live even
+      // if background broadcast timing is delayed.
+      sendPayload();
+    }, 300);
+  } else if (!shouldPoll && renderHeartbeatId !== null) {
+    clearInterval(renderHeartbeatId);
+    renderHeartbeatId = null;
+  }
 }
 
 function applyFieldAspectMode(triggerFrame = false) {
@@ -660,7 +681,9 @@ function payload() {
       latentFallbackMode: S.latentFallbackMode,
       encodeMidi: false,
       decodeEnabled: S.decodeEnabled,
-      renderEnabled: S.renderEnabled,
+      // Keep cancel sticky until backend acknowledges; prevents races where
+      // incoming render frames briefly re-enable rendering in outgoing payloads.
+      renderEnabled: pendingRenderDisable ? false : S.renderEnabled,
       sampleRandomize: S.sampleRandomize,
     },
     slider_values: {
@@ -674,10 +697,27 @@ function payload() {
   };
 }
 
+function clearFrameWatchdog() {
+  if (frameWatchdogId !== null) {
+    clearTimeout(frameWatchdogId);
+    frameWatchdogId = null;
+  }
+}
+
+function armFrameWatchdog() {
+  clearFrameWatchdog();
+  frameWatchdogId = setTimeout(() => {
+    // Recover if a frame response is lost: release gate and flush latest payload.
+    frameInFlight = false;
+    flushPayload(true);
+  }, 2000);
+}
+
 function flushPayload(force = false) {
   if (!queuedPayload || !socket || !socket.connected) return;
   if (frameInFlight && !force) return;
   frameInFlight = true;
+  armFrameWatchdog();
   const p = queuedPayload;
   queuedPayload = null;
   socket.emit("frame", p);
@@ -844,6 +884,18 @@ decodeBtn.addEventListener("click", () => {
 
 renderBtn.addEventListener("click", () => {
   S.renderEnabled = !S.renderEnabled;
+  if (S.renderEnabled) {
+    pendingRenderDisable = false;
+    S.renderStatus = "rendering";
+    S.renderCompleted = 0;
+    S.renderTotal = 0;
+    S.renderError = null;
+    S.renderOutputPath = null;
+  } else {
+    pendingRenderDisable = true;
+  }
+  setRenderingUiState();
+  syncRenderHeartbeat();
   sendPayload();
 });
 
@@ -892,12 +944,15 @@ socket = io();
 socket.on("connect", () => {
   setConnectionState(true);
   statusEl.textContent = "connected to server";
+  clearFrameWatchdog();
   socket.emit("bootstrap");
 });
 
 socket.on("bootstrap", (data) => {
   frameInFlight = false;
+  clearFrameWatchdog();
   pendingModelSwitch = null;
+  pendingRenderDisable = false;
   S.cursor = data.cursor;
   S.snappedCursor = data.cursor;
   S.points = data.draggable_points;
@@ -951,6 +1006,7 @@ socket.on("bootstrap", (data) => {
   decodeBtn.textContent = S.decodeEnabled ? "Decode: On" : "Decode: Off";
   currentBpmEl.textContent = formatCurrentBpm(S.currentBpm);
   setRenderingUiState();
+  syncRenderHeartbeat();
   updateRefinedBlendVisibility();
   applyFieldAspectMode(false);
   renderModelSelectors();
@@ -960,6 +1016,7 @@ socket.on("bootstrap", (data) => {
 
 socket.on("frame", (data) => {
   frameInFlight = false;
+  clearFrameWatchdog();
   // Keep points client-authoritative during normal dragging, but adopt server topology
   // when fallback mode/anchor-count transitions require N <-> N-1 resync.
   const prevFallbackMode = S.latentFallbackMode;
@@ -982,10 +1039,22 @@ socket.on("frame", (data) => {
   if (Number.isFinite(data.slider_values.refinedBlendLow)) S.refinedBlendLow = data.slider_values.refinedBlendLow;
   if (Number.isFinite(data.slider_values.refinedBlendHigh)) S.refinedBlendHigh = data.slider_values.refinedBlendHigh;
   S.halfExtent = data.field_half_extent;
+  S.decodeStatus = data.decode_status || S.decodeStatus;
+  S.decodeStep = Number.isFinite(data.decode_progress_step) ? data.decode_progress_step : S.decodeStep;
+  S.renderStatus = data.render_status || S.renderStatus;
+  S.renderCompleted = Number.isFinite(data.render_completed) ? data.render_completed : S.renderCompleted;
   S.renderTotal = Number.isFinite(data.render_total) ? data.render_total : S.renderTotal;
   S.renderOutputPath = data.render_output_path || S.renderOutputPath;
   S.renderError = data.render_error || null;
   S.currentBpm = Number.isFinite(Number(data.current_bpm)) ? Number(data.current_bpm) : S.currentBpm;
+
+  if (pendingRenderDisable) {
+    // Preserve local cancel intent until backend confirms non-rendering state.
+    S.renderEnabled = false;
+    if (S.renderStatus !== "rendering") {
+      pendingRenderDisable = false;
+    }
+  }
 
   if (Array.isArray(data.draggable_points)) {
     const modeChanged = prevFallbackMode !== S.latentFallbackMode;
@@ -1031,6 +1100,7 @@ socket.on("frame", (data) => {
   decodeBtn.textContent = S.decodeEnabled ? "Decode: On" : "Decode: Off";
   currentBpmEl.textContent = formatCurrentBpm(S.currentBpm);
   setRenderingUiState();
+  syncRenderHeartbeat();
   updateRefinedBlendVisibility();
   applyFieldAspectMode(false);
   renderModelSelectors();
@@ -1039,17 +1109,21 @@ socket.on("frame", (data) => {
 });
 
 socket.on("disconnect", () => {
+  frameInFlight = false;
+  clearFrameWatchdog();
   setConnectionState(false);
   statusEl.textContent = "disconnected from server";
 });
 
 socket.on("error", (err) => {
   frameInFlight = false;
+  clearFrameWatchdog();
   pendingModelSwitch = null;
   setConnectionState(false);
   const msg = typeof err === "string" ? err : (err && err.message) ? err.message : JSON.stringify(err);
   statusEl.textContent = `error: ${msg}`;
   updateModelStatus();
+  syncRenderHeartbeat();
   flushPayload();
 });
 
