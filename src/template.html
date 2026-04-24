@@ -217,6 +217,10 @@ let worldOverlayLoaded = false;
 let anchorLabels = [];
 let hoveredAnchorIndex = -1;
 
+function isRenderTerminalStatus(status) {
+  return status === "done" || status === "cancelled" || status === "error" || status === "idle";
+}
+
 function anchorBaseName(rawLabel, fallbackIndex) {
   const raw = String(rawLabel || "").trim();
   if (!raw) return `Anchor ${fallbackIndex}`;
@@ -667,6 +671,9 @@ function renderModelSelectors() {
 }
 
 function payload() {
+  const effectiveRenderEnabled = !isRenderTerminalStatus(S.renderStatus)
+    && !pendingRenderDisable
+    && S.renderEnabled;
   return {
     cursor: S.snappedCursor,
     draggable_points: S.snappedPoints.length === S.points.length ? S.snappedPoints : S.points,
@@ -681,9 +688,9 @@ function payload() {
       latentFallbackMode: S.latentFallbackMode,
       encodeMidi: false,
       decodeEnabled: S.decodeEnabled,
-      // Keep cancel sticky until backend acknowledges; prevents races where
-      // incoming render frames briefly re-enable rendering in outgoing payloads.
-      renderEnabled: pendingRenderDisable ? false : S.renderEnabled,
+      // Keep cancel sticky and never re-arm render after terminal completion
+      // unless user explicitly clicks start again.
+      renderEnabled: effectiveRenderEnabled,
       sampleRandomize: S.sampleRandomize,
     },
     slider_values: {
@@ -1048,10 +1055,15 @@ socket.on("frame", (data) => {
   S.renderError = data.render_error || null;
   S.currentBpm = Number.isFinite(Number(data.current_bpm)) ? Number(data.current_bpm) : S.currentBpm;
 
+  if (isRenderTerminalStatus(S.renderStatus)) {
+    S.renderEnabled = false;
+    pendingRenderDisable = false;
+  }
+
   if (pendingRenderDisable) {
     // Preserve local cancel intent until backend confirms non-rendering state.
     S.renderEnabled = false;
-    if (S.renderStatus !== "rendering") {
+    if (isRenderTerminalStatus(S.renderStatus)) {
       pendingRenderDisable = false;
     }
   }

@@ -1127,6 +1127,10 @@ class RBFServerController:
         if mode not in self.MODE_LABELS:
             raise ValueError(f"Unknown mode '{mode}'.")
 
+        previous_points = self.state.control_points.astype(np.float32, copy=True)
+        previous_cursor = self.state.cursor.astype(np.float32, copy=True)
+        previous_latent_fallback_mode = str(self.state.latent_fallback_mode)
+
         files = self._mode_files(mode)
         if not files:
             raise ValueError(f"No checkpoints available for mode '{mode}'.")
@@ -1147,6 +1151,66 @@ class RBFServerController:
         self.model_catalog = self._build_model_catalog()
         self._normalize_selection_to_catalog()
         self._rebuild_pool_dependent_state(reset_modes=True)
+
+        # Keep the user's currently selected latent fallback mode when switching models.
+        if previous_latent_fallback_mode in _LATENT_FALLBACK_MODES:
+            self.state.latent_fallback_mode = previous_latent_fallback_mode
+
+        # Preserve user-adjusted anchor positions across checkpoint switches.
+        if previous_points.ndim == 2 and previous_points.shape[1] == 2 and len(self.latent_vectors) > 0:
+            n_new = int(len(self.latent_vectors))
+            preserved_points = self._make_initial_control_points(n_new, field_half_extent=self.field_half_extent)
+            keep = min(int(previous_points.shape[0]), n_new)
+            if keep > 0:
+                preserved_points[:keep] = previous_points[:keep]
+
+            self.state.control_points = preserved_points.astype(np.float32)
+            if previous_cursor.shape == (2,):
+                self.state.cursor = previous_cursor.astype(np.float32)
+
+            self.weights = compute_rbf_weights(self.state.control_points, self.latent_vectors, sigma=self.state.sigma)
+            self.bpm_weights = self._compute_bpm_weights(self.state.control_points, sigma=self.state.sigma)
+
+            if len(self.state.control_points) >= 2:
+                sub_pts = self.state.control_points[1:]
+                try:
+                    self.weights_ex0 = compute_rbf_weights(sub_pts, self.latent_vectors[1:], sigma=self.state.sigma)
+                except np.linalg.LinAlgError:
+                    self.weights_ex0 = None
+                sub_bpms = self.anchor_bpms[1:].reshape(-1, 1).astype(np.float32)
+                try:
+                    self.bpm_weights_ex0 = compute_rbf_weights(sub_pts, sub_bpms, sigma=self.state.sigma, lambd=0.0)
+                except np.linalg.LinAlgError:
+                    try:
+                        self.bpm_weights_ex0 = compute_rbf_weights(sub_pts, sub_bpms, sigma=self.state.sigma, lambd=1e-6)
+                    except np.linalg.LinAlgError:
+                        self.bpm_weights_ex0 = None
+            else:
+                self.weights_ex0 = None
+                self.bpm_weights_ex0 = None
+
+            if _uses_hidden_anchor0_mode(self.state.latent_fallback_mode) and len(self.state.control_points) > 1 and self.weights_ex0 is not None:
+                heatmap_points = self.state.control_points[1:]
+                heatmap_weights = self.weights_ex0
+            else:
+                heatmap_points = self.state.control_points
+                heatmap_weights = self.weights
+
+            self._cached_heatmap = self._compute_heatmap(
+                heatmap_points,
+                heatmap_weights,
+                self.state.sigma,
+                self.state.grid_resolution,
+                self.state.heatmap_mode,
+            )
+            self._last_weights_signature = self._make_weights_signature(self.state.control_points, self.state.sigma)
+            self._last_heatmap_signature = self._make_heatmap_signature(
+                heatmap_points,
+                self.state.sigma,
+                self.state.grid_resolution,
+                self.state.heatmap_mode,
+                self.state.latent_fallback_mode,
+            )
 
     def _make_initial_control_points(self, n_points: int, field_half_extent: float) -> np.ndarray:
         if n_points <= 0:
