@@ -115,7 +115,7 @@ def load_model(previous=0, onnx=False, return_checkpoint=False, checkpoint_kind=
         return model, hparams, checkpoint
     return model, hparams
 
-def load_dataset(hparams):
+def load_dataset(hparams, shuffle=True):
     # dataset_name = hparams.dataset_name
     branch_name = safe_branch_name(get_current_branch())
     path = Path('data')
@@ -139,18 +139,24 @@ def load_dataset(hparams):
     print('Using ', data.shape[0])
     print('---'*5)
 
-    # Shuffle data before splitting
-    np.random.seed(hparams.seed)
-    np.random.shuffle(data)
+    # Shuffle data and metadata together (aligned) when requested.
+    if shuffle and data.shape[0] > 1:
+        rng = np.random.default_rng(hparams.seed)
+        perm = rng.permutation(data.shape[0])
+        data = data[perm]
+        metadata = metadata[perm]
     return data, metadata
 
-def pick_reproducible_samples(data, metadata, sample_count=5, sample_seed=15):
+def pick_reproducible_samples(data, metadata, sample_count=5, sample_seed=15, randomize=True):
     # Pick reproducible aligned samples from data and metadata.
     # sample_seed = getattr(hparams, 'seed', 42)
     n_available = len(data)
     n_pick = min(sample_count, n_available)
-    rng = np.random.default_rng(sample_seed)
-    sample_indices = rng.choice(n_available, size=n_pick, replace=False)
+    if randomize:
+        rng = np.random.default_rng(sample_seed)
+        sample_indices = rng.choice(n_available, size=n_pick, replace=False)
+    else:
+        sample_indices = np.arange(n_pick, dtype=np.int64)
     data = data[sample_indices]
     metadata = metadata[sample_indices]
     return data, metadata, sample_indices

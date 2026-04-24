@@ -81,12 +81,14 @@
       <div class="select-row"><label>Hovered</label><div id="hoveredAnchorName">-</div></div>
       <div class="select-row"><label>Current BPM</label><div id="currentBpm">-</div></div>
       <div class="row"><label>Grid</label><input id="grid" type="range" min="4" max="60" step="1" /><span id="gridVal"></span></div>
+      <div class="row"><label>Samples</label><input id="sampleCount" type="range" min="1" max="40" step="1" /><span id="sampleCountVal"></span></div>
       <div class="row"><label>Sigma</label><input id="sigma" type="range" min="0.05" max="3" step="0.01" /><span id="sigmaVal"></span></div>
       <div class="btns">
         <button id="modeBtn">Heat: Mag</button>
         <button id="influenceBtn">Influence: Raw</button>
         <button id="bpmInterpBtn">BPM: Gaussian</button>
         <button id="decodeBtn">Decode: Off</button>
+        <button id="sampleRandomizeBtn">Samples: Random</button>
         <button id="quantizeBtn">Mode: Continuous</button>
         <button id="mapBtn">Map: Off</button>
         <button id="renderBtn" class="idle">Render: Start</button>
@@ -130,6 +132,9 @@ const S = {
   influenceRaw: [],
   influencePct: [],
   grid: 30,
+  sampleCount: 10,
+  sampleCountMax: 40,
+  sampleRandomize: true,
   sigma: 0.3,
   heatMode: "magnitude",
   influenceMode: "raw",
@@ -168,13 +173,16 @@ const statusEl = document.getElementById("status");
 const statusLed = document.getElementById("statusLed");
 const statusText = document.getElementById("statusText");
 const gridEl = document.getElementById("grid");
+const sampleCountEl = document.getElementById("sampleCount");
 const sigmaEl = document.getElementById("sigma");
 const gridVal = document.getElementById("gridVal");
+const sampleCountVal = document.getElementById("sampleCountVal");
 const sigmaVal = document.getElementById("sigmaVal");
 const modeBtn = document.getElementById("modeBtn");
 const influenceBtn = document.getElementById("influenceBtn");
 const bpmInterpBtn = document.getElementById("bpmInterpBtn");
 const decodeBtn = document.getElementById("decodeBtn");
+const sampleRandomizeBtn = document.getElementById("sampleRandomizeBtn");
 const quantizeBtn = document.getElementById("quantizeBtn");
 const mapBtn = document.getElementById("mapBtn");
 const renderBtn = document.getElementById("renderBtn");
@@ -246,6 +254,18 @@ function formatCurrentBpm(value) {
   return bpm.toFixed(1);
 }
 
+function syncSampleControls() {
+  const maxCount = Math.max(1, Number(S.sampleCountMax) || 1);
+  const clamped = Math.max(1, Math.min(Number(S.sampleCount) || 1, maxCount));
+  S.sampleCountMax = maxCount;
+  S.sampleCount = clamped;
+  sampleCountEl.max = String(maxCount);
+  sampleCountEl.value = String(clamped);
+  sampleCountVal.textContent = `${clamped}/${maxCount}`;
+  sampleRandomizeBtn.classList.toggle("active", !!S.sampleRandomize);
+  sampleRandomizeBtn.textContent = S.sampleRandomize ? "Samples: Random" : "Samples: Ordered";
+}
+
 function setRenderingUiState() {
   const isRendering = S.renderStatus === "rendering";
 
@@ -273,11 +293,13 @@ function setRenderingUiState() {
   const disableControls = isRendering;
   [
     gridEl,
+    sampleCountEl,
     sigmaEl,
     modeBtn,
     influenceBtn,
     bpmInterpBtn,
     decodeBtn,
+    sampleRandomizeBtn,
     latentFallbackEl,
     quantizeBtn,
     mapBtn,
@@ -639,8 +661,16 @@ function payload() {
       encodeMidi: false,
       decodeEnabled: S.decodeEnabled,
       renderEnabled: S.renderEnabled,
+      sampleRandomize: S.sampleRandomize,
     },
-    slider_values: { gridResolution: S.grid, sigma: S.sigma, refinedBlendLow: S.refinedBlendLow, refinedBlendHigh: S.refinedBlendHigh },
+    slider_values: {
+      gridResolution: S.grid,
+      sigma: S.sigma,
+      refinedBlendLow: S.refinedBlendLow,
+      refinedBlendHigh: S.refinedBlendHigh,
+      sampleCount: S.sampleCount,
+      sampleCountMax: S.sampleCountMax,
+    },
   };
 }
 
@@ -745,7 +775,17 @@ fieldOverlay.addEventListener("pointerup", (evt) => {
 });
 
 gridEl.addEventListener("input", () => { S.grid = Number(gridEl.value); gridVal.textContent = String(S.grid); S.quantizedCell = -1; sendPayload(); });
+sampleCountEl.addEventListener("input", () => {
+  S.sampleCount = Number(sampleCountEl.value);
+  syncSampleControls();
+  sendPayload();
+});
 sigmaEl.addEventListener("input", () => { S.sigma = Number(sigmaEl.value); sigmaVal.textContent = S.sigma.toFixed(2); sendPayload(); });
+sampleRandomizeBtn.addEventListener("click", () => {
+  S.sampleRandomize = !S.sampleRandomize;
+  syncSampleControls();
+  sendPayload();
+});
 
 modeBtn.addEventListener("click", () => {
   S.heatMode = S.heatMode === "magnitude" ? "confidence" : "magnitude";
@@ -868,6 +908,8 @@ socket.on("bootstrap", (data) => {
   S.influenceRaw = data.influence_raw || [];
   S.influencePct = data.influence_percentage || [];
   S.grid = data.slider_values.gridResolution;
+  if (Number.isFinite(data.slider_values.sampleCount)) S.sampleCount = data.slider_values.sampleCount;
+  if (Number.isFinite(data.slider_values.sampleCountMax)) S.sampleCountMax = data.slider_values.sampleCountMax;
   S.sigma = data.slider_values.sigma;
   if (Number.isFinite(data.slider_values.refinedBlendLow)) S.refinedBlendLow = data.slider_values.refinedBlendLow;
   if (Number.isFinite(data.slider_values.refinedBlendHigh)) S.refinedBlendHigh = data.slider_values.refinedBlendHigh;
@@ -877,6 +919,7 @@ socket.on("bootstrap", (data) => {
   S.latentFallbackMode = data.button_values.latentFallbackMode || "preserve_current_behavior";
   S.decodeEnabled = !!data.button_values.decodeEnabled;
   S.renderEnabled = !!data.button_values.renderEnabled;
+  S.sampleRandomize = !!data.button_values.sampleRandomize;
   S.halfExtent = data.field_half_extent;
   S.nTiming = data.n_timing;
   S.decodeStatus = data.decode_status || "idle";
@@ -892,6 +935,7 @@ socket.on("bootstrap", (data) => {
   modelCatalog = data.model_options || { modes: {} };
   modelSelection = data.model_selection || { mode: "none", previous: 0, timestamp: null };
   gridEl.value = String(S.grid);
+  syncSampleControls();
   sigmaEl.value = String(S.sigma);
   gridVal.textContent = String(S.grid);
   sigmaVal.textContent = S.sigma.toFixed(2);
@@ -930,7 +974,10 @@ socket.on("frame", (data) => {
   S.latentFallbackMode = data.button_values.latentFallbackMode || S.latentFallbackMode;
   S.decodeEnabled = !!data.button_values.decodeEnabled;
   S.renderEnabled = !!data.button_values.renderEnabled;
+  S.sampleRandomize = !!data.button_values.sampleRandomize;
   S.grid = data.slider_values.gridResolution;
+  if (Number.isFinite(data.slider_values.sampleCount)) S.sampleCount = data.slider_values.sampleCount;
+  if (Number.isFinite(data.slider_values.sampleCountMax)) S.sampleCountMax = data.slider_values.sampleCountMax;
   S.sigma = data.slider_values.sigma;
   if (Number.isFinite(data.slider_values.refinedBlendLow)) S.refinedBlendLow = data.slider_values.refinedBlendLow;
   if (Number.isFinite(data.slider_values.refinedBlendHigh)) S.refinedBlendHigh = data.slider_values.refinedBlendHigh;
@@ -968,6 +1015,7 @@ socket.on("frame", (data) => {
     modelSelection = data.model_selection;
   }
   gridEl.value = String(S.grid);
+  syncSampleControls();
   sigmaEl.value = String(S.sigma);
   gridVal.textContent = String(S.grid);
   sigmaVal.textContent = S.sigma.toFixed(2);
@@ -1007,6 +1055,7 @@ socket.on("error", (err) => {
 
 setConnectionState(false);
 gridEl.value = String(S.grid);
+syncSampleControls();
 sigmaEl.value = String(S.sigma);
 blendLowEl.value = String(S.refinedBlendLow);
 blendHighEl.value = String(S.refinedBlendHigh);

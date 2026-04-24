@@ -235,6 +235,8 @@ The output is a 2-D matrix `(height × width*n_timing)` where each cell encodes 
 
 `RealtimeDecoderManager` publishes partial matrices after each note event, so the UI piano-roll updates column-by-column as decoding progresses.
 
+Important nuance for exported token data (`sequences_1d` in Section 10): the saved sequence is not a direct byte-for-byte dump of the decoder's internal autoregressive token stream. For full-field export, each cell is decoded to a matrix first, then re-tokenized from that matrix, and finally normalized to a fixed length (`sequence_length`, currently 256) via truncate/pad. This matrix round-trip is intended to preserve project semantics, but token IDs can differ from a hypothetical raw decoder stream while remaining musically equivalent or near-equivalent.
+
 ---
 
 ## 7. Model Checkpoint Management

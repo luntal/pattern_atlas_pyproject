@@ -40,6 +40,11 @@ def _normalize_heatmap(heatmap: np.ndarray) -> np.ndarray:
     return ((heatmap - h_min) / (h_max - h_min)).astype(np.float32)
 
 
+def _clamp_sample_count(value: int, max_count: int) -> int:
+    upper = max(1, int(max_count))
+    return max(1, min(int(value), upper))
+
+
 @dataclass
 class FrontendState:
     cursor: np.ndarray
@@ -57,6 +62,9 @@ class FrontendState:
     last_frontend_payload: dict | None = None
     refined_blend_low: float = 0.0002
     refined_blend_high: float = 0.45
+    sample_count: int = 10
+    sample_randomize: bool = True
+    sample_count_max: int = 40
 
 
 _FALLBACK_BLEND_LOW = 0.001
@@ -416,6 +424,23 @@ class FullFieldRenderManager:
                 sigma=float(sigma),
                 field_half_extent=float(field_half_extent),
                 total_points=int(total),
+                # Token vocabulary / layout metadata required for external token->MIDI decoding.
+                step_token=int(self.hparams.step_token),
+                eos_token=int(self.hparams.eos_token),
+                pad_token=int(self.hparams.pad_token),
+                sos_token=int(self.hparams.sos_token),
+                min_pitch_token=int(self.hparams.min_pitch_token),
+                max_pitch_token=int(self.hparams.max_pitch_token),
+                min_vel_token=int(self.hparams.min_vel_token),
+                max_vel_token=int(self.hparams.max_vel_token),
+                min_timing_token=int(self.hparams.min_timing_token),
+                max_timing_token=int(self.hparams.max_timing_token),
+                center_timing_token=int(self.hparams.center_timing_token),
+                n_vel=int(self.hparams.n_vel),
+                n_timing=int(self.hparams.n_timing),
+                width=int(self.hparams.width),
+                height=int(self.hparams.height),
+                max_seq_len=int(self.hparams.max_seq_len),
                 branch=branch_name,
                 timestamp=timestamp,
             )
@@ -905,9 +930,11 @@ class RBFServerController:
 
         return sorted(files, key=os.path.getmtime)
 
-    def __init__(self, sample_count: int = 10, sample_seed: int = 42):
+    def __init__(self, sample_count: int = 10, sample_seed: int = 42, sample_randomize: bool = True):
         self.sample_count = int(sample_count)
         self.sample_seed = int(sample_seed)
+        self.sample_randomize = bool(sample_randomize)
+        self.sample_count_max = 40
         self.selected_mode = "none"
         self.selected_previous = 0
 
@@ -958,6 +985,9 @@ class RBFServerController:
             grid_resolution=30,
             sigma=0.30,
             current_bpm=float(self.anchor_bpms[0]) if len(self.anchor_bpms) > 0 else 0.0,
+            sample_count=self.sample_count,
+            sample_randomize=self.sample_randomize,
+            sample_count_max=self.sample_count_max,
         )
 
     def _branch_model_dir(self) -> Path:
@@ -1016,12 +1046,17 @@ class RBFServerController:
         return catalog
 
     def _load_latent_pool(self):
-        data, metadata = load_dataset(self.hparams)
+        # Keep dataset order intact here; optional randomization is controlled below.
+        data, metadata = load_dataset(self.hparams, shuffle=False)
+        dataset_size = int(len(data))
+        self.sample_count_max = max(1, min(40, dataset_size))
+        self.sample_count = _clamp_sample_count(self.sample_count, self.sample_count_max)
         data, metadata, _ = pick_reproducible_samples(
             data,
             metadata,
             sample_count=self.sample_count,
             sample_seed=self.sample_seed,
+            randomize=self.sample_randomize,
         )
         tokens = torch.from_numpy(data).to(self.runtime.device, dtype=torch.long)
         beat_tokens = torch.cumsum((tokens == int(self.hparams.step_token)).to(torch.long), dim=1)
@@ -1053,6 +1088,41 @@ class RBFServerController:
         self.anchor_bpms = np.asarray(bpms, dtype=np.float32)
         self._recompute_fallback_caches()
 
+    def _rebuild_pool_dependent_state(self, reset_modes: bool = False):
+        self.render_manager.cancel_render()
+        control_points = self._make_initial_control_points(len(self.latent_vectors), field_half_extent=self.field_half_extent)
+        self.state.control_points = control_points
+        self.state.cursor = np.zeros(2, dtype=np.float32)
+        self.state.latent_vector = None
+        self.state.current_bpm = float(self.anchor_bpms[0]) if len(self.anchor_bpms) > 0 else 0.0
+        self.state.decode_enabled = False
+        self.state.render_enabled = False
+        self.state.sample_count = int(self.sample_count)
+        self.state.sample_randomize = bool(self.sample_randomize)
+        self.state.sample_count_max = int(self.sample_count_max)
+        if reset_modes:
+            self.state.bpm_interp_mode = "gaussian_blend"
+            self.state.latent_fallback_mode = "preserve_current_behavior"
+
+        self.recon_cols = int(self.hparams.width * self.hparams.n_timing)
+        self.reconstruction_matrix = np.zeros((int(self.hparams.height), self.recon_cols), dtype=np.float32)
+        self.decode_status = "idle"
+        self.decode_progress_step = -1
+        self.render_status = "idle"
+        self.render_completed = 0
+        self.render_total = 0
+        self.render_output_path = None
+        self.render_error = None
+        self._last_weights_signature = None
+        self._last_heatmap_signature = None
+        self._last_triggered_latent_signature = None
+        self.weights_ex0 = None
+        self.bpm_weights_ex0 = None
+        self._fallback_last_valid_latent = None
+        self.weights = compute_rbf_weights(control_points, self.latent_vectors, sigma=self.state.sigma)
+        self.bpm_weights = self._compute_bpm_weights(control_points, sigma=self.state.sigma)
+        self._cached_heatmap = np.zeros((self.state.grid_resolution, self.state.grid_resolution), dtype=np.float32)
+
     def reload_model(self, mode: str, previous: int = 0):
         if mode not in self.MODE_LABELS:
             raise ValueError(f"Unknown mode '{mode}'.")
@@ -1076,33 +1146,7 @@ class RBFServerController:
         self.selected_previous = previous
         self.model_catalog = self._build_model_catalog()
         self._normalize_selection_to_catalog()
-
-        control_points = self._make_initial_control_points(len(self.latent_vectors), field_half_extent=self.field_half_extent)
-        self.state.control_points = control_points
-        self.state.cursor = np.zeros(2, dtype=np.float32)
-        self.state.latent_vector = None
-        self.state.render_enabled = False
-        self.state.bpm_interp_mode = "gaussian_blend"
-        self.state.latent_fallback_mode = "preserve_current_behavior"
-        self.state.current_bpm = float(self.anchor_bpms[0]) if len(self.anchor_bpms) > 0 else 0.0
-        self.recon_cols = int(self.hparams.width * self.hparams.n_timing)
-        self.reconstruction_matrix = np.zeros((int(self.hparams.height), self.recon_cols), dtype=np.float32)
-        self.decode_status = "idle"
-        self.decode_progress_step = -1
-        self.render_status = "idle"
-        self.render_completed = 0
-        self.render_total = 0
-        self.render_output_path = None
-        self.render_error = None
-        self._last_weights_signature = None
-        self._last_heatmap_signature = None
-        self._last_triggered_latent_signature = None
-        self.weights_ex0 = None
-        self.bpm_weights_ex0 = None
-        self._fallback_last_valid_latent = None
-        self.weights = compute_rbf_weights(control_points, self.latent_vectors, sigma=self.state.sigma)
-        self.bpm_weights = self._compute_bpm_weights(control_points, sigma=self.state.sigma)
-        self._cached_heatmap = np.zeros((self.state.grid_resolution, self.state.grid_resolution), dtype=np.float32)
+        self._rebuild_pool_dependent_state(reset_modes=True)
 
     def _make_initial_control_points(self, n_points: int, field_half_extent: float) -> np.ndarray:
         if n_points <= 0:
@@ -1254,6 +1298,7 @@ class RBFServerController:
                 "encodeMidi": encode_midi,
                 "decodeEnabled": self.state.decode_enabled,
                 "renderEnabled": self.state.render_enabled,
+                "sampleRandomize": self.state.sample_randomize,
             },
             "anchor0_locked": False,
             "slider_values": {
@@ -1261,6 +1306,8 @@ class RBFServerController:
                 "sigma": sigma,
                 "refinedBlendLow": self.state.refined_blend_low,
                 "refinedBlendHigh": self.state.refined_blend_high,
+                "sampleCount": int(self.state.sample_count),
+                "sampleCountMax": int(self.state.sample_count_max),
             },
             "labels": response_labels,
             "anchor_bpms": response_anchor_bpms.tolist(),
@@ -1334,6 +1381,24 @@ class RBFServerController:
                 latent_fallback_mode = "preserve_current_behavior"
             decode_enabled = bool(button_values.get("decodeEnabled", self.state.decode_enabled))
             render_enabled = bool(button_values.get("renderEnabled", self.state.render_enabled))
+            sample_count = _clamp_sample_count(
+                _safe_int(slider_values.get("sampleCount"), self.state.sample_count),
+                self.state.sample_count_max,
+            )
+            sample_randomize = bool(button_values.get("sampleRandomize", self.state.sample_randomize))
+
+            sample_pool_changed = False
+            if sample_count != self.sample_count or sample_randomize != self.sample_randomize:
+                sample_pool_changed = True
+                self.sample_count = sample_count
+                self.sample_randomize = sample_randomize
+                self._load_latent_pool()
+                self._rebuild_pool_dependent_state(reset_modes=False)
+                # Ignore stale point/cursor data from this frame after pool reset.
+                cursor = self.state.cursor.copy()
+                raw_points = self.state.control_points.copy()
+                decode_enabled = False
+                render_enabled = False
 
             raw_blend_low = _safe_float(slider_values.get("refinedBlendLow"), self.state.refined_blend_low)
             raw_blend_high = _safe_float(slider_values.get("refinedBlendHigh"), self.state.refined_blend_high)
@@ -1345,7 +1410,7 @@ class RBFServerController:
             # Rebuild full internal control points when UI hides anchor 0 in user_defined mode.
             expected_shape = self.state.control_points.shape
             points = self.state.control_points
-            if raw_points.ndim == 2 and raw_points.shape[1] == 2:
+            if not sample_pool_changed and raw_points.ndim == 2 and raw_points.shape[1] == 2:
                 if _uses_hidden_anchor0_mode(latent_fallback_mode):
                     full_n = int(expected_shape[0])
                     if raw_points.shape == expected_shape:
@@ -1372,6 +1437,9 @@ class RBFServerController:
             self.state.render_enabled = render_enabled
             self.state.refined_blend_low = refined_blend_low
             self.state.refined_blend_high = refined_blend_high
+            self.state.sample_count = int(self.sample_count)
+            self.state.sample_randomize = bool(self.sample_randomize)
+            self.state.sample_count_max = int(self.sample_count_max)
 
             weights_signature = self._make_weights_signature(points, sigma)
             if weights_signature != self._last_weights_signature:
@@ -1562,10 +1630,13 @@ def create_app(sample_count: int = 10, sample_seed: int = 42):
                 "encodeMidi": False,
                 "decodeEnabled": False,
                 "renderEnabled": False,
+                "sampleRandomize": controller.state.sample_randomize,
             },
             "slider_values": {
                 "gridResolution": controller.state.grid_resolution,
                 "sigma": controller.state.sigma,
+                "sampleCount": controller.state.sample_count,
+                "sampleCountMax": controller.state.sample_count_max,
             },
         }
         response = controller.process_frame(payload)
