@@ -1494,6 +1494,13 @@ class RBFServerController:
                 latent_fallback_mode = "preserve_current_behavior"
             decode_enabled = bool(button_values.get("decodeEnabled", self.state.decode_enabled))
             render_enabled = bool(button_values.get("renderEnabled", self.state.render_enabled))
+            # Guard against stale heartbeat re-arming the render when the job just finished.
+            # _refresh_render_update() above may have just flipped render_status to a terminal
+            # state (done/cancelled/error) in this same call, but the heartbeat payload still
+            # carries renderEnabled=true because the frontend hasn't received the update yet.
+            # Without this guard the False→True transition triggers request_render() again.
+            if self.render_status in {"done", "cancelled", "error"}:
+                render_enabled = False
             sample_count = _clamp_sample_count(
                 _safe_int(slider_values.get("sampleCount"), self.state.sample_count),
                 self.state.sample_count_max,
