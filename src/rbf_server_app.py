@@ -45,6 +45,20 @@ def _clamp_sample_count(value: int, max_count: int) -> int:
     return max(1, min(int(value), upper))
 
 
+def _clamp_point_to_extent(point: np.ndarray, half_extent: float) -> np.ndarray:
+    h = float(max(0.0, half_extent))
+    p = np.asarray(point, dtype=np.float32).reshape(2)
+    return np.clip(p, -h, h).astype(np.float32)
+
+
+def _clamp_points_to_extent(points: np.ndarray, half_extent: float) -> np.ndarray:
+    h = float(max(0.0, half_extent))
+    pts = np.asarray(points, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] != 2:
+        return pts
+    return np.clip(pts, -h, h).astype(np.float32)
+
+
 @dataclass
 class FrontendState:
     cursor: np.ndarray
@@ -85,6 +99,22 @@ _ANCHOR0_HIDDEN_FALLBACK_MODES = {
 }
 
 RETOKENIZE = False
+DEBUG_CONTROL_POINTS = str(os.environ.get("RBF_DEBUG_CONTROL_POINTS", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_print_control_points(tag: str, points: np.ndarray, extra: str = ""):
+    if not DEBUG_CONTROL_POINTS:
+        return
+    pts = np.asarray(points, dtype=np.float32)
+    pts_str = np.array2string(
+        pts,
+        precision=4,
+        floatmode="fixed",
+        suppress_small=False,
+        max_line_width=200,
+    )
+    suffix = f" | {extra}" if extra else ""
+    print(f"[control_points] {tag} | n={int(pts.shape[0])}{suffix} | positions={pts_str}", flush=True)
 
 
 def _uses_hidden_anchor0_mode(mode: str) -> bool:
@@ -180,6 +210,11 @@ class FullFieldRenderManager:
             self._output_path = None
             self._error = None
             self._latest_generation += 1
+            _debug_print_control_points(
+                "render_request_snapshot",
+                control_points,
+                extra=f"job_id={job_id}, grid={int(grid_resolution)}, sigma={float(sigma):.4f}, status={self._status}",
+            )
 
         thread = threading.Thread(
             target=self._render_job,
@@ -1165,6 +1200,11 @@ class RBFServerController:
         self.weights = compute_rbf_weights(control_points, self.latent_vectors, sigma=self.state.sigma)
         self.bpm_weights = self._compute_bpm_weights(control_points, sigma=self.state.sigma)
         self._cached_heatmap = np.zeros((self.state.grid_resolution, self.state.grid_resolution), dtype=np.float32)
+        _debug_print_control_points(
+            "pool_rebuild",
+            control_points,
+            extra=f"sample_count={int(self.sample_count)}, sample_randomize={bool(self.sample_randomize)}, dataset={self.dataset_name}",
+        )
 
     def reload_model(self, mode: str, previous: int = 0):
         if mode not in self.MODE_LABELS:
@@ -1210,9 +1250,11 @@ class RBFServerController:
             if keep > 0:
                 preserved_points[:keep] = previous_points[:keep]
 
+            preserved_points = _clamp_points_to_extent(preserved_points, self.field_half_extent)
+
             self.state.control_points = preserved_points.astype(np.float32)
             if previous_cursor.shape == (2,):
-                self.state.cursor = previous_cursor.astype(np.float32)
+                self.state.cursor = _clamp_point_to_extent(previous_cursor.astype(np.float32), self.field_half_extent)
 
             self.weights = compute_rbf_weights(self.state.control_points, self.latent_vectors, sigma=self.state.sigma)
             self.bpm_weights = self._compute_bpm_weights(self.state.control_points, sigma=self.state.sigma)
@@ -1478,9 +1520,12 @@ class RBFServerController:
             self.state.last_frontend_payload = payload
             slider_values = payload.get("slider_values") or {}
             button_values = payload.get("button_values") or {}
+            prev_points_snapshot = self.state.control_points.copy()
 
             cursor = np.asarray(payload.get("cursor", self.state.cursor), dtype=np.float32).reshape(2)
+            cursor = _clamp_point_to_extent(cursor, self.field_half_extent)
             raw_points = np.asarray(payload.get("draggable_points", self.state.control_points), dtype=np.float32)
+            raw_points = _clamp_points_to_extent(raw_points, self.field_half_extent)
 
             grid = int(max(4, min(60, _safe_int(slider_values.get("gridResolution"), self.state.grid_resolution))))
             sigma = float(max(0.05, min(3.0, _safe_float(slider_values.get("sigma"), self.state.sigma))))
@@ -1531,6 +1576,11 @@ class RBFServerController:
                 raw_points = self.state.control_points.copy()
                 decode_enabled = False
                 render_enabled = False
+                _debug_print_control_points(
+                    "sample_pool_changed",
+                    self.state.control_points,
+                    extra=f"sample_count={int(self.sample_count)}, sample_randomize={bool(self.sample_randomize)}",
+                )
 
             if dataset_name != self.dataset_name:
                 self.dataset_name = self._resolve_dataset_name(dataset_name)
@@ -1542,6 +1592,11 @@ class RBFServerController:
                 raw_points = self.state.control_points.copy()
                 decode_enabled = False
                 render_enabled = False
+                _debug_print_control_points(
+                    "dataset_changed",
+                    self.state.control_points,
+                    extra=f"dataset={self.dataset_name}, sample_count={int(self.sample_count)}",
+                )
 
             raw_blend_low = _safe_float(slider_values.get("refinedBlendLow"), self.state.refined_blend_low)
             raw_blend_high = _safe_float(slider_values.get("refinedBlendHigh"), self.state.refined_blend_high)
@@ -1569,7 +1624,7 @@ class RBFServerController:
             prev_render_enabled = bool(self.state.render_enabled)
 
             self.state.cursor = cursor
-            self.state.control_points = points
+            self.state.control_points = _clamp_points_to_extent(points, self.field_half_extent)
             self.state.grid_resolution = grid
             self.state.sigma = sigma
             self.state.heatmap_mode = heat_mode
@@ -1583,6 +1638,13 @@ class RBFServerController:
             self.state.sample_count = int(self.sample_count)
             self.state.sample_randomize = bool(self.sample_randomize)
             self.state.sample_count_max = int(self.sample_count_max)
+
+            if points.shape == prev_points_snapshot.shape and not np.allclose(points, prev_points_snapshot, atol=1e-6):
+                _debug_print_control_points(
+                    "frontend_points_applied",
+                    points,
+                    extra=f"render_enabled={bool(render_enabled)}, sample_count={int(self.sample_count)}",
+                )
 
             weights_signature = self._make_weights_signature(points, sigma)
             if weights_signature != self._last_weights_signature:

@@ -425,6 +425,13 @@ function toWorld(x, y) {
   ];
 }
 
+function clampToField(wx, wy) {
+  const h = Math.max(0, Number(S.halfExtent) || 0);
+  const x = Math.max(-h, Math.min(h, Number(wx)));
+  const y = Math.max(-h, Math.min(h, Number(wy)));
+  return [x, y];
+}
+
 function snapToGrid(wx, wy) {
   if (!S.quantized) return [wx, wy];
   const cellSize = (2 * S.halfExtent) / S.grid;
@@ -630,7 +637,7 @@ function drawRecon() {
 
 function render() {
   drawField(); drawFieldOverlay(); drawLatent(); drawInfluence(); drawRecon();
-  statusEl.textContent = [
+  const baseLines = [
     `cursor=(${S.cursor[0].toFixed(3)}, ${S.cursor[1].toFixed(3)})`,
     `grid=${S.grid} sigma=${S.sigma.toFixed(2)} heat=${S.heatMode}`,
     `latent_dim=${S.latent.length} points=${S.points.length}`,
@@ -639,7 +646,20 @@ function render() {
     `render_output=${S.renderOutputPath || "-"}`,
     `aspect=${S.mapMode ? "map" : "square"}`,
     `overlay=${S.overlayStatus}`,
-  ].join("\n");
+  ];
+
+  const cpLines = ["control_points:"];
+  if (Array.isArray(S.points) && S.points.length > 0) {
+    const hiddenAnchorMode = isHiddenAnchor0Mode(S.latentFallbackMode);
+    S.points.forEach((p, i) => {
+      const idx = hiddenAnchorMode ? i + 1 : i;
+      cpLines.push(`  ${idx}: (${Number(p[0]).toFixed(4)}, ${Number(p[1]).toFixed(4)})`);
+    });
+  } else {
+    cpLines.push("  (none)");
+  }
+
+  statusEl.textContent = baseLines.concat(cpLines).join("\n");
 }
 
 function prettyModeLabel(mode) {
@@ -797,7 +817,7 @@ fieldOverlay.addEventListener("pointerdown", (evt) => {
   if (idx >= 0) {
     S.dragging = idx;
   } else {
-    const raw = toWorld(x, y);
+    const raw = clampToField(...toWorld(x, y));
     S.cursor = raw;
     S.snappedCursor = snapToGrid(raw[0], raw[1]);
     const cell = gridCell(S.snappedCursor[0], S.snappedCursor[1]);
@@ -821,7 +841,7 @@ fieldOverlay.addEventListener("pointermove", (evt) => {
   }
   if (S.dragging < 0 && evt.buttons === 0) return;
 
-  const raw = toWorld(x, y);
+  const raw = clampToField(...toWorld(x, y));
   if (S.dragging >= 0) {
     S.points[S.dragging] = raw;
     S.snappedPoints = S.points.map(p => snapToGrid(p[0], p[1]));
