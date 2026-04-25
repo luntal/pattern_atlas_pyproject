@@ -1102,6 +1102,8 @@ socket.on("frame", (data) => {
   if (isRenderTerminalStatus(S.renderStatus)) {
     S.renderEnabled = false;
     pendingRenderDisable = false;
+    // Drop any stale queued frame built while rendering to avoid re-arming.
+    queuedPayload = null;
   }
 
   if (pendingRenderDisable) {

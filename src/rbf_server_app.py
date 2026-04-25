@@ -1470,6 +1470,9 @@ class RBFServerController:
     def process_frame(self, payload: dict | None) -> dict:
         payload = payload or {}
         with self._lock:
+            prev_frontend_payload = self.state.last_frontend_payload or {}
+            prev_button_values = prev_frontend_payload.get("button_values") or {}
+            prev_client_render_enabled = bool(prev_button_values.get("renderEnabled", False))
             prev_render_status = self.render_status
             self._refresh_render_update()
             self.state.last_frontend_payload = payload
@@ -1494,7 +1497,9 @@ class RBFServerController:
             if latent_fallback_mode not in _LATENT_FALLBACK_MODES:
                 latent_fallback_mode = "preserve_current_behavior"
             decode_enabled = bool(button_values.get("decodeEnabled", self.state.decode_enabled))
-            render_enabled = bool(button_values.get("renderEnabled", self.state.render_enabled))
+            client_render_enabled = bool(button_values.get("renderEnabled", self.state.render_enabled))
+            render_enabled = client_render_enabled
+            client_render_rising_edge = client_render_enabled and (not prev_client_render_enabled)
             # Guard against stale heartbeat re-arming the render when the job JUST finished
             # in THIS frame. _refresh_render_update() above may have just flipped render_status
             # to a terminal state (done/cancelled/error), but the heartbeat payload still carries
@@ -1629,7 +1634,7 @@ class RBFServerController:
                 fallback_mode=latent_fallback_mode,
             )
 
-            if (not prev_render_enabled) and self.state.render_enabled:
+            if (not prev_render_enabled) and self.state.render_enabled and client_render_rising_edge:
                 # Start a new background render with current interpolation settings.
                 self.state.decode_enabled = False
                 self.decode_status = "idle"
