@@ -1470,6 +1470,7 @@ class RBFServerController:
     def process_frame(self, payload: dict | None) -> dict:
         payload = payload or {}
         with self._lock:
+            prev_render_status = self.render_status
             self._refresh_render_update()
             self.state.last_frontend_payload = payload
             slider_values = payload.get("slider_values") or {}
@@ -1494,12 +1495,17 @@ class RBFServerController:
                 latent_fallback_mode = "preserve_current_behavior"
             decode_enabled = bool(button_values.get("decodeEnabled", self.state.decode_enabled))
             render_enabled = bool(button_values.get("renderEnabled", self.state.render_enabled))
-            # Guard against stale heartbeat re-arming the render when the job just finished.
-            # _refresh_render_update() above may have just flipped render_status to a terminal
-            # state (done/cancelled/error) in this same call, but the heartbeat payload still
-            # carries renderEnabled=true because the frontend hasn't received the update yet.
-            # Without this guard the False→True transition triggers request_render() again.
-            if self.render_status in {"done", "cancelled", "error"}:
+            # Guard against stale heartbeat re-arming the render when the job JUST finished
+            # in THIS frame. _refresh_render_update() above may have just flipped render_status
+            # to a terminal state (done/cancelled/error), but the heartbeat payload still carries
+            # renderEnabled=true because the frontend hasn't received the update yet.
+            # We only clamp to False on the exact transition frame (prev was "rendering" and now
+            # it is terminal) so that a deliberate re-start on a subsequent frame is still allowed.
+            just_completed = (
+                prev_render_status == "rendering"
+                and self.render_status in {"done", "cancelled", "error"}
+            )
+            if just_completed:
                 render_enabled = False
             sample_count = _clamp_sample_count(
                 _safe_int(slider_values.get("sampleCount"), self.state.sample_count),
@@ -1630,6 +1636,11 @@ class RBFServerController:
                 self.decode_progress_step = -1
                 self._last_triggered_latent_signature = None
                 self.reconstruction_matrix.fill(0.0)
+                # Reset render status immediately so the progress bar clears (shows idle)
+                # before the background thread publishes its first "rendering" update.
+                self.render_status = "idle"
+                self.render_completed = 0
+                self.render_total = 0
                 self.render_manager.request_render(
                     control_points=points,
                     anchor_bpms=self.anchor_bpms,
