@@ -113,6 +113,7 @@
         <div id="renderProgressText" class="render-progress-text">Idle</div>
       </div>
       <h4>Model Checkpoint</h4>
+      <div class="select-row"><label for="datasetSelect">Dataset</label><select id="datasetSelect"></select></div>
       <div class="select-row"><label for="checkpointMode">Mode</label><select id="checkpointMode"></select></div>
       <div class="select-row"><label for="checkpointStamp">Timestamp</label><select id="checkpointStamp"></select></div>
       <div class="select-row"><label>Loaded</label><div id="modelStatus">(unknown)</div></div>
@@ -135,6 +136,8 @@ const S = {
   sampleCount: 10,
   sampleCountMax: 40,
   sampleRandomize: true,
+  datasetName: "",
+  datasetOptions: [],
   sigma: 0.3,
   heatMode: "magnitude",
   influenceMode: "raw",
@@ -197,6 +200,7 @@ const refinedBlendControlsEl = document.getElementById("refinedBlendControls");
 const checkpointModeEl = document.getElementById("checkpointMode");
 const checkpointStampEl = document.getElementById("checkpointStamp");
 const modelStatusEl = document.getElementById("modelStatus");
+const datasetSelectEl = document.getElementById("datasetSelect");
 const hoveredAnchorNameEl = document.getElementById("hoveredAnchorName");
 const currentBpmEl = document.getElementById("currentBpm");
 const worldOverlay = document.getElementById("worldOverlay");
@@ -273,6 +277,34 @@ function syncSampleControls() {
   sampleRandomizeBtn.textContent = S.sampleRandomize ? "Samples: Random" : "Samples: Ordered";
 }
 
+function renderDatasetSelector() {
+  const options = Array.isArray(S.datasetOptions) ? S.datasetOptions : [];
+  const current = String(S.datasetName || "");
+  datasetSelectEl.innerHTML = "";
+
+  options.forEach((name) => {
+    const opt = document.createElement("option");
+    opt.value = String(name);
+    opt.textContent = String(name);
+    datasetSelectEl.appendChild(opt);
+  });
+
+  if (options.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "(no datasets found)";
+    datasetSelectEl.appendChild(opt);
+    datasetSelectEl.disabled = true;
+    S.datasetName = "";
+    return;
+  }
+
+  const selected = options.includes(current) ? current : String(options[0]);
+  datasetSelectEl.value = selected;
+  datasetSelectEl.disabled = false;
+  S.datasetName = selected;
+}
+
 function setRenderingUiState() {
   const isRendering = S.renderStatus === "rendering";
 
@@ -314,6 +346,7 @@ function setRenderingUiState() {
     latentFallbackEl,
     quantizeBtn,
     mapBtn,
+    datasetSelectEl,
     checkpointModeEl,
     checkpointStampEl,
     blendLowEl,
@@ -686,6 +719,7 @@ function payload() {
       influenceMode: S.influenceMode,
       bpmInterpMode: S.bpmInterpMode,
       latentFallbackMode: S.latentFallbackMode,
+      datasetName: S.datasetName,
       encodeMidi: false,
       decodeEnabled: S.decodeEnabled,
       // Keep cancel sticky and never re-arm render after terminal completion
@@ -944,6 +978,11 @@ checkpointStampEl.addEventListener("change", () => {
   socket.emit("select_model", { mode, previous });
 });
 
+datasetSelectEl.addEventListener("change", () => {
+  S.datasetName = datasetSelectEl.value;
+  sendPayload();
+});
+
 window.addEventListener("resize", render);
 
 socket = io();
@@ -979,6 +1018,8 @@ socket.on("bootstrap", (data) => {
   S.influenceMode = data.button_values.influenceMode;
   S.bpmInterpMode = (data.button_values.bpmInterpMode === "exact_rbf") ? "exact_rbf" : "gaussian_blend";
   S.latentFallbackMode = data.button_values.latentFallbackMode || "preserve_current_behavior";
+  S.datasetName = data.dataset_selection || data.button_values.datasetName || S.datasetName;
+  S.datasetOptions = Array.isArray(data.dataset_options) ? data.dataset_options : S.datasetOptions;
   S.decodeEnabled = !!data.button_values.decodeEnabled;
   S.renderEnabled = !!data.button_values.renderEnabled;
   S.sampleRandomize = !!data.button_values.sampleRandomize;
@@ -1016,6 +1057,7 @@ socket.on("bootstrap", (data) => {
   syncRenderHeartbeat();
   updateRefinedBlendVisibility();
   applyFieldAspectMode(false);
+  renderDatasetSelector();
   renderModelSelectors();
   render();
   sendPayload(true);
@@ -1036,6 +1078,8 @@ socket.on("frame", (data) => {
   S.influenceMode = data.button_values.influenceMode;
   S.bpmInterpMode = (data.button_values.bpmInterpMode === "exact_rbf") ? "exact_rbf" : "gaussian_blend";
   S.latentFallbackMode = data.button_values.latentFallbackMode || S.latentFallbackMode;
+  S.datasetName = data.dataset_selection || data.button_values.datasetName || S.datasetName;
+  if (Array.isArray(data.dataset_options)) S.datasetOptions = data.dataset_options;
   S.decodeEnabled = !!data.button_values.decodeEnabled;
   S.renderEnabled = !!data.button_values.renderEnabled;
   S.sampleRandomize = !!data.button_values.sampleRandomize;
@@ -1115,6 +1159,7 @@ socket.on("frame", (data) => {
   syncRenderHeartbeat();
   updateRefinedBlendVisibility();
   applyFieldAspectMode(false);
+  renderDatasetSelector();
   renderModelSelectors();
   render();
   flushPayload();

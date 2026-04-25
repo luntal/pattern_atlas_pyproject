@@ -416,6 +416,7 @@ class FullFieldRenderManager:
                 sequences_1d=np.asarray(sequences_flat, dtype=np.int64),
                 bpms_1d=np.asarray(bpms, dtype=np.float32),
                 control_points=control_points.astype(np.float32),
+                anchor_bpms=anchor_bpms.astype(np.float32),
                 sequence_length=int(sequence_len),
                 grid_resolution=int(grid_resolution),
                 traversal_order="row_major",
@@ -423,6 +424,8 @@ class FullFieldRenderManager:
                 latent_fallback_mode=str(latent_fallback_mode),
                 sigma=float(sigma),
                 field_half_extent=float(field_half_extent),
+                refined_blend_low=float(refined_blend_low),
+                refined_blend_high=float(refined_blend_high),
                 total_points=int(total),
                 # Token vocabulary / layout metadata required for external token->MIDI decoding.
                 step_token=int(self.hparams.step_token),
@@ -441,6 +444,7 @@ class FullFieldRenderManager:
                 width=int(self.hparams.width),
                 height=int(self.hparams.height),
                 max_seq_len=int(self.hparams.max_seq_len),
+                dataset_name=str(getattr(self.hparams, "dataset_name", "")),
                 branch=branch_name,
                 timestamp=timestamp,
             )
@@ -813,6 +817,31 @@ class RBFServerController:
 
     TIMESTAMP_PATTERN = r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}"
 
+    def _data_branch_dir(self) -> Path:
+        branch_name = safe_branch_name(get_current_branch())
+        return Path("data") / branch_name
+
+    def _list_available_datasets(self) -> list[str]:
+        data_dir = self._data_branch_dir()
+        if not data_dir.exists():
+            return []
+        return sorted([p.name for p in data_dir.glob("*.npz") if p.is_file()])
+
+    def _resolve_dataset_name(self, preferred: str | None) -> str:
+        options = self._list_available_datasets()
+        if not options:
+            raise FileNotFoundError(f"No .npz datasets found in {self._data_branch_dir()}")
+
+        preferred_name = str(preferred) if preferred is not None else ""
+        if preferred_name in options:
+            return preferred_name
+
+        hparams_default = str(getattr(self.hparams, "dataset_name", ""))
+        if hparams_default in options:
+            return hparams_default
+
+        return options[0]
+
     def _compute_bpm_weights(self, control_points: np.ndarray, sigma: float) -> np.ndarray:
         bpm_targets = self.anchor_bpms.reshape(-1, 1).astype(np.float32)
         try:
@@ -950,6 +979,8 @@ class RBFServerController:
         self._lock = threading.Lock()
         self.decoder_manager = RealtimeDecoderManager(self.runtime.decoder, self.hparams)
         self.render_manager = FullFieldRenderManager(self.runtime, self.hparams)
+        self.dataset_name = self._resolve_dataset_name(getattr(self.hparams, "dataset_name", None))
+        self.hparams.dataset_name = self.dataset_name
 
         self.model_catalog = self._build_model_catalog()
         self._normalize_selection_to_catalog()
@@ -1047,6 +1078,7 @@ class RBFServerController:
 
     def _load_latent_pool(self):
         # Keep dataset order intact here; optional randomization is controlled below.
+        self.hparams.dataset_name = self.dataset_name
         data, metadata = load_dataset(self.hparams, shuffle=False)
         dataset_size = int(len(data))
         self.sample_count_max = max(1, min(40, dataset_size))
@@ -1130,6 +1162,7 @@ class RBFServerController:
         previous_points = self.state.control_points.astype(np.float32, copy=True)
         previous_cursor = self.state.cursor.astype(np.float32, copy=True)
         previous_latent_fallback_mode = str(self.state.latent_fallback_mode)
+        previous_dataset_name = str(self.dataset_name)
 
         files = self._mode_files(mode)
         if not files:
@@ -1144,6 +1177,8 @@ class RBFServerController:
         self.hparams = self.runtime.hparams
         self.decoder_manager = RealtimeDecoderManager(self.runtime.decoder, self.hparams)
         self.render_manager = FullFieldRenderManager(self.runtime, self.hparams)
+        self.dataset_name = self._resolve_dataset_name(previous_dataset_name)
+        self.hparams.dataset_name = self.dataset_name
         self._load_latent_pool()
 
         self.selected_mode = mode
@@ -1359,6 +1394,7 @@ class RBFServerController:
                 "influenceMode": self.state.influence_mode,
                 "bpmInterpMode": self.state.bpm_interp_mode,
                 "latentFallbackMode": self.state.latent_fallback_mode,
+                "datasetName": self.dataset_name,
                 "encodeMidi": encode_midi,
                 "decodeEnabled": self.state.decode_enabled,
                 "renderEnabled": self.state.render_enabled,
@@ -1394,6 +1430,8 @@ class RBFServerController:
                 "previous": int(self.selected_previous),
                 "timestamp": self._selected_timestamp(),
             },
+            "dataset_options": self._list_available_datasets(),
+            "dataset_selection": self.dataset_name,
             "frontend_echo": {
                 "cursor": self.state.last_frontend_payload.get("cursor") if self.state.last_frontend_payload else None,
                 "draggable_points": self.state.last_frontend_payload.get("draggable_points") if self.state.last_frontend_payload else None,
@@ -1450,6 +1488,7 @@ class RBFServerController:
                 self.state.sample_count_max,
             )
             sample_randomize = bool(button_values.get("sampleRandomize", self.state.sample_randomize))
+            dataset_name = str(button_values.get("datasetName", self.dataset_name))
 
             sample_pool_changed = False
             if sample_count != self.sample_count or sample_randomize != self.sample_randomize:
@@ -1459,6 +1498,17 @@ class RBFServerController:
                 self._load_latent_pool()
                 self._rebuild_pool_dependent_state(reset_modes=False)
                 # Ignore stale point/cursor data from this frame after pool reset.
+                cursor = self.state.cursor.copy()
+                raw_points = self.state.control_points.copy()
+                decode_enabled = False
+                render_enabled = False
+
+            if dataset_name != self.dataset_name:
+                self.dataset_name = self._resolve_dataset_name(dataset_name)
+                self.hparams.dataset_name = self.dataset_name
+                self._load_latent_pool()
+                self._rebuild_pool_dependent_state(reset_modes=False)
+                # Ignore stale point/cursor data from this frame after dataset swap.
                 cursor = self.state.cursor.copy()
                 raw_points = self.state.control_points.copy()
                 decode_enabled = False
@@ -1693,6 +1743,7 @@ def create_app(sample_count: int = 10, sample_seed: int = 42):
                 "influenceMode": controller.state.influence_mode,
                 "bpmInterpMode": controller.state.bpm_interp_mode,
                 "latentFallbackMode": controller.state.latent_fallback_mode,
+                "datasetName": controller.dataset_name,
                 "encodeMidi": False,
                 "decodeEnabled": False,
                 "renderEnabled": False,
