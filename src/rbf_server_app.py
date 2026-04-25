@@ -84,6 +84,8 @@ _ANCHOR0_HIDDEN_FALLBACK_MODES = {
     "user_defined_anchor0_refined",
 }
 
+RETOKENIZE = False
+
 
 def _uses_hidden_anchor0_mode(mode: str) -> bool:
     return str(mode) in _ANCHOR0_HIDDEN_FALLBACK_MODES
@@ -123,9 +125,10 @@ def _lerp_scalar(fallback_value: float, rbf_value: float, alpha: float) -> float
 
 
 class FullFieldRenderManager:
-    def __init__(self, runtime: "CudaRBFRuntime", hparams):
+    def __init__(self, runtime: "CudaRBFRuntime", hparams, retokenize: bool = False):
         self.runtime = runtime
         self.hparams = hparams
+        self.retokenize = bool(retokenize)
         self._lock = threading.RLock()
         self._current_job_id = 0
         self._cancel_event = None
@@ -397,8 +400,11 @@ class FullFieldRenderManager:
                     cursor = np.asarray([wx, wy], dtype=np.float32)
 
                     latent = _cell_latent(cursor)
-                    matrix = self.runtime.decode_latent_to_matrix(latent)
-                    tokens = self.runtime._tokens_from_matrix_buffer(matrix)
+                    matrix, original_tokens = self.runtime.decode_latent_to_matrix(latent, return_tokens=True)
+                    if self.retokenize:
+                        tokens = self.runtime._tokens_from_matrix_buffer(matrix)
+                    else:
+                        tokens = original_tokens
                     normalized = self._normalize_tokens(tokens, sequence_len, pad_token)
                     sequences_flat.extend(normalized.tolist())
                     bpms.append(_cell_bpm(cursor))
@@ -619,7 +625,7 @@ class RealtimeDecoderManager:
 
 
 class CudaRBFRuntime:
-    def __init__(self, previous: int = 0, checkpoint_kind: str | None = None):
+    def __init__(self, previous: int = 0, checkpoint_kind: str | None = None, retokenize: bool = False):
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
             device_name = "CUDA"
@@ -635,6 +641,7 @@ class CudaRBFRuntime:
         self.model.eval()
         self.decoder = self.model.decoder
         self.encoder = self.model.encoder
+        self.retokenize = bool(retokenize)
 
     def _write_wrapped_segment(self, matrix: np.ndarray, row: int, start: int, length: int, value: float):
         cols = matrix.shape[1]
@@ -650,7 +657,7 @@ class CudaRBFRuntime:
             matrix[row, s:s + first] = value
             matrix[row, 0:length - first] = value
 
-    def decode_latent_to_matrix(self, latent_vector: np.ndarray) -> np.ndarray:
+    def decode_latent_to_matrix(self, latent_vector: np.ndarray, return_tokens: bool = False) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
         h = self.hparams
         n_timing = int(h.n_timing)
         cols = int(h.width * n_timing)
@@ -676,6 +683,7 @@ class CudaRBFRuntime:
         step_idx = 0
         pending_pitch = None
         pending_vel = None
+        generated_tokens: list[int] = []
 
         with torch.no_grad():
             for _ in range(int(h.max_seq_len)):
@@ -698,6 +706,7 @@ class CudaRBFRuntime:
                 logits = self.decoder.fc_out(out)
                 next_tok = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
                 token = int(next_tok.item())
+                generated_tokens.append(token)
 
                 cur_tokens = torch.cat([cur_tokens, next_tok], dim=1)
                 is_step = (cur_tokens == step_token).to(torch.long)
@@ -726,6 +735,8 @@ class CudaRBFRuntime:
                     pending_pitch = None
                     pending_vel = None
 
+        if return_tokens:
+            return matrix, np.asarray(generated_tokens, dtype=np.int64)
         return matrix
 
     def _tokens_from_matrix_buffer(self, matrix_buffer: np.ndarray) -> np.ndarray:
@@ -974,11 +985,11 @@ class RBFServerController:
 
         checkpoint_kind = None if self.selected_mode == "none" else self.selected_mode
 
-        self.runtime = CudaRBFRuntime(previous=self.selected_previous, checkpoint_kind=checkpoint_kind)
+        self.runtime = CudaRBFRuntime(previous=self.selected_previous, checkpoint_kind=checkpoint_kind, retokenize=RETOKENIZE)
         self.hparams = self.runtime.hparams
         self._lock = threading.Lock()
         self.decoder_manager = RealtimeDecoderManager(self.runtime.decoder, self.hparams)
-        self.render_manager = FullFieldRenderManager(self.runtime, self.hparams)
+        self.render_manager = FullFieldRenderManager(self.runtime, self.hparams, retokenize=RETOKENIZE)
         self.dataset_name = self._resolve_dataset_name(getattr(self.hparams, "dataset_name", None))
         self.hparams.dataset_name = self.dataset_name
 
@@ -1173,10 +1184,10 @@ class RBFServerController:
             previous = len(files) - 1
 
         checkpoint_kind = None if mode == "none" else mode
-        self.runtime = CudaRBFRuntime(previous=previous, checkpoint_kind=checkpoint_kind)
+        self.runtime = CudaRBFRuntime(previous=previous, checkpoint_kind=checkpoint_kind, retokenize=RETOKENIZE)
         self.hparams = self.runtime.hparams
         self.decoder_manager = RealtimeDecoderManager(self.runtime.decoder, self.hparams)
-        self.render_manager = FullFieldRenderManager(self.runtime, self.hparams)
+        self.render_manager = FullFieldRenderManager(self.runtime, self.hparams, retokenize=RETOKENIZE)
         self.dataset_name = self._resolve_dataset_name(previous_dataset_name)
         self.hparams.dataset_name = self.dataset_name
         self._load_latent_pool()
@@ -1791,6 +1802,8 @@ def create_app(sample_count: int = 10, sample_seed: int = 42):
 
 
 def main():
+    global RETOKENIZE
+    RETOKENIZE = False
     AUTOMATIC_PORT_SELECTION = True
     if AUTOMATIC_PORT_SELECTION:
         # Automatic mode: CUDA machines default to 5006, others to 5009.
