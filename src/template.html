@@ -648,18 +648,7 @@ function render() {
     `overlay=${S.overlayStatus}`,
   ];
 
-  const cpLines = ["control_points:"];
-  if (Array.isArray(S.points) && S.points.length > 0) {
-    const hiddenAnchorMode = isHiddenAnchor0Mode(S.latentFallbackMode);
-    S.points.forEach((p, i) => {
-      const idx = hiddenAnchorMode ? i + 1 : i;
-      cpLines.push(`  ${idx}: (${Number(p[0]).toFixed(4)}, ${Number(p[1]).toFixed(4)})`);
-    });
-  } else {
-    cpLines.push("  (none)");
-  }
-
-  statusEl.textContent = baseLines.concat(cpLines).join("\n");
+  statusEl.textContent = baseLines.join("\n");
 }
 
 function prettyModeLabel(mode) {
