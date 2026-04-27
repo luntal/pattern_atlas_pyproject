@@ -18,7 +18,9 @@ from typing import List, Tuple
 import re
 from modules.midi_mappings import (
     chromatic_to_generic,
+    generic_to_chromatic as generic_to_chromatic_pitch,
     groove_midi_to_groove_midi_merged,
+    groove_merged_to_chromatic_specific,
     fan_out_merged_step,
 )
 
@@ -475,7 +477,8 @@ class MidiProcessor:
     def extract(
             self, midi_folder_path=None, skip=0, take=0, clip=False,
             randomize_velocity=0, qnt_strength=1, qnt_randomness=0, pitch_randomness=False,
-            roland=True, drums_only=False, filter_duplicates=True, remap=False, jump=1, generic_midi_mapping=False):
+            roland=True, drums_only=False, filter_duplicates=True, remap=False, jump=1,
+            generic_midi_mapping=False, groove_to_specific=False, generic_to_chromatic=False):
         """
         Extracts sequences from MIDI files and save as list of tokens
         currently sequences are 2 bars long, 16th notes per bar
@@ -484,6 +487,22 @@ class MidiProcessor:
 
         only eos token, eos token should be appended to the end of encoder sequence during inference!
         """
+        if groove_to_specific and generic_midi_mapping:
+            warning = (
+                "groove_to_specific=True requires generic_midi_mapping=False. "
+                "Stop extraction and disable generic_midi_mapping."
+            )
+            print(f"WARNING: {warning}")
+            raise ValueError(warning)
+
+        if generic_to_chromatic and (generic_midi_mapping or groove_to_specific):
+            warning = (
+                "generic_to_chromatic=True requires generic_midi_mapping=False and groove_to_specific=False. "
+                "Stop extraction and disable the conflicting options."
+            )
+            print(f"WARNING: {warning}")
+            raise ValueError(warning)
+
         qnt_strength = max(min(qnt_strength, 1), 0)
         qnt_randomness = max(min(qnt_randomness, 1), 0)
         if midi_folder_path is None:
@@ -654,7 +673,7 @@ class MidiProcessor:
                         continue
                     pitch, vel = result
 
-                    if generic_midi_mapping:
+                    if generic_midi_mapping or groove_to_specific:
                         # Use raw MIDI pitch before the 0-23 wrapping performed by note_checks.
                         merged_note = groove_midi_to_groove_midi_merged(note.pitch)
                     else:
@@ -723,6 +742,12 @@ class MidiProcessor:
                     prev_note_start = note.start
                     notes_advanced.append(advanced_note)
 
+                # Map generic input note IDs directly to chromatic before tokenization.
+                if generic_to_chromatic and notes_advanced:
+                    for i, n in enumerate(notes_advanced):
+                        chromatic_note = generic_to_chromatic_pitch(int(n['pitch']))
+                        notes_advanced[i]['pitch_token'] = int(chromatic_note) + int(min_pitch_token)
+
 
                 # Apply feature-based fan-out to assign final chromatic pitches (0-53).
                 if generic_midi_mapping and notes_advanced:
@@ -753,6 +778,12 @@ class MidiProcessor:
                                 notes_advanced[list_idx]['pitch_token'] = (
                                     fanned_event['chromatic_note'] + min_pitch_token
                                 )
+
+                # Deterministic merged->chromatic-specific mapping.
+                if groove_to_specific and notes_advanced:
+                    for i, n in enumerate(notes_advanced):
+                        chromatic_note = groove_merged_to_chromatic_specific(int(n['merged_note']))
+                        notes_advanced[i]['pitch_token'] = int(chromatic_note) + int(min_pitch_token)
 
                 # self.seq_advanced.append(notes_advanced)
                 token_list, metadata = self.notes_advanced_to_token_sequences_stream(

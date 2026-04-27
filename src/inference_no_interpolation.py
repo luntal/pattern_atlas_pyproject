@@ -18,14 +18,15 @@ from modules.branch_paths import latest_in_branch, safe_branch_name, get_current
 from modules.utilities import load_model
 
 """
-spherical interpolation between 2 latent vectors.
+direct inference without interpolation.
+Observe the reconstructions of sequences
 """
 
 ##########################
 # Load model with metadata
 ##########################
 
-model, hparams = load_model(0, checkpoint_kind='best_val')
+model, hparams = load_model(0, checkpoint_kind='best_train')
 
 
 ###########################
@@ -35,14 +36,14 @@ model, hparams = load_model(0, checkpoint_kind='best_val')
 offset = 0
 n_examples = 1
 interpolation_steps = 25
-latest_dataset = latest_in_branch('data', 'dataset-groove.npz')
+latest_dataset = latest_in_branch('data', 'dataset-merged-test.npz')
 if latest_dataset is None:
     raise FileNotFoundError(f"No dataset files found in data/")
 print(f'Loading dataset: {latest_dataset}')
 data = np.load(latest_dataset)['data']
 
 print('data shape: ', data.shape)
-take = 20
+take = 18
 skip = 0
 print('using: ', take, ' samples')
 data = data[skip:skip+take]

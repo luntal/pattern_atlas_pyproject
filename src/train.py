@@ -21,7 +21,9 @@ if __name__ == '__main__':
     retrain = False
     resume_checkpoint = None
     if retrain:
-        vae, hparams, resume_checkpoint = load_model(previous=0, onnx=False, return_checkpoint=True)
+        # vae, hparams, resume_checkpoint = load_model(previous=0, onnx=False, return_checkpoint=True)
+        # load model with fresh optim and scheduler (resume_checkpoint has to stay None for this)
+        vae, hparams = load_model(previous=0, onnx=False, return_checkpoint=False)
 
         hparams.n_epochs = 20 # override n_epochs for retraining
         # update learning rate

@@ -60,4 +60,9 @@ functions
 
 - [text](../models/exp/model_2026-04-20_22-37-21.pt)
 - overfitting with latnet to memory expansion
-- 
+- exp 01
+  - [best val model with fan-out data](../models/global-grooves/model_best_val_2026-04-22_23-25-45.pt)
+  - [last model with fan out data](../models/global-grooves/model_last_2026-04-22_22-00-24.pt)
+- exp 02
+  - model_2026-04-27_13-26-37.pt
+  - big model strong overfit
