@@ -478,7 +478,8 @@ class MidiProcessor:
             self, midi_folder_path=None, skip=0, take=0, clip=False,
             randomize_velocity=0, qnt_strength=1, qnt_randomness=0, pitch_randomness=False,
             roland=True, drums_only=False, filter_duplicates=True, remap=False, jump=1,
-            generic_midi_mapping=False, groove_to_specific=False, generic_to_chromatic=False):
+            generic_midi_mapping=False, groove_to_specific=False, generic_to_chromatic=False,
+            bpm_from_filename=False):
         """
         Extracts sequences from MIDI files and save as list of tokens
         currently sequences are 2 bars long, 16th notes per bar
@@ -602,6 +603,20 @@ class MidiProcessor:
             if len(instruments_to_process) == 0:
                 print('No instruments to process - skipping file')
                 continue
+
+            # check bpm from filename if option enabled
+            bpm_from_name = None
+            # if bpm_from_filename:
+            filename_lower = Path(filename).stem.lower()
+            bpm_match = re.search(r'(\d{2,3})\s*bpm$', filename_lower)
+            # bpm_match = re.search(r'(\d{2,3})\s?bpm', filename_lower)
+            if bpm_match:
+                bpm_from_name = int(bpm_match.group(1))
+                print(f'BPM from filename: {bpm_from_name}')
+                # tempo_changes[0] = bpm_from_name
+                
+            # else:
+            #     print('No BPM found in filename, using MIDI tempo.')
                 
 
             for instrument in instruments_to_process:
@@ -733,6 +748,7 @@ class MidiProcessor:
                         'note_interval_in_16th': note_interval_in_16th,
                         'filename': filename,
                         'bpm': bpm,
+                        'bpm_from_name': bpm_from_name,
                         'first_note_in_window': first_note_in_window,
                         'window_note_interval': window_note_interval,
                         'window_note_interval_in_16th': window_note_interval_in_16th,
@@ -1228,7 +1244,10 @@ class MidiProcessor:
     
             if len(current_seq) >= min_seq_len:
                 sequences.append(current_seq)
-                metadata.append((notes_advanced[0]["filename"], current_window, notes_advanced[0]["bpm"]))
+                metadata.append((
+                    notes_advanced[0]["filename"], 
+                    current_window, 
+                    notes_advanced[0]["bpm"] if notes_advanced[0]["bpm_from_name"] is None else notes_advanced[0]["bpm_from_name"]))
     
             current_seq = []
             last_step_in_window = None

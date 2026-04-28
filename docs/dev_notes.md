@@ -65,4 +65,4 @@ functions
   - [last model with fan out data](../models/global-grooves/model_last_2026-04-22_22-00-24.pt)
 - exp 02
   - model_2026-04-27_13-26-37.pt
-  - big model strong overfit
+  - big model strong overfit,used for overfitting retraining
