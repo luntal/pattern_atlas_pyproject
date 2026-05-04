@@ -1,0 +1,5 @@
+import numpy as np
+
+data = np.load('data/global-grooves/dataset-empty.npz', allow_pickle=True)
+print('Data shape:', data['data'].shape)
+print('Metadata:', data['metadata'])

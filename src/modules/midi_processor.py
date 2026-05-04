@@ -371,6 +371,7 @@ class MidiProcessor:
         self.playback_position = 0
         # self.matrix = np.zeros((hparams.height, hparams.width))
         self.stop_event = None
+        self.playback_wakeup_event = None
         self.thread = None
         self.seq_index = 0
         self.matrices = []
@@ -478,8 +479,7 @@ class MidiProcessor:
             self, midi_folder_path=None, skip=0, take=0, clip=False,
             randomize_velocity=0, qnt_strength=1, qnt_randomness=0, pitch_randomness=False,
             roland=True, drums_only=False, filter_duplicates=True, remap=False, jump=1,
-            generic_midi_mapping=False, groove_to_specific=False, generic_to_chromatic=False,
-            bpm_from_filename=False):
+            generic_midi_mapping=False, groove_to_specific=False, generic_to_chromatic=False):
         """
         Extracts sequences from MIDI files and save as list of tokens
         currently sequences are 2 bars long, 16th notes per bar
@@ -705,8 +705,10 @@ class MidiProcessor:
                     qnt_time = current_time_idx_16th * seconds_per_16th_note
                     dev = note.start - qnt_time
                     dev_norm = current_16th - current_time_idx_16th
-                    # deviation_norm = (note.start - qnt_time) / seconds_per_16th_note
-                    dev_token = int((dev_norm * (self.hparams.n_timing // 2)) + self.hparams.center_timing_token)
+                    # Normalize microshift to [-1, 1], where +/-1 equals half a sixteenth note.
+                    shift_norm = max(-1.0, min(1.0, dev_norm * 2.0))
+                    dev_token = int(round((shift_norm * (self.hparams.n_timing // 2)) + self.hparams.center_timing_token))
+                    dev_token = max(self.hparams.min_timing_token, min(self.hparams.max_timing_token - 1, dev_token))
                     valid_timing_range = self.hparams.min_timing_token <= dev_token < self.hparams.max_timing_token
                     if not valid_timing_range:
                         print(f'Warning: dev token out of range: {dev_token}')
@@ -723,7 +725,7 @@ class MidiProcessor:
                         window_note_interval = note.start - current_previous_note_start
                         window_note_interval = max(0, window_note_interval)  # Ensure non-negative
                         window_note_interval_in_16th = window_note_interval / seconds_per_16th_note
-                        window_dev_norm = max(0, dev_norm)
+                        window_dev_norm = shift_norm
                     else:
                         window_note_interval = None
                         window_note_interval_in_16th = None
@@ -755,6 +757,7 @@ class MidiProcessor:
                         'merged_note': merged_note,
                         'window_dev_norm': window_dev_norm
                     }
+                    # print(f"Note: start={note.start:.2f}s, pitch={note.pitch}, vel={note.velocity}, current_16th={current_16th:.2f}, ")
                     prev_note_start = note.start
                     notes_advanced.append(advanced_note)
 
@@ -1074,6 +1077,8 @@ class MidiProcessor:
             im.set_data(mats[idx])
             # self.matrix = mats[idx]
             self.seq_index = idx
+            if playback and self.playback_wakeup_event is not None:
+                self.playback_wakeup_event.set()
             if print_tokens:
                 tokens = [token for token in self.sequences[idx] if  token != self.hparams.pad_token]
                 # print('seq: ', tokens)
@@ -1096,8 +1101,8 @@ class MidiProcessor:
         # Timer function to update playback position line
         def update_playback_line():
             if playback:
-                # Convert playback_position to x coordinate (accounting for n_timing)
-                x_pos = self.playback_position * n_timing
+                # Align line with the quantization center used for zero microshift.
+                x_pos = self.playback_position * n_timing + n_timing
                 playback_line.set_xdata([x_pos, x_pos])
                 fig.canvas.draw_idle()
             # Schedule next update
@@ -1123,32 +1128,46 @@ class MidiProcessor:
             self.stop_event.set()
             self.thread.join()
 
+    def _get_sequence_bpm(self, seq_index, fallback_bpm=100.0):
+        """Return BPM for the given sequence index from metadata if available."""
+        if seq_index < 0 or seq_index >= len(self.metadata):
+            return fallback_bpm
+
+        metadata_item = self.metadata[seq_index]
+        if isinstance(metadata_item, (list, tuple, np.ndarray)) and len(metadata_item) >= 3:
+            try:
+                bpm = float(metadata_item[2])
+                if bpm > 0:
+                    return bpm
+            except (TypeError, ValueError):
+                pass
+
+        return fallback_bpm
+
     def playback(self, fig=None, update_callback=None, generic_midi_mapping=False):
         port = mido.get_output_names()[0]
-        bpm = 100
-        beat_length = 60 / bpm
-        sixteenth_note_length = beat_length / 4
         output_port = mido.open_output(port, callback=lambda msg: print(msg))
         self.stop_event = threading.Event()
+        self.playback_wakeup_event = threading.Event()
 
         self.stop_event.clear()  # Ensure the event is not set before starting
+        self.playback_wakeup_event.clear()
         self.thread = threading.Thread(
             target=self.play_midi,
             args=(
                 self.playback_position,
                 self.stop_event,
                 output_port,
-                sixteenth_note_length,
                 generic_midi_mapping,
             ),
         )
         self.thread.start()
 
-    def play_midi(self, playback_position, stop_event, output_port, sixteenth_note_length, generic_midi_mapping=False):
-        def play_single_note(pitch, vel, delay=0):
+    def play_midi(self, playback_position, stop_event, output_port, generic_midi_mapping=False):
+        def play_single_note(pitch, vel, delay=0, note_length=0.0):
             time.sleep(delay)
             output_port.send(mido.Message('note_on', note=pitch , velocity=vel))
-            time.sleep(sixteenth_note_length)
+            time.sleep(note_length)
             output_port.send(mido.Message('note_off', note=pitch))
         deviation_strength = 1
 
@@ -1156,15 +1175,20 @@ class MidiProcessor:
             if len(self.sequences) == 0:
                 time.sleep(0.1)
                 continue
-            seq = self.sequences[self.seq_index]
+
+            current_seq_index = self.seq_index
+            bpm = self._get_sequence_bpm(current_seq_index)
+            beat_length = 60 / bpm
+            sixteenth_note_length = beat_length / 4
+            seq = self.sequences[current_seq_index]
             # matrix = np.array(matrix)
             # print(playback_position)
             counter = 0
-            vel = 0
-            delay = sixteenth_note_length
+            interval_start = float(self.playback_position)
+            interval_end = interval_start + 1.0
 
             for i, token in enumerate(seq):
-                if counter > self.playback_position:
+                if counter > interval_end:
                     break
                 if token == self.hparams.eos_token or token == 0:
                     break
@@ -1178,36 +1202,52 @@ class MidiProcessor:
                 #     deviation *= (sixteenth_note_length / 2) * deviation_strength
                 #     delay = sixteenth_note_length + deviation
 
-                if counter == self.playback_position:
-                    vel_token = seq[i+1] if i+1 < len(seq) else None
-                    if vel_token is not None and self.hparams.min_vel_token <= vel_token < self.hparams.max_vel_token:
-                        vel = (vel_token - self.hparams.min_vel_token) * (127/(self.hparams.n_vel-1))
-                        timing_token = seq[i+2] if i+2 < len(seq) else None
-                        if timing_token is not None and self.hparams.min_timing_token <= timing_token < self.hparams.max_timing_token:
-                            deviation = timing_token - self.hparams.center_timing_token
-                            deviation /= (self.hparams.n_timing // 2) # scale to -1 to 1
-                            deviation *= (sixteenth_note_length / 2) * deviation_strength
-                            delay = sixteenth_note_length + deviation
-                            if self.hparams.min_pitch_token <= token < self.hparams.max_pitch_token:
-                                chromatic_pitch = token - self.hparams.min_pitch_token
-                                if generic_midi_mapping:
-                                    pitch = chromatic_to_generic(chromatic_pitch)
-                                else:
-                                    pitch = chromatic_pitch + 36
-                                if pitch < 0 or pitch > 127:
-                                    continue
-                                # output_port.send(mido.Message('note_on', note=pitch , velocity=int(vel)))
-                                # play_single_note(pitch, int(vel), delay)
+                if self.hparams.min_pitch_token <= token < self.hparams.max_pitch_token:
+                    vel_token = seq[i + 1] if i + 1 < len(seq) else None
+                    timing_token = seq[i + 2] if i + 2 < len(seq) else None
+                    if vel_token is None or timing_token is None:
+                        continue
+                    if not (self.hparams.min_vel_token <= vel_token < self.hparams.max_vel_token):
+                        continue
+                    if not (self.hparams.min_timing_token <= timing_token < self.hparams.max_timing_token):
+                        continue
 
-                                # print(self.playback_position, pitch, int(vel), delay)
-                                threading.Thread(target=play_single_note, args=(pitch, int(vel), delay)).start()
+                    vel = (vel_token - self.hparams.min_vel_token) * (127 / (self.hparams.n_vel - 1))
+                    shift = (timing_token - self.hparams.center_timing_token) / (self.hparams.n_timing // 2)
+                    shift *= deviation_strength
+                    event_step = counter + (0.5 * shift)
+
+                    if not (interval_start <= event_step < interval_end):
+                        continue
+
+                    delay = (event_step - interval_start) * sixteenth_note_length
+                    delay = max(0.0, delay)
+
+                    chromatic_pitch = token - self.hparams.min_pitch_token
+                    if generic_midi_mapping:
+                        pitch = chromatic_to_generic(chromatic_pitch)
+                    else:
+                        pitch = chromatic_pitch + 36
+                    if pitch < 0 or pitch > 127:
+                        continue
+
+                    threading.Thread(
+                        target=play_single_note,
+                        args=(pitch, int(vel), delay, sixteenth_note_length),
+                    ).start()
 
                 if token == self.hparams.step_token:
                     counter += 1
 
 
 
-            time.sleep(sixteenth_note_length)
+            if self.playback_wakeup_event is not None:
+                woke_up = self.playback_wakeup_event.wait(timeout=sixteenth_note_length)
+                if woke_up:
+                    self.playback_wakeup_event.clear()
+                    continue
+            else:
+                time.sleep(sixteenth_note_length)
 
             self.playback_position += 1
             self.playback_position %= self.hparams.width

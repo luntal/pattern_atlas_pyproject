@@ -9,8 +9,8 @@ DATA_DIR = Path(__file__).resolve().parent.parent / 'data' / current_branch
 
 # List of .npz files to merge
 files_to_merge = [
-    DATA_DIR / 'dataset-groove-selection.npz',
-    DATA_DIR / 'dataset-generic-test.npz',
+    DATA_DIR / 'dataset-groove-selection-2.npz',
+    DATA_DIR / 'dataset-global-grooves-2.npz',
     # DATA_DIR / 'dataset-groove.npz',
     # DATA_DIR / 'dataset-groove-augmented.npz',
     # DATA_DIR / 'dataset-groove-augmented-rnd.npz',
@@ -18,7 +18,7 @@ files_to_merge = [
     # DATA_DIR / 'dataset-lakh-augmented.npz',
 ]
 
-save_path = DATA_DIR / 'dataset-merged-test.npz'
+save_path = DATA_DIR / 'dataset-merged-global-grooves-2.npz'
 
 # Load all datasets
 all_data = []

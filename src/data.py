@@ -17,8 +17,8 @@ if __name__ == "__main__":
     scores = '/Users/alexanderlunt/Nextcloud/KI-Labor/Forschung KI-Labor/_Trainingsdaten/MIDI-Files/scores'
     piano = '/Users/alexanderlunt/Programmierung/datasets/piano'
     lakh = '/Users/alexanderlunt/Nextcloud/KI-Labor/Forschung KI-Labor/_Trainingsdaten/MIDI-Files/LakhMidiDataset-Clean'
-    groove_selection = '/Users/alexanderlunt/Music/Ableton/Projects/Global Grooves Project/groove-patterns'
-    generic_test = '/Users/alexanderlunt/Nextcloud/KI-Labor/Forschung KI-Labor/_Projekte/Global Grooves/dataset/midi/origial'
+    groove_selection = '/Users/alexanderlunt/Music/Ableton/Projects/Global Grooves Project/groove-patterns-2'
+    global_grooves = '/Users/alexanderlunt/Nextcloud/KI-Labor/Forschung KI-Labor/_Projekte/Global Grooves/dataset/midi/original-2'
     abs_path = groove_selection
 
     # Initialize processor
@@ -26,7 +26,7 @@ if __name__ == "__main__":
 
     tasks = ['select_folder', 'extract', 'only_visualize']
     task = tasks[2]
-    dataset_name = 'dataset-groove-selection.npz' 
+    dataset_name = 'dataset-merged-global-grooves-2.npz' 
 
     if task == 'select_folder':
         folder = select_folder()
@@ -42,8 +42,7 @@ if __name__ == "__main__":
         processor.extract(midi_folder_path=abs_path, skip=0, take=0, clip=False,
                           randomize_velocity=0, qnt_strength=0, qnt_randomness=0, pitch_randomness=False,
                           drums_only=False, filter_duplicates=True, jump=1, 
-                          generic_midi_mapping=False, groove_to_specific=True, generic_to_chromatic=False,
-                          bpm_from_filename=True)
+                          generic_midi_mapping=False, groove_to_specific=True, generic_to_chromatic=False)
         processor.save(dataset_name=dataset_name)
 
     elif task == 'only_visualize':

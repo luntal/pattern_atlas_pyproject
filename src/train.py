@@ -22,17 +22,22 @@ if __name__ == '__main__':
     resume_checkpoint = None
     if retrain:
         # vae, hparams, resume_checkpoint = load_model(previous=0, onnx=False, return_checkpoint=True)
-        # load model with fresh optim and scheduler (resume_checkpoint has to stay None for this)
-        vae, hparams = load_model(previous=0, onnx=False, return_checkpoint=False)
+        vae, hparams = load_model(previous=0, onnx=False, return_checkpoint=False,
+                                  name='model_2026-04-27_13-26-37.pt')
 
-        hparams.n_epochs = 20 # override n_epochs for retraining
+
+        hparams.validation_split = 0
+        hparams.n_epochs = 25 # override n_epochs for retraining
         # update learning rate
-        hparams.scheduler_start_lr = hparams.learning_rate
-        hparams.scheduler_end_lr = hparams.learning_rate * 0.9
+        # hparams.scheduler_start_lr = hparams.learning_rate
+        hparams.scheduler_start_lr = 1e-8
+        hparams.scheduler_end_lr = hparams.learning_rate * 0.1
         # update annealing list to continue from current beta
         w_beta_start = hparams.weighted_beta
         w_beta_end = w_beta_start
-        hparams.annealing_list = [[0, w_beta_start], [1,w_beta_end]]
+        hparams.annealing_list = [[0, w_beta_start], [0.5, w_beta_end], [1.0, w_beta_end]]
+
+        hparams.dataset_name = 'dataset-merged-test.npz'
         
     else:
         vae = TransformerVAE(hparams)
@@ -83,16 +88,19 @@ if __name__ == '__main__':
         persistent_workers=True,
         prefetch_factor=2
     )
-    val_loader = DataLoader(
-        val_data,
-        batch_size=BATCH,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=use_pin_memory,
-        persistent_workers=True,
-        prefetch_factor=2
-    )
-    scheduler = None
+    if VALIDATION_SPLIT > 0:
+        val_loader = DataLoader(
+            val_data,
+            batch_size=BATCH,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=use_pin_memory,
+            persistent_workers=True,
+            prefetch_factor=2
+        )
+    else:
+        val_loader = None
+        scheduler = None
 
     if retrain:
         resume_optim_state = None

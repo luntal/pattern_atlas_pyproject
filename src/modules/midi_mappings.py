@@ -216,6 +216,30 @@ def groove_merged_to_chromatic(groove_note: int, strategy: str = "random") -> in
     return candidates[0]
 
 
+# Deterministic single-target mapping used by groove_to_specific mode.
+# Targets are chosen from the leading entry of each class's prioritized
+# chromatic bank to represent standard drum elements.
+GROOVE_MERGED_TO_CHROMATIC_SPECIFIC = {
+    36: 2,   # kick / bass accent
+    37: 26,  # side stick
+    38: 31,  # snare accent
+    40: 25,  # snare rimshot
+    42: 45,  # hi-hat closed
+    43: 7,   # floor tom
+    44: 47,  # hi-hat pedal
+    45: 5,   # mid tom
+    46: 46,  # hi-hat open
+    48: 4,   # high tom
+    49: 50,  # crash
+    51: 48,  # ride
+}
+
+
+def groove_merged_to_chromatic_specific(groove_note: int) -> int:
+    """Map merged Groove MIDI class to a deterministic chromatic pitch (0..53)."""
+    return GROOVE_MERGED_TO_CHROMATIC_SPECIFIC.get(groove_note, groove_note)
+
+
 # ---------------------------------------------------------------------------
 # Feature-based fan-out: merged Groove MIDI class → ordered chromatic bank
 # ---------------------------------------------------------------------------
@@ -364,27 +388,3 @@ def fan_out_merged_step(
             fixed_map[merged_note] = selected_for_merged
 
     return result
-
-
-
-
-# Deterministic "specific conditions" strategy:
-# merged Groove MIDI -> fixed chromatic pitch
-GROOVE_MERGED_TO_CHROMATIC_SPECIFIC = {
-    36: 2,
-    37: 26,
-    38: 24,
-    40: 25,
-    42: 45,
-    43: 6,
-    44: 47,
-    45: 5,
-    46: 46,
-    48: 4,
-    49: 50,
-    51: 48,
-}
-
-def groove_merged_to_chromatic_specific(groove_note: int) -> int:
-    """Map merged Groove MIDI note to chromatic note using fixed specific conditions."""
-    return GROOVE_MERGED_TO_CHROMATIC_SPECIFIC.get(groove_note, groove_note)

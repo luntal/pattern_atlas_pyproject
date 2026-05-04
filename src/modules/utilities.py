@@ -16,7 +16,7 @@ def create_latent_vectors(input_data: np.ndarray, model):
     z = mu.detach().numpy()
     return z
 
-def load_model(previous=0, onnx=False, return_checkpoint=False, checkpoint_kind=None):
+def load_model(previous=0, onnx=False, return_checkpoint=False, checkpoint_kind=None, name=None):
     """Load a model checkpoint from the branch-specific models directory.
 
     checkpoint_kind selects a named checkpoint written by train_vae:
@@ -36,7 +36,22 @@ def load_model(previous=0, onnx=False, return_checkpoint=False, checkpoint_kind=
         'best_train': 'model_best_train_',
         'last':       'model_last_',
     }
-    if checkpoint_kind is not None:
+    # Explicit model-name selection has highest priority.
+    if name is not None:
+        # Always resolve explicit names within the current branch directory.
+        # If a path is provided, only the filename part is used.
+        candidate = model_dir / Path(str(name)).name
+        if candidate.suffix == '':
+            candidate = candidate.with_suffix('.pt')
+
+        if not candidate.exists():
+            raise FileNotFoundError(
+                f"Requested model name '{name}' not found at: {candidate}"
+            )
+
+        selected_model = candidate
+        print(f'Loading model by name: {selected_model}')
+    elif checkpoint_kind is not None:
         if checkpoint_kind not in _KIND_PREFIXES:
             raise ValueError(
                 f"Unknown checkpoint_kind '{checkpoint_kind}'. "
