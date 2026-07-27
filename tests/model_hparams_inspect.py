@@ -7,8 +7,8 @@ import argparse
 import torch
 
 
-# DEFAULT_MODEL_PATH = Path("models/dev/model_2026-04-08_09-52-22.pt")
-DEFAULT_MODEL_PATH = Path("models/exp/model_2026-04-21_22-31-51.pt")
+DEFAULT_MODEL_PATH = Path("models/dev/model_2026-04-08_09-52-22.pt")
+# DEFAULT_MODEL_PATH = Path("models/exp/model_2026-04-21_22-31-51.pt")
 
 def _print_hparams_summary(hparams: SimpleNamespace, model_path: Path) -> None:
 	keys = [
