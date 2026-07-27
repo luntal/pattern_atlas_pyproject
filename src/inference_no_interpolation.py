@@ -14,6 +14,7 @@ import math
 import time
 import glob
 import os
+import subprocess
 
 """
 spherical interpolation between 2 latent vectors.
@@ -24,16 +25,59 @@ spherical interpolation between 2 latent vectors.
 ##########################
 # ONNX = True
 ONNX = False
+# model_name = None  # Example: 'model_2026-04-08_09-52-22.pt'
+model_name = 'model_2026-04-08_09-52-22.pt'
+dataset_name = 'dataset-groove.npz'
 
-# Find the latest model in the models directory
-model_files = glob.glob('models/model_*.pt')
+# Resolve branch-specific models directory: models/<current_branch>
+project_root = os.path.dirname(os.path.dirname(__file__))
+
+branch_name = 'unknown-branch'
+try:
+    result = subprocess.run(
+        ['git', '-C', project_root, 'rev-parse', '--abbrev-ref', 'HEAD'],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    branch_name = result.stdout.strip() or 'unknown-branch'
+    if branch_name == 'HEAD':
+        detached_result = subprocess.run(
+            ['git', '-C', project_root, 'rev-parse', '--short', 'HEAD'],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        commit_hash = detached_result.stdout.strip() or 'unknown'
+        branch_name = f'detached-{commit_hash}'
+except (subprocess.CalledProcessError, FileNotFoundError):
+    pass
+
+safe_branch_name = branch_name.replace('/', '_').replace(' ', '_')
+models_dir = os.path.join(project_root, 'models', safe_branch_name)
+
+model_files = glob.glob(os.path.join(models_dir, '*.pt'))
 if not model_files:
-    raise FileNotFoundError("No model files found in models/ directory")
-latest_model = max(model_files, key=os.path.getmtime)
-print(f'Loading model: {latest_model}')
+    raise FileNotFoundError(f"No model files found in {models_dir}")
+
+selected_model = None
+if model_name is not None:
+    candidate_name = os.path.basename(model_name)
+    candidate_path = os.path.join(models_dir, candidate_name)
+    if os.path.isfile(candidate_path):
+        selected_model = candidate_path
+    elif not candidate_name.endswith('.pt') and os.path.isfile(candidate_path + '.pt'):
+        selected_model = candidate_path + '.pt'
+    else:
+        print(f"Requested model_name '{model_name}' not found in {models_dir}; falling back to latest model.")
+
+if selected_model is None:
+    selected_model = max(model_files, key=os.path.getmtime)
+
+print(f'Loading model: {selected_model}')
 
 # Load the saved data
-checkpoint = torch.load(latest_model, map_location='cpu')
+checkpoint = torch.load(selected_model, map_location='cpu')
 model_state_dict = checkpoint['model_state_dict']
 hparams_dict = checkpoint['hparams']
 
@@ -65,7 +109,15 @@ else:
 offset = 0
 n_examples = 1
 interpolation_steps = 25
-data = np.load('data/dataset-merged.npz')['data']
+
+if not dataset_name.endswith('.npz'):
+    dataset_name += '.npz'
+data_dir = os.path.join(project_root, 'data', safe_branch_name)
+dataset_path = os.path.join(data_dir, dataset_name)
+if not os.path.isfile(dataset_path):
+    raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+print(f'Loading dataset: {dataset_path}')
+data = np.load(dataset_path)['data']
 # print(data['tensor'])
 print('data shape: ', data.shape)
 # maxi = data.shape[0]

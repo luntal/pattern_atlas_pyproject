@@ -17,15 +17,15 @@ if __name__ == "__main__":
     scores = '/Users/alexanderlunt/Nextcloud/KI-Labor/Forschung KI-Labor/_Trainingsdaten/MIDI-Files/scores'
     piano = '/Users/alexanderlunt/Programmierung/datasets/piano'
     lakh = '/Users/alexanderlunt/Nextcloud/KI-Labor/Forschung KI-Labor/_Trainingsdaten/MIDI-Files/LakhMidiDataset-Clean'
-    abs_path = lakh
+    abs_path = groove
 
     # Initialize processor
     processor = MidiProcessor(hparams)
 
 
     tasks = ['select_folder', 'extract', 'only_visualize']
-    task = tasks[2]
-    dataset_name = 'dataset-merged-aug.npz' 
+    task = tasks[1]
+    dataset_name = 'dataset-groove.npz'
 
     if task == 'select_folder':
         folder = select_folder()
@@ -40,7 +40,7 @@ if __name__ == "__main__":
         # Set drums_only=True when extracting from multi-instrument datasets like Lakh
         processor.extract(midi_folder_path=abs_path, skip=0, take=0, clip=False,
                           randomize_velocity=0, qnt_strength=0, qnt_randomness=0, pitch_randomness=False,
-                          drums_only=True, filter_duplicates=True, jump=15)
+                          drums_only=False, filter_duplicates=True, jump=15)
         processor.save(dataset_name=dataset_name)
 
     elif task == 'only_visualize':

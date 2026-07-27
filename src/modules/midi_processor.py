@@ -11,6 +11,7 @@ import threading
 import time
 from types import SimpleNamespace
 import random
+import subprocess
 
 def get_randomness(value, strength=1, invert=False):
     """
@@ -261,9 +262,42 @@ class MidiProcessor:
         self.seq_index = 0
         self.matrices = []
 
+    def _get_branch_data_folder(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+        branch_name = 'unknown-branch'
+        try:
+            result = subprocess.run(
+                ['git', '-C', project_root, 'rev-parse', '--abbrev-ref', 'HEAD'],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            branch_name = result.stdout.strip() or 'unknown-branch'
+            if branch_name == 'HEAD':
+                detached_result = subprocess.run(
+                    ['git', '-C', project_root, 'rev-parse', '--short', 'HEAD'],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                commit_hash = detached_result.stdout.strip() or 'unknown'
+                branch_name = f'detached-{commit_hash}'
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+
+        safe_branch_name = branch_name.replace('/', '_').replace(' ', '_')
+        data_folder = os.path.join(project_root, 'data', safe_branch_name)
+        os.makedirs(data_folder, exist_ok=True)
+        return data_folder
+
 
     def load(self, dataset_name, skip=0, take=0):
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data', dataset_name)
+        if not dataset_name.endswith('.npz'):
+            dataset_name += '.npz'
+
+        data_folder = self._get_branch_data_folder()
+        path = os.path.join(data_folder, dataset_name)
         npz_data = np.load(path, allow_pickle=True)
 
         # Support both old and new format
@@ -384,6 +418,7 @@ class MidiProcessor:
             # print('c_qnt_strength', current_qnt_strength)
 
             # Filter for drum tracks if drums_only is enabled
+            # this should only be applied on multi-instrument datasets like Lakh, where we want to extract only the drum tracks
             if drums_only:
                 drum_instruments = [inst for inst in midi_data.instruments if inst.is_drum]
                 if len(drum_instruments) == 0:
@@ -709,9 +744,7 @@ class MidiProcessor:
             dataset_name += '.npz'
 
 
-        # Prepend data folder path
-        data_folder = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data')
-        os.makedirs(data_folder, exist_ok=True)
+        data_folder = self._get_branch_data_folder()
         dataset_path = os.path.join(data_folder, dataset_name)
 
         # Convert metadata to numpy array for saving

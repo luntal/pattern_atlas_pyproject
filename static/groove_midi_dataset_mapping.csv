@@ -1,0 +1,23 @@
+Pitch,Roland Mapping,GM Mapping,Paper Mapping,Frequency, Merged Mapping
+22,HH Closed (Edge),N/A,Closed Hi-Hat (42),34764, 42
+26,HH Open (Edge),N/A,Open Hi-Hat (46),10243, 46
+36,Kick,Bass Drum 1,Bass (36),88067,36
+37,Snare X-Stick,Side Stick,Snare (38),9696,37
+38,Snare (Head),Acoustic Snare,Snare (38),102787,38
+40,Snare (Rim),Electric Snare,Snare (38),22262,40
+42,HH Closed (Bow),Closed Hi-Hat,Closed Hi-Hat (42),31691,42
+43,Tom 3 (Head),High Floor Tom,High Floor Tom (43),11260,43
+44,HH Pedal,Pedal Hi-Hat,Closed Hi-Hat (42),52343,44
+45,Tom 2,Low Tom,Low-Mid Tom (47),3935,45
+46,HH Open (Bow),Open Hi-Hat,Open Hi-Hat (46),3905,46
+47,Tom 2 (Rim),Low-Mid Tom,Low-Mid Tom (47),1322,45
+48,Tom 1,Hi-Mid Tom,High Tom (50),13145,48
+49,Crash 1 (Bow),Crash Cymbal 1,Crash Cymbal (49),720,49
+50,Tom 1 (Rim),High Tom,High Tom (50),1561,48
+51,Ride (Bow),Ride Cymbal 1,Ride Cymbal (51),43847,51
+52,Crash 2 (Edge),Chinese Cymbal,Crash Cymbal (49),1046,49
+53,Ride (Bell),Ride Bell,Ride Cymbal (51),5567,51
+55,Crash 1 (Edge),Splash Cymbal,Crash Cymbal (49),5567,49
+57,Crash 2 (Bow),Crash Cymbal 2,Crash Cymbal (49),1832,49
+58,Tom 3 (Rim),Vibraslap,High Floor Tom (43),1003,43
+59,Ride (Edge),Ride Cymbal 2,Ride Cymbal (51),2220,51
