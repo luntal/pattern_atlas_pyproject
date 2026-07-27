@@ -9,10 +9,8 @@ This project is intended for both experimentation and development of model archi
 
 - [Project Overview](#project-overview)
 - [Features](#features)
-- [Project Structure](#project-structure)
 - [Installation](#installation)
 - [Usage](#usage)
-- [Development Notes](#development-notes)
 - [Dataset](#dataset)
 - [License](#license)
 
@@ -37,23 +35,6 @@ The model supports:
 - Support for dataset augmentation (pitch shift, timing jitter)
 - Flexible architecture for experimenting with VAE parameters
 
----
-
-## Project Structure
-
-```text
-my-project/
-├── src/                   # Python source code
-├── data/                  # Preprocessed tokenized data (.npz)
-├── models/                # Trained VAE models (.pt, .onnx, etc.)
-├── outputs/               # Generated Sequences, reconstructions (.pkl)
-├── tests/                 # Unit tests
-├── docs/                  # Development notes (internal)
-├── README.md              # This file
-├── requirements.txt       # Python dependencies
-├── .gitignore
-└── pyproject.toml
-```
 
 ---
 
@@ -65,17 +46,8 @@ my-project/
 ---
 ## Usage
 1. Training via train.py
-2. sampling via sample.py
+2. sampling via inference.py
 3. hyperparameter tuning in hparams.py
-
----
-## Development Notes
-- Internal development notes are maintained in DEV_NOTES.md￼
-- Includes:
-  - Model architecture changes
-  - Input feature experiments
-  - Known issues / limitations
-  - TODOs for current commit/version
 
 ---
 ## Dataset

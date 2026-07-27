@@ -12,7 +12,8 @@ from modules.model import ONNXWrapper, TransformerVAE
 
 """
 Evaluate interpolation quality by comparing each interpolated output sequence
-against the two source (original) sequences of each interpolation pair.
+against either original endpoint sequences or generated start/end endpoint
+sequences of each interpolation pair.
 """
 
 
@@ -27,14 +28,17 @@ sample_skip = 0
 sample_take = 0  # <= 0 means use all samples after skip
 
 # Interpolation settings
-n_interpolation_pairs = 20
+n_interpolation_pairs = 15
 interpolation_steps = 10  # number of vectors between each pair endpoint
-pair_sampling_seed = 42
+pair_sampling_seed = 33
 sampling_temperature = 0.1
-position_tolerance = 6  # Match token within +/- this many positions.
+# If True, compare each interpolation output against the original source pair.
+# If False, compare against the generated interpolation endpoints.
+compare_to_original = True
+position_tolerance = 16  # Match token within +/- this many positions.
 pitch_tolerance_steps = 1
-velocity_tolerance_percent = 30
-micro_timing_tolerance_percent = 20
+velocity_tolerance_percent = 10
+micro_timing_tolerance_percent = 10
 
 # Output
 plot_filename = 'evaluation_interpolation.png'
@@ -327,14 +331,18 @@ def save_interpolation_plot(
     save_path: str,
     mean_overall_to_a: np.ndarray,
     mean_overall_to_b: np.ndarray,
+    ref_a_label: str,
+    ref_b_label: str,
+    x_label_start: str,
+    x_label_end: str,
 ):
     x = np.arange(len(mean_overall_to_a))
 
     fig, ax = plt.subplots(1, 1, figsize=(10, 5))
 
-    ax.plot(x, mean_overall_to_a, label='x vs original A', marker='o')
-    ax.plot(x, mean_overall_to_b, label='x vs original B', marker='o')
-    ax.set_xlabel('Interpolation position (0=start original A, last=end original B)')
+    ax.plot(x, mean_overall_to_a, label=f'x vs {ref_a_label}', marker='o')
+    ax.plot(x, mean_overall_to_b, label=f'x vs {ref_b_label}', marker='o')
+    ax.set_xlabel(f'Interpolation position (0={x_label_start}, last={x_label_end})')
     ax.set_ylabel('Accuracy')
     ax.set_title('Interpolation Accuracy (Windowed Position Match)')
     ax.grid(True, alpha=0.3)
@@ -377,10 +385,24 @@ if __name__ == '__main__':
     print(f'Selected samples: {len(sample_data)}')
     print(f'Interpolation pairs: {n_interpolation_pairs}')
     print(f'Interpolation steps between endpoints: {interpolation_steps}')
+    print(f'Compare to original endpoints: {compare_to_original}')
     print(f'Position tolerance: +/-{position_tolerance}')
     print(f'Pitch tolerance: +/-{pitch_tolerance_steps} pitch steps')
     print(f'Velocity tolerance: +/-{velocity_tolerance_percent}% of velocity token range')
     print(f'Micro timing tolerance: +/-{micro_timing_tolerance_percent}% of timing token range')
+
+    if compare_to_original:
+        ref_a_label = 'original A'
+        ref_b_label = 'original B'
+        best_label = 'closer original'
+        x_label_start = 'start original A'
+        x_label_end = 'end original B'
+    else:
+        ref_a_label = 'generated start'
+        ref_b_label = 'generated end'
+        best_label = 'closer generated endpoint'
+        x_label_start = 'start generated'
+        x_label_end = 'end generated'
 
     n_positions = interpolation_steps + 2
     overall_to_a = np.zeros((n_interpolation_pairs, n_positions), dtype=float)
@@ -400,8 +422,12 @@ if __name__ == '__main__':
             temperature=sampling_temperature,
         )
 
-        ref_a = torch.tensor(source_pair[0], dtype=torch.long).unsqueeze(0)
-        ref_b = torch.tensor(source_pair[1], dtype=torch.long).unsqueeze(0)
+        if compare_to_original:
+            ref_a = torch.tensor(source_pair[0], dtype=torch.long).unsqueeze(0)
+            ref_b = torch.tensor(source_pair[1], dtype=torch.long).unsqueeze(0)
+        else:
+            ref_a = pred_tokens[0].unsqueeze(0)
+            ref_b = pred_tokens[-1].unsqueeze(0)
 
         for pos in range(n_positions):
             pred_seq = pred_tokens[pos].unsqueeze(0)
@@ -437,13 +463,17 @@ if __name__ == '__main__':
         save_path=plot_path,
         mean_overall_to_a=mean_overall_to_a,
         mean_overall_to_b=mean_overall_to_b,
+        ref_a_label=ref_a_label,
+        ref_b_label=ref_b_label,
+        x_label_start=x_label_start,
+        x_label_end=x_label_end,
     )
 
     print('\nInterpolation Evaluation Summary')
-    print(f'Mean overall vs original A (all positions): {np.mean(mean_overall_to_a):.4f}')
-    print(f'Mean overall vs original B (all positions): {np.mean(mean_overall_to_b):.4f}')
-    print(f'Mean overall vs closer original (all positions): {np.mean(mean_overall_best):.4f}')
-    print(f'Mean pitch vs closer original (all positions): {np.mean(mean_pitch_best):.4f}')
-    print(f'Mean velocity vs closer original (all positions): {np.mean(mean_velocity_best):.4f}')
-    print(f'Mean micro timing vs closer original (all positions): {np.mean(mean_timing_best):.4f}')
+    print(f'Mean overall vs {ref_a_label} (all positions): {np.mean(mean_overall_to_a):.4f}')
+    print(f'Mean overall vs {ref_b_label} (all positions): {np.mean(mean_overall_to_b):.4f}')
+    print(f'Mean overall vs {best_label} (all positions): {np.mean(mean_overall_best):.4f}')
+    print(f'Mean pitch vs {best_label} (all positions): {np.mean(mean_pitch_best):.4f}')
+    print(f'Mean velocity vs {best_label} (all positions): {np.mean(mean_velocity_best):.4f}')
+    print(f'Mean micro timing vs {best_label} (all positions): {np.mean(mean_timing_best):.4f}')
     print(f'Matplotlib output saved to: {plot_path}')
