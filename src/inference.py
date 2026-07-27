@@ -23,7 +23,7 @@ spherical interpolation between 2 latent vectors.
 ############################
 # Load model with metadata
 ############################
-model, hparams = load_model()
+model, hparams = load_model(0, checkpoint_kind='best_train')
 
 
 
@@ -274,6 +274,7 @@ def calculate(seq1, seq2, interpolation_steps=25):
     print('stack shape', stack.shape)
 
     preds = model.sample(z=stack, max_len=hparams.max_seq_len, temperature=0.1, sample=False)
+    _print_interpolation_similarity_metrics(data_tensors, preds)
     sequences = preds.tolist()
     # global_vars.set_sequences(sequences)
 
@@ -301,6 +302,68 @@ def calculate(seq1, seq2, interpolation_steps=25):
     print(f"Processing time: {processing_time:.2f} seconds")
     # print(f'max syncopation measure: {max(syncopation_measures)}')
     return mats, seq1_matrix, seq2_matrix
+
+
+def _align_generated_to_target(generated: torch.Tensor, target_len: int, pad_token: int) -> torch.Tensor:
+    if generated.size(0) > target_len:
+        return generated[:target_len]
+    if generated.size(0) < target_len:
+        pad = torch.full(
+            (target_len - generated.size(0),),
+            int(pad_token),
+            dtype=generated.dtype,
+            device=generated.device,
+        )
+        return torch.cat([generated, pad], dim=0)
+    return generated
+
+
+def _token_similarity(anchor_tokens: torch.Tensor, generated_tokens: torch.Tensor, pad_token: int) -> float:
+    aligned = _align_generated_to_target(generated_tokens, anchor_tokens.size(0), pad_token)
+    valid_mask = anchor_tokens != int(pad_token)
+    valid_count = int(valid_mask.sum().item())
+    if valid_count == 0:
+        return 0.0
+    matches = int(((anchor_tokens == aligned) & valid_mask).sum().item())
+    return float(matches / valid_count)
+
+
+def _print_interpolation_similarity_metrics(anchor_tokens: torch.Tensor, generated_tokens: torch.Tensor):
+    """
+    Prints similarity of each generated interpolation rhythm to both anchors.
+    This is intentionally read-only reporting and does not alter generation behavior.
+    """
+    pad_token = int(hparams.pad_token)
+    anchors = anchor_tokens.to(generated_tokens.device)
+    preds = generated_tokens.to(anchors.device)
+
+    sim_to_a0 = []
+    sim_to_a1 = []
+    for idx in range(preds.size(0)):
+        sim0 = _token_similarity(anchors[0], preds[idx], pad_token)
+        sim1 = _token_similarity(anchors[1], preds[idx], pad_token)
+        sim_to_a0.append(sim0)
+        sim_to_a1.append(sim1)
+
+    sim_to_a0 = np.asarray(sim_to_a0, dtype=np.float32)
+    sim_to_a1 = np.asarray(sim_to_a1, dtype=np.float32)
+
+    # Positive slope indicates increasing relative similarity toward anchor 1
+    # along interpolation index (expected for smooth anchor-to-anchor traversal).
+    diff = sim_to_a1 - sim_to_a0
+    x = np.arange(len(diff), dtype=np.float32)
+    slope = float(np.polyfit(x, diff, 1)[0]) if len(diff) > 1 else 0.0
+
+    print('---' * 10)
+    print('Interpolation Quality Metrics (Anchor Similarity)')
+    print('Per-rhythm similarity is token match ratio on non-pad anchor tokens.')
+    print('Idx | Similarity->A0 | Similarity->A1 | Closer Anchor')
+    for idx, (sim0, sim1) in enumerate(zip(sim_to_a0, sim_to_a1)):
+        closer = 'A0' if sim0 >= sim1 else 'A1'
+        print(f'{idx:>3} | {sim0:>14.6f} | {sim1:>14.6f} | {closer}')
+
+    print(f'Anchor-trend slope (simA1 - simA0 vs index): {slope:.6f} (higher > 0 is better)')
+    print('---' * 10)
 
 
 visualize_with_slider()

@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
 # from hparams import hparams
 from modules.model import TransformerVAE, reparameterize, ONNXWrapper
 from modules.interpolation import interpolate_latent_vectors_spherical
@@ -17,6 +18,7 @@ import os
 from modules.branch_paths import latest_in_branch, safe_branch_name, get_current_branch
 from modules.utilities import load_model
 
+
 """
 direct inference without interpolation.
 Observe the reconstructions of sequences
@@ -26,8 +28,8 @@ Observe the reconstructions of sequences
 # Load model with metadata
 ##########################
 
-model, hparams = load_model(0, checkpoint_kind='best_train')
 
+model, hparams = load_model(0, checkpoint_kind='best_train')
 
 ###########################
 # Parameters
@@ -225,15 +227,94 @@ def calculate(sequences):
     latent_space_representations = []
     max_length = 0
     logits, mu, logvar = model(data_tensors)
-    z = reparameterize(mu, logvar)
+    # z = reparameterize(mu, logvar)
+    z = mu  # Use the mean for reconstruction
 
     preds = model.sample(z=z, max_len=hparams.max_seq_len, temperature=0.1, sample=False)
+
+    _print_reconstruction_metrics(data_tensors, preds, logits)
+
     print(preds.shape)
     sequences = preds.tolist()
     # compute mats with midi processor:
     m_reconstructions = global_vars.generate_matrices(sequences)
     m_originals = global_vars.convert_seq2mat(data)
     return m_reconstructions, m_originals
+
+
+def _timing_center_token(_hparams) -> int:
+    if hasattr(_hparams, 'center_timing_token'):
+        return int(_hparams.center_timing_token)
+    if hasattr(_hparams, 'min_timing_token') and hasattr(_hparams, 'n_timing'):
+        return int(_hparams.min_timing_token) + int(_hparams.n_timing) // 2
+    span = int(_hparams.max_timing_token) - int(_hparams.min_timing_token)
+    return int(_hparams.min_timing_token) + span // 2
+
+
+def _align_generated_to_target(generated: torch.Tensor, target_len: int, pad_token: int) -> torch.Tensor:
+    if generated.size(1) > target_len:
+        return generated[:, :target_len]
+    if generated.size(1) < target_len:
+        pad = torch.full(
+            (generated.size(0), target_len - generated.size(1)),
+            int(pad_token),
+            dtype=generated.dtype,
+            device=generated.device,
+        )
+        return torch.cat([generated, pad], dim=1)
+    return generated
+
+
+def _print_reconstruction_metrics(target_tokens: torch.Tensor, generated_tokens: torch.Tensor, logits: torch.Tensor):
+    pad_token = int(hparams.pad_token)
+    target = target_tokens.to(logits.device)
+    generated = _align_generated_to_target(generated_tokens.to(logits.device), target.size(1), pad_token)
+
+    valid_mask = target != pad_token
+    n_valid = int(valid_mask.sum().item())
+
+    exact_match = ((generated == target) | (~valid_mask)).all(dim=1)
+    exact_match_percent = 100.0 * float(exact_match.float().mean().item())
+
+    token_correct = int(((generated == target) & valid_mask).sum().item())
+    token_accuracy = float(token_correct / max(1, n_valid))
+
+    ce_sum = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        target.reshape(-1),
+        ignore_index=pad_token,
+        reduction='sum',
+    )
+    reconstruction_ce = float(ce_sum.item() / max(1, n_valid))
+
+    pitch_mask = (target >= int(hparams.min_pitch_token)) & (target < int(hparams.max_pitch_token))
+    pitch_total = int(pitch_mask.sum().item())
+    pitch_correct = int(((generated == target) & pitch_mask).sum().item())
+    pitch_accuracy = float(pitch_correct / max(1, pitch_total))
+
+    vel_mask = (target >= int(hparams.min_vel_token)) & (target < int(hparams.max_vel_token))
+    vel_total = int(vel_mask.sum().item())
+    velocity_mae = float(torch.abs(generated[vel_mask] - target[vel_mask]).float().mean().item()) if vel_total > 0 else 0.0
+
+    timing_mask = (target >= int(hparams.min_timing_token)) & (target < int(hparams.max_timing_token))
+    timing_total = int(timing_mask.sum().item())
+    center = _timing_center_token(hparams)
+    if timing_total > 0:
+        pred_timing = generated[timing_mask].to(torch.float32) - float(center)
+        target_timing = target[timing_mask].to(torch.float32) - float(center)
+        micro_timing_mae = float(torch.abs(pred_timing - target_timing).mean().item())
+    else:
+        micro_timing_mae = 0.0
+
+    print('---' * 10)
+    print('Reconstruction Quality (Original vs Generated)')
+    print(f'Exact match (% identical sequences): {exact_match_percent:.3f}%')
+    print(f'Token accuracy: {token_accuracy:.6f}')
+    print(f'Cross entropy / reconstruction loss: {reconstruction_ce:.6f}')
+    print(f'Pitch accuracy: {pitch_accuracy:.6f}')
+    print(f'Velocity MAE: {velocity_mae:.6f}')
+    print(f'Micro Timing MAE: {micro_timing_mae:.6f}')
+    print('---' * 10)
 
 
 

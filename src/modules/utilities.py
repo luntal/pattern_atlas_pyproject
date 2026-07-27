@@ -16,8 +16,12 @@ def create_latent_vectors(input_data: np.ndarray, model):
     z = mu.detach().numpy()
     return z
 
-def load_model(previous=0, onnx=False, return_checkpoint=False, checkpoint_kind=None, name=None):
+def load_model(previous=0, onnx=False, return_checkpoint=False, checkpoint_kind=None, name=None, branch=None):
     """Load a model checkpoint from the branch-specific models directory.
+
+    branch selects which models/<branch>/ directory is used.
+        None         – default: use current git branch
+        <str>        – use the provided branch name
 
     checkpoint_kind selects a named checkpoint written by train_vae:
         'best_val'   – lowest validation loss checkpoint (model_best_val.pt)
@@ -27,7 +31,7 @@ def load_model(previous=0, onnx=False, return_checkpoint=False, checkpoint_kind=
                        (0 = latest timestamped model, 1 = previous, ...)
     """
     print()
-    branch_name = safe_branch_name(get_current_branch())
+    branch_name = safe_branch_name(branch if branch is not None else get_current_branch())
     model_dir = Path('models') / branch_name
 
     # Named checkpoint selection.
@@ -38,7 +42,7 @@ def load_model(previous=0, onnx=False, return_checkpoint=False, checkpoint_kind=
     }
     # Explicit model-name selection has highest priority.
     if name is not None:
-        # Always resolve explicit names within the current branch directory.
+        # Always resolve explicit names within the selected branch directory.
         # If a path is provided, only the filename part is used.
         candidate = model_dir / Path(str(name)).name
         if candidate.suffix == '':
