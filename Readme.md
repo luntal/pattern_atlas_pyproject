@@ -1,4 +1,4 @@
-# Pattern VAE – Python Development Project
+# Pattern Atlas – Python Development Project
 
 A Python-based Variational Autoencoder (VAE) for generating and transforming rhythmic MIDI patterns.  
 This project is intended for both experimentation and development of model architectures, input features, and latent space exploration.
