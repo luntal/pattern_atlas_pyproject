@@ -140,7 +140,14 @@ def load_dataset(hparams, shuffle=True):
     branch_name = safe_branch_name(get_current_branch())
     # Resolve relative to the project root so it works regardless of the current working directory.
     path = project_root() / 'data'
-    dataset_name = os.path.join(path, branch_name, hparams.dataset_name)
+    branch_data_dir = os.path.join(path, branch_name)
+    # Datasets must come from data/<branch>/ only: plain file names, no sub-paths or other branches.
+    requested_name = str(hparams.dataset_name)
+    if os.path.basename(requested_name) != requested_name or requested_name in ('', '.', '..'):
+        raise ValueError(f"Dataset name '{requested_name}' must be a plain file name inside data/{branch_name}/")
+    dataset_name = os.path.join(branch_data_dir, requested_name)
+    if not os.path.isfile(dataset_name):
+        raise FileNotFoundError(f"Dataset '{requested_name}' not found in {branch_data_dir}")
     print(f'Loading dataset: {dataset_name}')
     full_data = np.load(dataset_name, allow_pickle=True)
     data = full_data['data']

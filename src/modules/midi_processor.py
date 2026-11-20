@@ -56,6 +56,10 @@ class ExtractionStats:
     skipped_too_short: int = 0
 
 
+class ExtractionCancelled(Exception):
+    """Raised by MidiProcessor.extract when should_stop() returns True."""
+
+
 def get_randomness(value, strength=1, invert=False):
     """
     returns a random value between 0 and input value.
@@ -479,10 +483,16 @@ class MidiProcessor:
             self, midi_folder_path=None, skip=0, take=0, clip=False,
             randomize_velocity=0, qnt_strength=1, qnt_randomness=0, pitch_randomness=False,
             roland=True, drums_only=False, filter_duplicates=True, remap=False, jump=1,
-            generic_midi_mapping=False, groove_to_specific=False, generic_to_chromatic=False):
+            generic_midi_mapping=False, groove_to_specific=False, generic_to_chromatic=False,
+            progress_callback=None, should_stop=None):
         """
         Extracts sequences from MIDI files and save as list of tokens
         currently sequences are 2 bars long, 16th notes per bar
+
+        Optional hooks (used by the server GUI):
+          progress_callback(file_idx, n_files, filename, stats, n_sequences) is called before each file
+          and once more after the last one (file_idx == n_files).
+          should_stop() -> bool is polled before each file; True raises ExtractionCancelled.
 
         !!no sos token!! sos token is added during training only for decoder input!!
 
@@ -541,7 +551,13 @@ class MidiProcessor:
         allowed_time_signatures = {(4, 4), (2, 4), (2, 2)}
 
         statistics = ExtractionStats()
+        statistics.files_count = len(selection)
+        self.last_stats = statistics
         for file_idx, filename in enumerate(selection):
+            if should_stop is not None and should_stop():
+                raise ExtractionCancelled()
+            if progress_callback is not None:
+                progress_callback(file_idx, len(selection), filename, statistics, len(self.sequences))
             file_variant_index = sum(ord(ch) for ch in Path(filename).name)
             fanout_state = {
                 'merged_cursors': {},
@@ -817,6 +833,9 @@ class MidiProcessor:
 
                 self.sequences = self.sequences + token_list
                 print('\nTotal Number of Sequences: ', len(self.sequences))
+
+        if progress_callback is not None:
+            progress_callback(len(selection), len(selection), '', statistics, len(self.sequences))
 
         # Filter similar sequences if requested
         statistics.sequences_before_filter = len(self.sequences)

@@ -26,6 +26,8 @@
 10. [Full-Field Render Output Format (.npz)](#10-full-field-render-output-format-npz)
 11. [Threading Model](#11-threading-model)
 12. [Startup and Configuration](#12-startup-and-configuration)
+13. [Training Tab](#13-training-tab)
+14. [Dataset Tab](#14-dataset-tab)
 
 ---
 
@@ -458,3 +460,162 @@ The server is started by running `rbf_server_app.py` directly or via the `main()
 | `RBF_SAMPLE_SEED` | `42` | Random seed for reproducible sample selection |
 
 **Branch-scoped paths:** Model checkpoints and render outputs are scoped to the current git branch via `get_current_branch()` / `safe_branch_name()`. This allows multiple experiment branches to coexist without file conflicts.
+
+---
+
+## 13. Training Tab
+
+The page has two tabs: **Latent Field** (inference, unchanged) and **Training**. Training always runs on the server in a separate worker process (`src/train_worker.py`); the browser is only GUI and monitoring. Reloading the page or connecting later shows the running state including the history so far.
+
+### 13.1 What can be set
+
+| Group | Parameters |
+|---|---|
+| Data | `dataset_name`, `validation_split`, `n_samples` (0 = all), `batch_size`, `seed` |
+| Optimization | `n_epochs`, `learning_rate`, `scheduler_start_lr`, `scheduler_end_lr`, `scheduler_exp_curve_factor`, `weight_decay` |
+| Beta / annealing | `free_bits`, `annealing_slope`, `annealing_list` (table of position/beta rows) |
+| Model | `d_model`, `n_heads`, `n_layers`, `ff_dim`, `dropout`, `latent_dim`, `n_memory_tokens` |
+| Options | `torch_compile` (default on when CUDA and a C compiler exist), event interval |
+
+Token vocabulary and `ranges` are not editable. The values shown are read fresh from `hparams.py`.
+
+**Modes:** *New* starts from scratch. *Resume / retrain* loads a checkpoint (`last`, `best_val`, `best_train`, `none`) including optimizer and scheduler state. In resume mode only fields you changed override the checkpoint's values; the architecture fields are locked and come from the checkpoint. Extra options: keep beta constant, warm-start LR, end-LR factor.
+
+### 13.2 Behaviour
+
+- **Start** validates everything (`validate_train_config`): number ranges, `d_model % n_heads == 0`, annealing positions ascending in [0, 1], dataset and checkpoint exist. Errors are returned per field and shown next to the inputs; no process is started on error. A second start while a run is active is rejected.
+- **Inference is paused** while training runs: running render/decode jobs are cancelled, the model is released (`gc` and `empty_cache`), `app_status.training` is `true`, and the Latent Field tab shows the yellow idle banner "Training läuft". Model/dataset switching is blocked.
+- **Stop** asks the worker to finish the current batch. It then saves `model_last_*.pt` and `model_*.pt` and ends with `stopped = true`. A second click on the (now "Force kill") button kills the process; the last finished epoch checkpoint stays.
+- **After end, stop or failure** the server runs `recheck_resources()`: model and dataset are loaded again and the new checkpoints appear in the checkpoint menus. A crash of the worker only sets state `failed` with a message.
+- **Save to hparams.py** writes only the changed values of the `hyper_params` dict (whitelist above). Comments, formatting and other entries stay as they are. A backup `hparams.py.bak` is written first and the result is validated (parse, exec, value check) before replacing the file. Changing `d_model` changes `d_base`, so `latent_dim` and `ff_dim` follow when they are expressions of `d_base`; the response lists these derived values. Training itself never writes `hparams.py`. The running inference model is unaffected until the server is restarted.
+- On server exit a running worker is terminated (`atexit`).
+
+### 13.3 Socket events and HTTP
+
+| Direction | Event | Payload |
+|---|---|---|
+| client → server | `train_get_config` | – |
+| server → client | `train_config` | `defaults`, `datasets`, `model_options`, `options`, `branch`, `device`, `keys`, `state` |
+| client → server | `train_start` | TrainConfig (below) |
+| server → client | `train_start_result` | `{ok, errors: {field: message}}` |
+| client → server | `train_stop` | `{force?: bool}` |
+| server → client | `train_stop_result` | `{ok}` |
+| client → server | `hparams_save` | `{changes: {key: value}}` |
+| server → client | `hparams_save_result` | `{ok, changed, unchanged, derived, backup, message}` or `{ok: false, errors, message}` |
+| server → client (broadcast, ≤ 4 Hz, on change) | `train_update` | snapshot: `state`, `active`, `stopped`, `config`, `epochs[]`, `batches[]`, `last_batch`, `logs[]`, `checkpoints[]`, `error`, `elapsed`, … |
+
+`GET /api/train/status` returns the same snapshot. `GET /api/health` additionally contains `training`.
+
+States: `idle | starting | running | stopping | finished | failed`.
+
+```text
+TrainConfig:
+  mode: "new" | "resume"
+  resume: {mode: best_val|best_train|last|none, previous: int, continue_beta: bool, start_lr?: float, end_lr_factor?: float}
+  overrides: {key: value}          # whitelist keys only
+  options: {torch_compile: bool, log_interval: int}
+```
+
+### 13.4 Worker event protocol
+
+`train_worker.py --config <json> --stop-file <path>` writes one JSON object per stdout line (everything else, including library output, goes to stderr):
+
+```text
+{"type":"status","text":str}
+{"type":"batch","epoch":int,"step":int,"steps":int,"loss":f,"beta":f,"lr":f,"step_time":f}
+{"type":"epoch","epoch":int,"epochs":int,"train":{loss,rec,kl,ppl},"val":{...}|null,"beta":f,"lr":f,"epoch_time":f,"elapsed":f,"remaining":f}
+{"type":"checkpoint","kind":"last|best_train|best_val|final","path":str}
+{"type":"log","text":str}
+{"type":"done","stopped":bool,"result":{...}}   |   {"type":"error","message":str}
+```
+
+The worker stops on SIGTERM/SIGINT or when the stop file exists (Windows). The server keeps ring buffers of the last epochs, batches and log lines for late-joining clients.
+
+### 13.5 Manual GUI checklist
+
+The frontend cannot be tested without a browser. After changes to `template.html`, check:
+
+1. Tabs switch; the Latent Field tab behaves as before (drag, decode, render). The render heartbeat only runs while that tab is visible.
+2. Training tab shows branch, device and dataset count; the form is filled from `hparams.py`.
+3. Invalid input (e.g. `d_model = 30`, `n_heads = 4`, annealing positions descending, negative LR) shows errors next to the fields and starts nothing.
+4. Start: banner "Training läuft", form locked, Stop enabled, progress bar, charts and log fill live; the Latent Field tab shows the yellow idle banner and its selectors are disabled.
+5. Reload the page during training: state, charts and log are restored.
+6. Stop: state `stopping`, then `finished (stopped)`; `model_last_*` is listed; the Latent Field tab works again and the new checkpoint is in the menu.
+7. Resume: pick a checkpoint, architecture fields are locked, change epochs/LR, start; the epoch counter and optimizer state continue.
+8. Save to hparams.py: message with the changed values; `hparams.py` keeps its comments and `hparams.py.bak` exists.
+9. Start the server without model/dataset: it runs idle, the Training tab is still usable (it needs a dataset in `data/<branch>/` to start).
+
+
+---
+
+## 14. Dataset Tab
+
+The third tab turns the former scripts `data.py` (MIDI folder → dataset), `data_merge.py` and `data_augment.py` into GUI functions. As everywhere in the app, the **browser only shows things**: all paths, all computation and all files live on the server (`src/modules/dataset_tools.py`). Datasets always go to `<project_root>/data/<git-branch>/<name>.npz`.
+
+### 14.1 Functions
+
+| Area | What it does |
+|---|---|
+| **Server folder browser** | *Browse server…* lists the folders of the **server's** file system (shortcuts: Home, `midifiles`, project root, `/Volumes`, `/`). A folder is chosen with *Select this folder*; the server then counts the MIDI files below it (numbered duplicates like `x.1.mid` are ignored, as in `extract`). |
+| **Extract** | Runs `MidiProcessor.extract` in a background thread with all options of `data.py` (pitch mapping, drums only, filter duplicates, clip, Roland, remap, randomize pitches, skip/take, window jump, velocity noise, quantize strength/randomness). Progress (file x of n, sequences so far, skipped-file counters, ETA, log) is shown live and survives a page reload. *Cancel job* stops before the next file and writes nothing. |
+| **Merge** | Concatenates two or more datasets of the branch (= `data_merge.py`), optionally removing duplicate sequences. Sequences of different length are padded; a missing BPM is kept missing. |
+| **Augment** | Note removal, pitch-line removal, global velocity scaling and micro-shifts (= `data_augment.py`); keep percentage, scale and shift lists and an optional seed are settable. The BPM of the source is now preserved in the output metadata. |
+| **Dataset list and statistics** | All datasets of the branch with sequence count, size, type and date. A selected dataset shows a summary, histograms (pitch usage with labels, velocity, microtiming, notes per sequence, BPM) and the meta info. |
+| **Sequence viewer** | Slider / ◀ ▶ / random / arrow keys. A piano roll shows the notes of the sequence (rows = pitches that occur, colour = velocity, micro timing as sub-step offset) with a playhead during playback. |
+| **MIDI playback** | *Connect MIDI* asks the browser for Web MIDI access and lists the output ports **of the computer running the browser**. Start/Stop plays the current sequence (optionally looping) on the chosen port and channel (default 10). The pitch mapping is *chromatic + 36* (like the old server playback) or the generic MIDI mapping; the tempo is the stored BPM unless overridden. *Browser synth* plays a simple preview without a MIDI device. Stop silences hanging notes (note-off for sounding notes + CC 123). |
+
+Web MIDI needs Chrome/Edge/Opera and a secure context: open the server as `http://localhost:<port>` (or via https). Events are scheduled with a short look-ahead (100 ms) so that Stop is nearly immediate.
+
+### 14.2 Dataset file format and meta info
+
+`.npz` with the keys
+
+- `data` — `int` array `(N, max_seq_len)` of tokens (unchanged, so training and the latent field keep working)
+- `metadata` — one `(filename, window_index[, bpm])` per sequence (unchanged)
+- `info` — **new**, optional: a JSON string with the dataset meta info. Datasets without it (older ones) are shown as type *legacy* and get an `info` key the first time their meta info is saved.
+
+Contents of `info`:
+
+| Key | Edited by | Description |
+|---|---|---|
+| `description`, `notes`, `tags`, `custom` | user (Dataset tab → *Save meta info*) | free description, free notes, tag list, custom key/value pairs |
+| `schema`, `kind` (`extract`/`merge`/`augment`/`legacy`), `branch`, `created`, `modified` | automatic | |
+| `source` | automatic | MIDI folder + file count, source datasets of a merge, or the augmented dataset |
+| `options` | automatic | all extraction / merge / augmentation options of the run |
+| `stats` | automatic | summary (sequences, unique sequences, source files, mean notes/tokens, BPM range) and extraction counters |
+
+Saving meta info rewrites the file atomically (temp file + `os.replace`); the sequences and metadata are not changed. Output names must be plain file names (letters, digits, space, `.`, `_`, `-`); existing datasets are only replaced with *overwrite* enabled, and a job never overwrites its own source.
+
+### 14.3 Socket events and HTTP
+
+| Direction | Event | Payload |
+|---|---|---|
+| client → server | `ds_get_state` | – → `ds_state` `{branch, data_dir, datasets[], job, mappings[], hparams}` |
+| client → server | `ds_browse` `{path, show_hidden}` | → `ds_browse_result` `{ok, path, parent, dirs[], midi_files[], midi_count, shortcuts[], error}` |
+| client → server | `ds_scan` `{path}` | → `ds_scan_result` `{ok, midi_files, folders, skipped_numbered_duplicates}` |
+| client → server | `ds_start` `{kind: extract\|merge\|augment, params}` | → `ds_start_result` `{ok, kind, errors{field: message}}` |
+| client → server | `ds_cancel` | → `ds_cancel_result` `{ok}` |
+| client → server | `ds_info` `{name}` | → `ds_info_result` `{ok, dataset{info, stats, shape, path, …}}` |
+| client → server | `ds_sequence` `{name, index}` | → `ds_sequence_result` `{ok, sequence{notes[], bpm, filename, window, …}}` |
+| client → server | `ds_save_info` `{name, patch}` | → `ds_save_info_result` `{ok, info}` |
+| server → all | `ds_update` | job snapshot `{state, kind, phase, progress, done, total, message, stats, logs[], result, error, elapsed, eta}` (≈ 4 Hz, only on change) |
+| server → all | `ds_list` | `{datasets[], state}` after a job ended or meta info was saved |
+
+`GET /api/dataset/status` returns the job snapshot. Only one dataset job runs at a time; a second `ds_start` is rejected with a message. Job states: `idle`, `running`, `cancelling`, `finished`, `failed`, `cancelled`. A failing job (even a hard `exit()` inside the extractor) only ends the job, never the server.
+
+### 14.4 Tests
+
+- `python tests/test_dataset_tools.py` — folder browser, extraction with progress, statistics, sequence view, meta info, legacy datasets, merge, augmentation, cancel, failure (isolated branch folder `data/test-dataset-tools`, removed afterwards).
+- `python tests/test_dataset_server.py` — the same through the Socket.IO test client, including the broadcast of progress.
+
+### 14.5 Manual GUI checklist
+
+1. The tab bar shows *Latent Field | Training | Dataset*; `#dataset` opens the tab directly. The Latent Field tab behaves as before.
+2. *Browse server…* shows server folders; Up, shortcuts, typing a path + Enter and *show hidden folders* work; *Select this folder* fills the field and shows the MIDI file count.
+3. Start an extraction with a name that already exists: the error is shown at the name field. With a new name the progress bar, counters and log update live; reloading the page keeps the job visible; *Cancel job* stops it and nothing is written.
+4. After a finished job the banner names the new dataset, which is selected automatically; it appears in the list, in the merge list, in the augment source menu and (after a moment) in the Training tab's dataset menu.
+5. Statistics: five charts are drawn, hovering a bar shows its value; resizing the window redraws them.
+6. Meta info: edit description, tags, notes and custom fields, *Save meta info*, reload the page and select the dataset again — the values are still there.
+7. Sequence viewer: slider, ◀ ▶, arrow keys and *Random* change the piano roll and the info line (file, window, BPM, notes, tokens).
+8. Playback: *Connect MIDI* (Chrome/Edge, `http://localhost`), choose a port, channel 10, *Start playback* — notes arrive on the port, the playhead runs, *Stop* silences everything; with *Browser synth* a click track is audible. Leaving the tab stops playback.
+9. Start the server without any dataset: the tab shows "no dataset found"; extraction still works and creates the first dataset.

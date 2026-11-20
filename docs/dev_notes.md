@@ -66,3 +66,8 @@ functions
 - exp 02
   - model_2026-04-27_13-26-37.pt
   - big model strong overfit,used for overfitting retraining
+
+
+### compund tokens
+- KV-Cache: speichert die bereits autoregressiv berechneten Werte, um die Berechnung zu beschleunigen und die Rechenzeit zu reduzieren.
+- Interpolationsglätte hängt von beta, free_bits und kl-druck ab. 

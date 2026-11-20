@@ -1,11 +1,24 @@
 from __future__ import annotations
 
+import atexit
+import gc
+import json
+import math
 import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
 import threading
+import time
+from collections import deque
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import traceback
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -13,8 +26,12 @@ import torch
 from flask import Flask, render_template, request, send_from_directory
 from flask_socketio import SocketIO, emit
 
+from hparams import hparams as _DEFAULT_HPARAMS
 from modules.branch_paths import get_current_branch, project_root, safe_branch_name
+from modules import dataset_tools
+from modules.hparams_io import HparamsSaveError, read_hparams, save_hparams
 from modules.radial_basis_function import compute_rbf_weights, rbf_interpolate_exact
+from modules.train_params import ALLOWED_KEYS, ARCHITECTURE_KEYS, MODEL_KEYS, TRAIN_KEYS, coerce_param
 from modules.utilities import load_dataset, load_model, pick_reproducible_samples
 
 
@@ -38,6 +55,15 @@ def _normalize_heatmap(heatmap: np.ndarray) -> np.ndarray:
     if h_max <= h_min:
         return np.zeros_like(heatmap, dtype=np.float32)
     return ((heatmap - h_min) / (h_max - h_min)).astype(np.float32)
+
+
+def _safe_rbf_weights(points: np.ndarray, targets: np.ndarray, sigma: float, **kwargs) -> np.ndarray:
+    """compute_rbf_weights that tolerates an empty anchor set (no model / no dataset)."""
+    targets = np.asarray(targets, dtype=np.float32)
+    if len(points) == 0 or targets.shape[0] == 0:
+        cols = int(targets.shape[1]) if targets.ndim > 1 else 1
+        return np.zeros((0, cols), dtype=np.float32)
+    return compute_rbf_weights(points, targets, sigma=sigma, **kwargs)
 
 
 def _clamp_sample_count(value: int, max_count: int) -> int:
@@ -99,6 +125,9 @@ _ANCHOR0_HIDDEN_FALLBACK_MODES = {
 }
 
 RETOKENIZE = False
+# Number of grid cells decoded together (batched greedy decoding with KV-cache) in the full-field render.
+# Can be overridden via the RBF_DECODE_BATCH_SIZE environment variable.
+DECODE_BATCH_SIZE = max(1, int(os.environ.get("RBF_DECODE_BATCH_SIZE", "64")))
 DEBUG_CONTROL_POINTS = str(os.environ.get("RBF_DEBUG_CONTROL_POINTS", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -155,11 +184,13 @@ def _lerp_scalar(fallback_value: float, rbf_value: float, alpha: float) -> float
 
 
 class FullFieldRenderManager:
-    def __init__(self, runtime: "CudaRBFRuntime", hparams, retokenize: bool = False):
+    def __init__(self, runtime: "CudaRBFRuntime", hparams, retokenize: bool = False, decode_batch_size: int = DECODE_BATCH_SIZE):
         self.runtime = runtime
         self.hparams = hparams
         self.retokenize = bool(retokenize)
+        self.decode_batch_size = max(1, int(decode_batch_size))
         self._lock = threading.RLock()
+        self._threads: list[threading.Thread] = []
         self._current_job_id = 0
         self._cancel_event = None
         self._latest_generation = 0
@@ -242,12 +273,24 @@ class FullFieldRenderManager:
             ),
             daemon=True,
         )
+        with self._lock:
+            self._threads = [t for t in self._threads if t.is_alive()] + [thread]
         thread.start()
 
     def cancel_render(self):
         with self._lock:
             if self._cancel_event is not None:
                 self._cancel_event.set()
+
+    def shutdown(self, timeout: float = 30.0):
+        """Cancel the running render and wait until its worker threads are gone (so the model can be released)."""
+        self.cancel_render()
+        with self._lock:
+            threads = list(self._threads)
+        deadline = time.time() + float(timeout)
+        for thread in threads:
+            if thread is not threading.current_thread():
+                thread.join(max(0.0, deadline - time.time()))
 
     def consume_latest_update(self):
         with self._lock:
@@ -424,9 +467,33 @@ class FullFieldRenderManager:
             return float(np.asarray(bpm).reshape(-1)[0])
 
         try:
-            for row in range(int(grid_resolution)):
+            grid_n = int(grid_resolution)
+            decode_batch_size = max(1, int(self.decode_batch_size))
+            chunk_latents: list[np.ndarray] = []
+
+            def _flush_chunk():
+                nonlocal completed
+                if not chunk_latents:
+                    return
+                matrices, token_lists = self.runtime.decode_latents_to_matrices(
+                    np.stack(chunk_latents, axis=0), return_tokens=True, batch_size=decode_batch_size
+                )
+                for matrix, original_tokens in zip(matrices, token_lists):
+                    if self.retokenize:
+                        tokens = self.runtime._tokens_from_matrix_buffer(matrix)
+                    else:
+                        tokens = original_tokens
+                    normalized = self._normalize_tokens(tokens, sequence_len, pad_token)
+                    sequences_flat.extend(normalized.tolist())
+                completed += len(chunk_latents)
+                chunk_latents.clear()
+                self._publish_update(job_id, "rendering", completed, total)
+
+            # Latents/BPMs are computed cell by cell in row-major order (the "last valid latent" fallback
+            # depends on this order). The expensive decoding is batched over blocks of cells.
+            for row in range(grid_n):
                 wy = -field_half_extent + (row + 0.5) * cell_size
-                for col in range(int(grid_resolution)):
+                for col in range(grid_n):
                     if cancel_event.is_set():
                         self._publish_update(job_id, "cancelled", completed, total)
                         return
@@ -434,18 +501,16 @@ class FullFieldRenderManager:
                     wx = -field_half_extent + (col + 0.5) * cell_size
                     cursor = np.asarray([wx, wy], dtype=np.float32)
 
-                    latent = _cell_latent(cursor)
-                    matrix, original_tokens = self.runtime.decode_latent_to_matrix(latent, return_tokens=True)
-                    if self.retokenize:
-                        tokens = self.runtime._tokens_from_matrix_buffer(matrix)
-                    else:
-                        tokens = original_tokens
-                    normalized = self._normalize_tokens(tokens, sequence_len, pad_token)
-                    sequences_flat.extend(normalized.tolist())
+                    chunk_latents.append(_cell_latent(cursor))
                     bpms.append(_cell_bpm(cursor))
 
-                    completed += 1
-                    self._publish_update(job_id, "rendering", completed, total)
+                    if len(chunk_latents) >= decode_batch_size:
+                        _flush_chunk()
+                        if cancel_event.is_set():
+                            self._publish_update(job_id, "cancelled", completed, total)
+                            return
+
+            _flush_chunk()
 
             timestamp = datetime.now(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d_%H-%M-%S")
             output_dir = project_root() / "outputs" / branch_name
@@ -503,6 +568,7 @@ class RealtimeDecoderManager:
         self.max_len = int(hparams.max_seq_len)
 
         self._lock = threading.RLock()
+        self._threads: list[threading.Thread] = []
         self._current_job_id = 0
         self._cancel_event = None
         self._latest_generation = 0
@@ -531,7 +597,20 @@ class RealtimeDecoderManager:
             args=(job_id, latent_vector, seed_matrix.copy(), cancel_event),
             daemon=True,
         )
+        with self._lock:
+            self._threads = [t for t in self._threads if t.is_alive()] + [thread]
         thread.start()
+
+    def shutdown(self, timeout: float = 30.0):
+        """Cancel the running decode and wait until its worker threads are gone (so the model can be released)."""
+        with self._lock:
+            if self._cancel_event is not None:
+                self._cancel_event.set()
+            threads = list(self._threads)
+        deadline = time.time() + float(timeout)
+        for thread in threads:
+            if thread is not threading.current_thread():
+                thread.join(max(0.0, deadline - time.time()))
 
     def consume_latest_update(self):
         with self._lock:
@@ -586,9 +665,9 @@ class RealtimeDecoderManager:
         display_matrix = seed_matrix.copy()
 
         z = torch.from_numpy(latent_vector).to(self.device, dtype=torch.float32).unsqueeze(0)
-        memory = self.decoder.z_to_mem(z).view(1, self.decoder.n_memory_tokens, self.decoder.emb_size)
-        cur_tokens = torch.full((1, 1), sos_token, dtype=torch.long, device=self.device)
-        beat_tokens = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        with torch.no_grad():
+            cache = self.decoder.init_cache(z)
+        cur_tokens = torch.full((1,), sos_token, dtype=torch.long, device=self.device)
 
         step_idx = 0
         pending_pitch = None
@@ -599,33 +678,14 @@ class RealtimeDecoderManager:
                 self._publish_update(job_id, display_matrix, step_idx, "cancelled")
                 return
 
-            t = cur_tokens.shape[1]
-            if t > self.decoder.max_seq_len:
+            if cache['pos'] >= self.decoder.max_seq_len:
                 break
 
             with torch.no_grad():
-                emb = self.decoder.token_embedding(cur_tokens)
-                beat_emb = self.decoder.beat_embedding(beat_tokens)
-                emb = self.decoder.projection(torch.cat((emb, beat_emb), dim=-1))
-                pos_emb = self.decoder.pos_embedding(torch.arange(t, device=self.device)).unsqueeze(0)
-                emb = emb + pos_emb
-                tgt_mask = torch.nn.Transformer.generate_square_subsequent_mask(t).to(self.device)
-                tgt_key_padding_mask = (cur_tokens == self.decoder.pad_token).float()
-                out = self.decoder.transformer_decoder(
-                    tgt=emb,
-                    memory=memory,
-                    tgt_mask=tgt_mask,
-                    tgt_key_padding_mask=tgt_key_padding_mask,
-                )
-                logits = self.decoder.fc_out(out)
-                next_tok = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                logits = self.decoder.decode_step(cur_tokens, cache)
+                cur_tokens = torch.argmax(logits, dim=-1)
 
-            token = int(next_tok.item())
-            cur_tokens = torch.cat([cur_tokens, next_tok], dim=1)
-            is_step = (cur_tokens == step_token).to(torch.long)
-            beat_tokens = torch.cumsum(is_step, dim=1)
-            beat_tokens += 1
-            beat_tokens[:, 0] = 0
+            token = int(cur_tokens.item())
 
             if token == eos_token:
                 break
@@ -692,18 +752,15 @@ class CudaRBFRuntime:
             matrix[row, s:s + first] = value
             matrix[row, 0:length - first] = value
 
-    def decode_latent_to_matrix(self, latent_vector: np.ndarray, return_tokens: bool = False) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    def _tokens_to_matrix(self, tokens) -> np.ndarray:
+        """Parse a generated token sequence (pitch, velocity, timing triplets and STEP tokens) into a note matrix."""
         h = self.hparams
         n_timing = int(h.n_timing)
         cols = int(h.width * n_timing)
         matrix = np.zeros((int(h.height), cols), dtype=np.float32)
 
-        z = torch.from_numpy(latent_vector.astype(np.float32)).to(self.device).unsqueeze(0)
-        memory = self.decoder.z_to_mem(z).view(1, self.decoder.n_memory_tokens, self.decoder.emb_size)
-
         step_token = int(h.step_token)
         eos_token = int(h.eos_token)
-        sos_token = int(h.sos_token)
         min_pitch_token = int(h.min_pitch_token)
         max_pitch_token = int(h.max_pitch_token)
         min_vel_token = int(h.min_vel_token)
@@ -713,66 +770,74 @@ class CudaRBFRuntime:
         center_timing_token = int(h.center_timing_token)
         note_len = max(1, n_timing // 2)
 
-        cur_tokens = torch.full((1, 1), sos_token, dtype=torch.long, device=self.device)
-        beat_tokens = torch.zeros((1, 1), dtype=torch.long, device=self.device)
         step_idx = 0
         pending_pitch = None
         pending_vel = None
-        generated_tokens: list[int] = []
 
+        for token in np.asarray(tokens, dtype=np.int64).reshape(-1).tolist():
+            if token == eos_token:
+                break
+            if token == step_token:
+                step_idx += 1
+                continue
+            if min_pitch_token <= token < max_pitch_token:
+                pending_pitch = token
+                pending_vel = None
+                continue
+            if pending_pitch is not None and min_vel_token <= token < max_vel_token:
+                pending_vel = token
+                continue
+            if pending_pitch is not None and pending_vel is not None and min_timing_token <= token < max_timing_token:
+                pitch_idx = pending_pitch - min_pitch_token
+                timing = token - center_timing_token
+                vel = (pending_vel - min_vel_token) / max(1, int(h.n_vel) - 1)
+                start = step_idx * n_timing + timing
+                self._write_wrapped_segment(matrix, pitch_idx, start, note_len, float(vel))
+                pending_pitch = None
+                pending_vel = None
+
+        return matrix
+
+    def decode_latents_to_matrices(
+        self,
+        latent_vectors: np.ndarray,
+        return_tokens: bool = False,
+        batch_size: int = 64,
+    ) -> list[np.ndarray] | tuple[list[np.ndarray], list[np.ndarray]]:
+        """Decode many latent vectors at once (batched greedy decoding with KV-cache).
+
+        Returns one matrix per latent (and, optionally, the generated tokens up to and including EOS).
+        """
+        latents = np.asarray(latent_vectors, dtype=np.float32)
+        if latents.ndim == 1:
+            latents = latents.reshape(1, -1)
+        eos_token = int(self.hparams.eos_token)
+        max_len = int(self.hparams.max_seq_len)
+        batch_size = max(1, int(batch_size))
+
+        matrices: list[np.ndarray] = []
+        token_lists: list[np.ndarray] = []
         with torch.no_grad():
-            for _ in range(int(h.max_seq_len)):
-                t = cur_tokens.shape[1]
-                if t > self.decoder.max_seq_len:
-                    break
-                emb = self.decoder.token_embedding(cur_tokens)
-                beat_emb = self.decoder.beat_embedding(beat_tokens)
-                emb = self.decoder.projection(torch.cat((emb, beat_emb), dim=-1))
-                pos_emb = self.decoder.pos_embedding(torch.arange(t, device=self.device)).unsqueeze(0)
-                emb = emb + pos_emb
-                tgt_mask = torch.nn.Transformer.generate_square_subsequent_mask(t).to(self.device)
-                tgt_key_padding_mask = (cur_tokens == self.decoder.pad_token).float()
-                out = self.decoder.transformer_decoder(
-                    tgt=emb,
-                    memory=memory,
-                    tgt_mask=tgt_mask,
-                    tgt_key_padding_mask=tgt_key_padding_mask,
-                )
-                logits = self.decoder.fc_out(out)
-                next_tok = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-                token = int(next_tok.item())
-                generated_tokens.append(token)
-
-                cur_tokens = torch.cat([cur_tokens, next_tok], dim=1)
-                is_step = (cur_tokens == step_token).to(torch.long)
-                beat_tokens = torch.cumsum(is_step, dim=1)
-                beat_tokens += 1
-                beat_tokens[:, 0] = 0
-
-                if token == eos_token:
-                    break
-                if token == step_token:
-                    step_idx += 1
-                    continue
-                if min_pitch_token <= token < max_pitch_token:
-                    pending_pitch = token
-                    pending_vel = None
-                    continue
-                if pending_pitch is not None and min_vel_token <= token < max_vel_token:
-                    pending_vel = token
-                    continue
-                if pending_pitch is not None and pending_vel is not None and min_timing_token <= token < max_timing_token:
-                    pitch_idx = pending_pitch - min_pitch_token
-                    timing = token - center_timing_token
-                    vel = (pending_vel - min_vel_token) / max(1, int(h.n_vel) - 1)
-                    start = step_idx * n_timing + timing
-                    self._write_wrapped_segment(matrix, pitch_idx, start, note_len, float(vel))
-                    pending_pitch = None
-                    pending_vel = None
+            for start in range(0, latents.shape[0], batch_size):
+                z = torch.from_numpy(latents[start:start + batch_size]).to(self.device)
+                generated = self.decoder.generate(z, max_len=max_len, sample=False, pad_after_eos=True)
+                generated = generated.detach().cpu().numpy().astype(np.int64)
+                for row in generated:
+                    eos_pos = np.flatnonzero(row == eos_token)
+                    seq = row[: int(eos_pos[0]) + 1] if eos_pos.size else row
+                    token_lists.append(seq)
+                    matrices.append(self._tokens_to_matrix(seq))
 
         if return_tokens:
-            return matrix, np.asarray(generated_tokens, dtype=np.int64)
-        return matrix
+            return matrices, token_lists
+        return matrices
+
+    def decode_latent_to_matrix(self, latent_vector: np.ndarray, return_tokens: bool = False) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+        latent = np.asarray(latent_vector, dtype=np.float32).reshape(1, -1)
+        if return_tokens:
+            matrices, token_lists = self.decode_latents_to_matrices(latent, return_tokens=True, batch_size=1)
+            return matrices[0], token_lists[0]
+        return self.decode_latents_to_matrices(latent, batch_size=1)[0]
 
     def _tokens_from_matrix_buffer(self, matrix_buffer: np.ndarray) -> np.ndarray:
         h = self.hparams
@@ -846,6 +911,454 @@ class CudaRBFRuntime:
         return mu.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
 
+TRAIN_WORKER_PATH = Path(__file__).resolve().parent / "train_worker.py"
+TRAIN_RESUME_MODES = ("best_val", "best_train", "last", "none")
+
+# key -> (min, max, min_inclusive, max_inclusive)
+_TRAIN_RANGES = {
+    "validation_split": (0.0, 1.0, True, False),
+    "batch_size": (1, 65536, True, True),
+    "n_epochs": (1, 100000, True, True),
+    "learning_rate": (0.0, 1.0, False, True),
+    "scheduler_start_lr": (0.0, 1.0, False, True),
+    "scheduler_end_lr": (0.0, 1.0, True, True),
+    "scheduler_exp_curve_factor": (-50.0, 50.0, True, True),
+    "weight_decay": (0.0, 10.0, True, True),
+    "n_samples": (0, 10 ** 9, True, True),
+    "free_bits": (0.0, 100.0, True, True),
+    "annealing_slope": (0.0, 1.0, True, True),
+    "seed": (0, 2 ** 32 - 1, True, True),
+    "d_model": (8, 8192, True, True),
+    "n_heads": (1, 64, True, True),
+    "n_layers": (1, 64, True, True),
+    "ff_dim": (1, 65536, True, True),
+    "dropout": (0.0, 1.0, True, False),
+    "latent_dim": (1, 8192, True, True),
+    "n_memory_tokens": (1, 512, True, True),
+}
+
+
+def validate_train_config(raw, available_datasets, checkpoint_count, defaults) -> tuple[dict, dict]:
+    """Validate a TrainConfig coming from the browser.
+
+    Returns (clean_config, errors). errors maps a field name (or "general") to a message; the config may only be
+    used when errors is empty. checkpoint_count(mode) -> number of checkpoints available for a resume mode.
+    """
+    errors: dict[str, str] = {}
+    raw = raw if isinstance(raw, dict) else {}
+    defaults = defaults or {}
+
+    mode = str(raw.get("mode", "new")).lower()
+    if mode not in ("new", "resume"):
+        errors["mode"] = "must be 'new' or 'resume'"
+        mode = "new"
+    clean: dict = {"mode": mode, "overrides": {}, "options": {}}
+
+    raw_overrides = raw.get("overrides") or {}
+    if not isinstance(raw_overrides, dict):
+        errors["general"] = "overrides must be an object"
+        raw_overrides = {}
+
+    overrides = clean["overrides"]
+    for key, value in raw_overrides.items():
+        if key not in ALLOWED_KEYS:
+            errors[key] = "unknown parameter"
+            continue
+        if mode == "resume" and key in ARCHITECTURE_KEYS:
+            continue  # architecture comes from the checkpoint
+        try:
+            overrides[key] = coerce_param(key, value)
+        except ValueError as exc:
+            errors[key] = str(exc)
+
+    for key, (lo, hi, lo_incl, hi_incl) in _TRAIN_RANGES.items():
+        if key not in overrides or key in errors:
+            continue
+        value = overrides[key]
+        if (value < lo if lo_incl else value <= lo) or (value > hi if hi_incl else value >= hi):
+            left = "[" if lo_incl else "("
+            right = "]" if hi_incl else ")"
+            errors[key] = f"must be in {left}{lo}, {hi}{right}"
+
+    points = overrides.get("annealing_list")
+    if points is not None and "annealing_list" not in errors:
+        if len(points) < 2:
+            errors["annealing_list"] = "needs at least two points"
+        elif any(not (0.0 <= x <= 1.0) for x, _ in points):
+            errors["annealing_list"] = "positions must be within [0, 1]"
+        elif any(points[i][0] >= points[i + 1][0] for i in range(len(points) - 1)):
+            errors["annealing_list"] = "positions must be strictly ascending"
+        elif any(y < 0.0 or y > 100.0 for _, y in points):
+            errors["annealing_list"] = "beta values must be in [0, 100]"
+
+    if mode == "new":
+        d_model = overrides.get("d_model", defaults.get("d_model"))
+        n_heads = overrides.get("n_heads", defaults.get("n_heads"))
+        if d_model and n_heads and "d_model" not in errors and "n_heads" not in errors and int(d_model) % int(n_heads) != 0:
+            errors["d_model"] = f"must be divisible by n_heads ({n_heads})"
+            errors["n_heads"] = f"must divide d_model ({d_model})"
+
+    if not available_datasets:
+        errors["general"] = "No dataset found for this branch (data/<branch>/*.npz)."
+    else:
+        if "dataset_name" in overrides:
+            wanted = overrides["dataset_name"]
+        else:
+            wanted = defaults.get("dataset_name") if mode == "new" else None
+        if wanted is not None and wanted not in available_datasets and "dataset_name" not in errors:
+            errors["dataset_name"] = f"dataset '{wanted}' not found"
+
+    resume_raw = raw.get("resume") or {}
+    if mode == "resume":
+        if not isinstance(resume_raw, dict):
+            errors["general"] = "resume must be an object"
+            resume_raw = {}
+        resume_mode = str(resume_raw.get("mode", "last")).lower()
+        if resume_mode not in TRAIN_RESUME_MODES:
+            errors["resume_mode"] = f"must be one of {', '.join(TRAIN_RESUME_MODES)}"
+            resume_mode = "last"
+        try:
+            previous = coerce_param_number(resume_raw.get("previous", 0), integer=True)
+        except ValueError as exc:
+            errors["resume_previous"] = str(exc)
+            previous = 0
+        if previous < 0:
+            errors["resume_previous"] = "must be >= 0"
+        resume_clean = {"mode": resume_mode, "previous": previous, "continue_beta": bool(resume_raw.get("continue_beta", False))}
+        for key, field in (("start_lr", "resume_start_lr"), ("end_lr_factor", "resume_end_lr_factor")):
+            if resume_raw.get(key) not in (None, ""):
+                try:
+                    number = coerce_param_number(resume_raw[key])
+                    if number <= 0.0:
+                        raise ValueError("must be > 0")
+                    resume_clean[key] = number
+                except ValueError as exc:
+                    errors[field] = str(exc)
+        if "resume_mode" not in errors and "resume_previous" not in errors:
+            if checkpoint_count(resume_mode) <= previous:
+                errors["resume_mode"] = f"no '{resume_mode}' checkpoint #{previous} available"
+        clean["resume"] = resume_clean
+
+    options_raw = raw.get("options") or {}
+    options_raw = options_raw if isinstance(options_raw, dict) else {}
+    clean["options"]["torch_compile"] = bool(options_raw.get("torch_compile", True))
+    try:
+        log_interval = coerce_param_number(options_raw.get("log_interval", 25), integer=True)
+        if not (1 <= log_interval <= 1000):
+            raise ValueError("must be in [1, 1000]")
+        clean["options"]["log_interval"] = log_interval
+    except ValueError as exc:
+        errors["log_interval"] = str(exc)
+
+    return clean, errors
+
+
+def coerce_param_number(value, integer: bool = False):
+    """Small helper for options that are not part of the hparams whitelist."""
+    if isinstance(value, bool):
+        raise ValueError("must be a number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("must be a number")
+    if not math.isfinite(number):
+        raise ValueError("must be finite")
+    if integer:
+        if abs(number - round(number)) > 1e-9:
+            raise ValueError("must be an integer")
+        return int(round(number))
+    return number
+
+
+class TrainingManager:
+    """Runs one training in a subprocess (train_worker.py) and keeps its progress for late-joining clients.
+
+    States: idle | starting | running | stopping | finished | failed.
+    The worker writes one JSON event per stdout line; a reader thread folds them into this object.
+    `version` increases with every change so the broadcast loop only emits when something happened.
+    """
+
+    ACTIVE_STATES = ("starting", "running", "stopping")
+
+    def __init__(self, on_finish=None, worker_path: Path | None = None, max_epochs: int = 5000, max_logs: int = 400, max_batches: int = 600):
+        self._lock = threading.RLock()
+        self._on_finish = on_finish
+        self._worker_path = Path(worker_path) if worker_path else TRAIN_WORKER_PATH
+        self._max_epochs = int(max_epochs)
+        self._max_logs = int(max_logs)
+        self._max_batches = int(max_batches)
+        self._proc: subprocess.Popen | None = None
+        self._proc_alive = False
+        self._finalizing = False
+        self._stop_requested = False
+        self._tmpdir: str | None = None
+        self._stop_file: str | None = None
+        self._stderr_tail: deque = deque(maxlen=40)
+        self._stderr_thread: threading.Thread | None = None
+        self._done_event: dict | None = None
+        self._error_event: dict | None = None
+        self.version = 0
+        self._reset_run()
+
+    # ------------------------------------------------------------------ state helpers
+    def _reset_run(self):
+        self.state = "idle"
+        self.config: dict | None = None
+        self.epochs: deque = deque(maxlen=self._max_epochs)
+        self.batches: deque = deque(maxlen=self._max_batches)
+        self.last_batch: dict | None = None
+        self.logs: deque = deque(maxlen=self._max_logs)
+        self.checkpoints: list[dict] = []
+        self.error: str | None = None
+        self.status_text = ""
+        self.stopped = False
+        self.pid: int | None = None
+        self.started_at: float | None = None
+        self.finished_at: float | None = None
+        self._done_event = None
+        self._error_event = None
+        self._stop_requested = False
+        self._stderr_tail.clear()
+
+    def _bump(self):
+        self.version += 1
+
+    def _append_log(self, text: str):
+        self.logs.append({"t": time.time(), "text": str(text)})
+
+    def is_active(self) -> bool:
+        """True while the worker process exists (inference must stay paused)."""
+        with self._lock:
+            return bool(self._proc_alive)
+
+    # ------------------------------------------------------------------ start / stop
+    def start(self, config: dict, before_spawn=None):
+        with self._lock:
+            if self._proc_alive or self._finalizing:
+                raise RuntimeError("A training is already running.")
+            self._reset_run()
+            self._proc_alive = True
+            self.state = "starting"
+            self.config = config
+            self.started_at = time.time()
+            self.status_text = "starting"
+            self._bump()
+
+        try:
+            if before_spawn is not None:
+                before_spawn()
+            tmpdir = tempfile.mkdtemp(prefix="rbf_train_")
+            config_path = os.path.join(tmpdir, "config.json")
+            stop_file = os.path.join(tmpdir, "STOP")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump(config, handle)
+            env = dict(os.environ)
+            env["PYTHONUNBUFFERED"] = "1"
+            proc = subprocess.Popen(
+                [sys.executable, str(self._worker_path), "--config", config_path, "--stop-file", stop_file],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                cwd=str(self._worker_path.parent),
+                env=env,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            self._finalize(returncode=None, message=f"Failed to start training: {exc}")
+            raise
+
+        with self._lock:
+            self._proc = proc
+            self._tmpdir = tmpdir
+            self._stop_file = stop_file
+            self.pid = proc.pid
+            stop_now = self._stop_requested
+        self._stderr_thread = threading.Thread(target=self._read_stderr, args=(proc,), daemon=True)
+        self._stderr_thread.start()
+        threading.Thread(target=self._read_stdout, args=(proc,), daemon=True).start()
+        if stop_now:
+            self._signal_stop(proc, stop_file)
+
+    def _signal_stop(self, proc, stop_file):
+        if stop_file:
+            try:
+                Path(stop_file).touch()
+            except OSError:
+                pass
+        if proc is not None and os.name != "nt":
+            try:
+                proc.send_signal(signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+
+    def stop(self, force: bool = False) -> bool:
+        """Ask the worker to stop after the current batch. force=True kills the process immediately."""
+        with self._lock:
+            if not self._proc_alive:
+                return False
+            self._stop_requested = True
+            if self.state in ("starting", "running"):
+                self.state = "stopping"
+                self.status_text = "stopping"
+                self._bump()
+            proc = self._proc
+            stop_file = self._stop_file
+        if force and proc is not None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        else:
+            self._signal_stop(proc, stop_file)
+        return True
+
+    def terminate(self, timeout: float = 30.0):
+        """Used at server shutdown: stop the worker and make sure it does not outlive the server."""
+        if not self.stop():
+            return
+        with self._lock:
+            proc = self._proc
+        if proc is None:
+            return
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    # ------------------------------------------------------------------ reader threads
+    def _read_stderr(self, proc):
+        try:
+            for line in proc.stderr:
+                text = line.rstrip("\n")
+                if text:
+                    self._stderr_tail.append(text)
+                    print(f"[train] {text}", file=sys.stderr, flush=True)
+        except (ValueError, OSError):
+            pass
+
+    def _read_stdout(self, proc):
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    with self._lock:
+                        self._append_log(line)
+                        self._bump()
+                    continue
+                if isinstance(event, dict):
+                    self._handle_event(event)
+        except (ValueError, OSError):
+            pass
+        finally:
+            try:
+                returncode = proc.wait()
+            except Exception:
+                returncode = None
+            self._finalize(returncode=returncode)
+
+    def _handle_event(self, event: dict):
+        kind = event.get("type")
+        with self._lock:
+            if self.state == "starting":
+                self.state = "running"
+            if kind == "status":
+                self.status_text = str(event.get("text", ""))
+                self._append_log(self.status_text)
+            elif kind == "batch":
+                self.last_batch = event
+                self.batches.append({k: event.get(k) for k in ("epoch", "step", "steps", "loss", "beta", "lr")})
+            elif kind == "epoch":
+                self.epochs.append(event)
+            elif kind == "checkpoint":
+                self.checkpoints.append({"kind": event.get("kind"), "path": event.get("path"), "time": time.time()})
+            elif kind == "log":
+                self._append_log(event.get("text", ""))
+            elif kind == "done":
+                self._done_event = event
+                self.stopped = bool(event.get("stopped"))
+            elif kind == "error":
+                self._error_event = event
+                self._append_log(f"ERROR: {event.get('message', '')}")
+            self._bump()
+
+    def _finalize(self, returncode, message: str | None = None):
+        with self._lock:
+            if self._finalizing:
+                return
+            self._finalizing = True
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=2.0)
+
+        error = None
+        with self._lock:
+            if self._error_event is not None:
+                error = str(self._error_event.get("message") or "Training failed")
+            elif self._done_event is None:
+                if message:
+                    error = message
+                elif returncode not in (0, None):
+                    if self._stop_requested:
+                        self.stopped = True
+                        self.status_text = "terminated"
+                    else:
+                        tail = " | ".join(list(self._stderr_tail)[-3:])
+                        error = f"Training process exited with code {returncode}" + (f": {tail}" if tail else "")
+            final_state = "failed" if error else "finished"
+            self._proc_alive = False  # inference may come back from here on
+            tmpdir = self._tmpdir
+            self._tmpdir = None
+
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        if self._on_finish is not None:
+            try:
+                self._on_finish(final_state)
+            except Exception:
+                traceback.print_exc()
+
+        with self._lock:
+            self.state = final_state
+            self.error = error
+            self.finished_at = time.time()
+            self._proc = None
+            self._finalizing = False
+            self._bump()
+
+    # ------------------------------------------------------------------ snapshot
+    def snapshot(self) -> dict:
+        with self._lock:
+            now = time.time()
+            elapsed = None
+            if self.started_at is not None:
+                elapsed = (self.finished_at or now) - self.started_at
+            return {
+                "state": self.state,
+                "active": self.state in self.ACTIVE_STATES,
+                "stopped": bool(self.stopped),
+                "status_text": self.status_text,
+                "config": self.config,
+                "epochs": list(self.epochs),
+                "batches": list(self.batches),
+                "last_batch": self.last_batch,
+                "logs": list(self.logs),
+                "checkpoints": list(self.checkpoints),
+                "error": self.error,
+                "pid": self.pid,
+                "started_at": self.started_at,
+                "finished_at": self.finished_at,
+                "elapsed": elapsed,
+                "version": self.version,
+            }
+
+
 class RBFServerController:
     MODE_LABELS = {
         "best_val": "best_val",
@@ -890,6 +1403,8 @@ class RBFServerController:
 
     def _compute_bpm_weights(self, control_points: np.ndarray, sigma: float) -> np.ndarray:
         bpm_targets = self.anchor_bpms.reshape(-1, 1).astype(np.float32)
+        if len(control_points) == 0 or bpm_targets.shape[0] == 0:
+            return np.zeros((0, 1), dtype=np.float32)
         try:
             # Use zero ridge first so anchors reproduce their source BPM exactly.
             return compute_rbf_weights(control_points, bpm_targets, sigma=sigma, lambd=0.0)
@@ -1013,20 +1528,23 @@ class RBFServerController:
         self.selected_mode = "none"
         self.selected_previous = 0
 
-        for candidate in ["none", "best_val", "best_train", "last"]:
-            if self._mode_files_static(candidate):
-                self.selected_mode = candidate
-                break
-
-        checkpoint_kind = None if self.selected_mode == "none" else self.selected_mode
-
-        self.runtime = CudaRBFRuntime(previous=self.selected_previous, checkpoint_kind=checkpoint_kind, retokenize=RETOKENIZE)
-        self.hparams = self.runtime.hparams
+        # The app also starts without a model and/or dataset: it then runs idle and reports what is missing.
+        self.hparams = SimpleNamespace(**vars(_DEFAULT_HPARAMS))
+        self.runtime = None
+        self.decoder_manager = None
+        self.render_manager = None
+        self.model_error: str | None = None
+        self.dataset_error: str | None = None
+        self.dataset_name = ""
+        self.latent_vectors = np.zeros((0, int(getattr(self.hparams, "latent_dim", 0) or 0)), dtype=np.float32)
+        self.labels: list[str] = []
+        self.anchor_bpms = np.zeros(0, dtype=np.float32)
         self._lock = threading.Lock()
-        self.decoder_manager = RealtimeDecoderManager(self.runtime.decoder, self.hparams)
-        self.render_manager = FullFieldRenderManager(self.runtime, self.hparams, retokenize=RETOKENIZE)
-        self.dataset_name = self._resolve_dataset_name(getattr(self.hparams, "dataset_name", None))
-        self.hparams.dataset_name = self.dataset_name
+        self._train_start_lock = threading.Lock()
+        self.training = TrainingManager(on_finish=self._on_training_finished)
+
+        self._try_init_runtime()
+        self._refresh_dataset(getattr(self.hparams, "dataset_name", None))
 
         self.model_catalog = self._build_model_catalog()
         self._normalize_selection_to_catalog()
@@ -1034,7 +1552,7 @@ class RBFServerController:
         self._load_latent_pool()
         control_points = self._make_initial_control_points(len(self.latent_vectors), field_half_extent=2.0)
         self.field_half_extent = 2.0
-        self.weights = compute_rbf_weights(control_points, self.latent_vectors, sigma=0.30)
+        self.weights = _safe_rbf_weights(control_points, self.latent_vectors, sigma=0.30)
         self.bpm_weights = self._compute_bpm_weights(control_points, sigma=0.30)
         self.weights_ex0: np.ndarray | None = None
         self.bpm_weights_ex0: np.ndarray | None = None
@@ -1070,6 +1588,84 @@ class RBFServerController:
     def _branch_model_dir(self) -> Path:
         branch_name = safe_branch_name(get_current_branch())
         return project_root() / "models" / branch_name
+
+    def _try_init_runtime(self) -> bool:
+        """Try to load a model checkpoint. Never raises; on failure the app stays idle and model_error is set."""
+        self.model_error = None
+        selected_mode = None
+        for candidate in ["none", "best_val", "best_train", "last"]:
+            if self._mode_files_static(candidate):
+                selected_mode = candidate
+                break
+        if selected_mode is None:
+            self.model_error = f"No model checkpoints found in {self._branch_model_dir()}"
+            print(f"[warning] {self.model_error}. Starting without a model (idle).", flush=True)
+            return False
+
+        self.selected_mode = selected_mode
+        self.selected_previous = 0
+        checkpoint_kind = None if selected_mode == "none" else selected_mode
+        try:
+            runtime = CudaRBFRuntime(previous=0, checkpoint_kind=checkpoint_kind, retokenize=RETOKENIZE)
+        except Exception as exc:
+            traceback.print_exc()
+            self.model_error = f"Failed to load model checkpoint: {exc}"
+            return False
+
+        self.runtime = runtime
+        self.hparams = runtime.hparams
+        self.decoder_manager = RealtimeDecoderManager(runtime.decoder, self.hparams)
+        self.render_manager = FullFieldRenderManager(runtime, self.hparams, retokenize=RETOKENIZE)
+        return True
+
+    def _refresh_dataset(self, preferred: str | None = None):
+        """Resolve the dataset to use. Never raises; without datasets dataset_name is empty and dataset_error is set."""
+        try:
+            self.dataset_name = self._resolve_dataset_name(preferred)
+            self.dataset_error = None
+        except FileNotFoundError as exc:
+            self.dataset_name = ""
+            self.dataset_error = str(exc)
+            print(f"[warning] {exc}. Starting without a dataset (idle).", flush=True)
+        self.hparams.dataset_name = self.dataset_name
+
+    def _app_status(self) -> dict:
+        model_ok = self.runtime is not None
+        dataset_ok = bool(self.dataset_name) and len(self.latent_vectors) > 0
+        training = self.training.is_active()
+        messages: list[str] = []
+        if training:
+            messages.append("Training läuft – die Inferenz ist pausiert. / Training is running – inference is paused.")
+        else:
+            if not model_ok:
+                messages.append(self.model_error or "No model loaded.")
+            if not dataset_ok:
+                messages.append(self.dataset_error or "No dataset loaded.")
+        return {
+            "ready": bool(model_ok and dataset_ok and not training),
+            "model_available": bool(model_ok),
+            "dataset_available": bool(dataset_ok),
+            "training": bool(training),
+            "messages": messages,
+        }
+
+    def _is_idle(self) -> bool:
+        return not self._app_status()["ready"]
+
+    def recheck_resources(self):
+        """Retry loading model/dataset (e.g. after files were added while the server is running)."""
+        if self.training.is_active():
+            return  # the GPU belongs to the training; inference comes back when it ends
+        with self._lock:
+            had_pool = self.runtime is not None and len(self.latent_vectors) > 0
+            if self.runtime is None:
+                self._try_init_runtime()
+            self._refresh_dataset(self.dataset_name or getattr(self.hparams, "dataset_name", None))
+            self.model_catalog = self._build_model_catalog()
+            self._normalize_selection_to_catalog()
+            if not had_pool and self.runtime is not None and self.dataset_name:
+                self._load_latent_pool()
+                self._rebuild_pool_dependent_state(reset_modes=True)
 
     def _mode_files(self, mode: str) -> list[Path]:
         return self._mode_files_static(mode)
@@ -1122,7 +1718,28 @@ class RBFServerController:
             }
         return catalog
 
+    def _set_empty_pool(self):
+        dim = int(getattr(self.hparams, "latent_dim", 0) or 0)
+        self.latent_vectors = np.zeros((0, dim), dtype=np.float32)
+        self.labels = []
+        self.anchor_bpms = np.zeros(0, dtype=np.float32)
+        # Keep the requested sample count / default maximum so the UI sliders stay untouched while idle.
+        self.sample_count_max = 40
+        self._recompute_fallback_caches()
+
     def _load_latent_pool(self):
+        if self.runtime is None or not self.dataset_name:
+            self._set_empty_pool()
+            return
+        try:
+            self._load_latent_pool_impl()
+            self.dataset_error = None
+        except Exception as exc:
+            traceback.print_exc()
+            self.dataset_error = f"Failed to load dataset '{self.dataset_name}': {exc}"
+            self._set_empty_pool()
+
+    def _load_latent_pool_impl(self):
         # Keep dataset order intact here; optional randomization is controlled below.
         self.hparams.dataset_name = self.dataset_name
         data, metadata = load_dataset(self.hparams, shuffle=False)
@@ -1167,7 +1784,8 @@ class RBFServerController:
         self._recompute_fallback_caches()
 
     def _rebuild_pool_dependent_state(self, reset_modes: bool = False):
-        self.render_manager.cancel_render()
+        if self.render_manager is not None:
+            self.render_manager.cancel_render()
         control_points = self._make_initial_control_points(len(self.latent_vectors), field_half_extent=self.field_half_extent)
         self.state.control_points = control_points
         self.state.cursor = np.zeros(2, dtype=np.float32)
@@ -1197,7 +1815,7 @@ class RBFServerController:
         self.weights_ex0 = None
         self.bpm_weights_ex0 = None
         self._fallback_last_valid_latent = None
-        self.weights = compute_rbf_weights(control_points, self.latent_vectors, sigma=self.state.sigma)
+        self.weights = _safe_rbf_weights(control_points, self.latent_vectors, sigma=self.state.sigma)
         self.bpm_weights = self._compute_bpm_weights(control_points, sigma=self.state.sigma)
         self._cached_heatmap = np.zeros((self.state.grid_resolution, self.state.grid_resolution), dtype=np.float32)
         _debug_print_control_points(
@@ -1206,7 +1824,80 @@ class RBFServerController:
             extra=f"sample_count={int(self.sample_count)}, sample_randomize={bool(self.sample_randomize)}, dataset={self.dataset_name}",
         )
 
+    # ------------------------------------------------------------------ training integration
+    def _checkpoint_count(self, mode: str) -> int:
+        if mode not in self.MODE_PREFIX:
+            return 0
+        return len(self._mode_files_static(mode))
+
+    def _release_device_memory(self):
+        gc.collect()
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+        except Exception:
+            traceback.print_exc()
+
+    def pause_for_training(self):
+        """Stop render/decode jobs and drop the model so the training process gets the whole device."""
+        with self._lock:
+            if self.render_manager is not None:
+                self.render_manager.shutdown()
+            if self.decoder_manager is not None:
+                self.decoder_manager.shutdown()
+            self.runtime = None
+            self.render_manager = None
+            self.decoder_manager = None
+            self.state.decode_enabled = False
+            self.state.render_enabled = False
+            self.render_status = "idle"
+            self.decode_status = "idle"
+            self.decode_progress_step = -1
+            self._release_device_memory()
+
+    def _on_training_finished(self, final_state: str):
+        """Called by the TrainingManager (reader thread) after the worker ended: bring inference back."""
+        try:
+            self.recheck_resources()
+        except Exception:
+            traceback.print_exc()
+
+    def train_defaults(self) -> dict:
+        """Current content of hparams.py (read fresh, so values saved from the GUI show up without a restart)."""
+        try:
+            values = read_hparams()
+        except Exception:
+            traceback.print_exc()
+            values = dict(vars(_DEFAULT_HPARAMS))
+        return {key: values[key] for key in ALLOWED_KEYS if key in values}
+
+    def start_training(self, raw_config) -> tuple[bool, dict]:
+        """Validate and start a training. Returns (ok, errors); errors maps field -> message."""
+        with self._train_start_lock:
+            if self.training.is_active():
+                return False, {"general": "A training is already running."}
+            clean, errors = validate_train_config(
+                raw_config,
+                self._list_available_datasets(),
+                self._checkpoint_count,
+                self.train_defaults(),
+            )
+            if errors:
+                return False, errors
+            try:
+                self.training.start(clean, before_spawn=self.pause_for_training)
+            except Exception as exc:
+                return False, {"general": str(exc)}
+            return True, {}
+
+    def stop_training(self, force: bool = False) -> bool:
+        return self.training.stop(force=force)
+
     def reload_model(self, mode: str, previous: int = 0):
+        if self.training.is_active():
+            raise RuntimeError("Training is running; model switching is disabled until it ends.")
         if mode not in self.MODE_LABELS:
             raise ValueError(f"Unknown mode '{mode}'.")
 
@@ -1224,12 +1915,15 @@ class RBFServerController:
             previous = len(files) - 1
 
         checkpoint_kind = None if mode == "none" else mode
-        self.runtime = CudaRBFRuntime(previous=previous, checkpoint_kind=checkpoint_kind, retokenize=RETOKENIZE)
+        runtime = CudaRBFRuntime(previous=previous, checkpoint_kind=checkpoint_kind, retokenize=RETOKENIZE)
+        if self.render_manager is not None:
+            self.render_manager.cancel_render()
+        self.runtime = runtime
+        self.model_error = None
         self.hparams = self.runtime.hparams
         self.decoder_manager = RealtimeDecoderManager(self.runtime.decoder, self.hparams)
         self.render_manager = FullFieldRenderManager(self.runtime, self.hparams, retokenize=RETOKENIZE)
-        self.dataset_name = self._resolve_dataset_name(previous_dataset_name)
-        self.hparams.dataset_name = self.dataset_name
+        self._refresh_dataset(previous_dataset_name)
         self._load_latent_pool()
 
         self.selected_mode = mode
@@ -1394,6 +2088,8 @@ class RBFServerController:
         return (points.shape, np.round(points, 4).tobytes(), round(float(sigma), 4), int(grid), str(mode), str(fallback_mode))
 
     def _refresh_decoder_update(self) -> bool:
+        if self.decoder_manager is None:
+            return False
         decode_update = self.decoder_manager.consume_latest_update()
         if decode_update is None:
             return False
@@ -1403,6 +2099,8 @@ class RBFServerController:
         return True
 
     def _refresh_render_update(self) -> bool:
+        if self.render_manager is None:
+            return False
         render_update = self.render_manager.consume_latest_update()
         if render_update is None:
             return False
@@ -1477,6 +2175,7 @@ class RBFServerController:
             "render_total": int(self.render_total),
             "render_output_path": self.render_output_path,
             "render_error": self.render_error,
+            "app_status": self._app_status(),
             "model_options": self.model_catalog,
             "model_selection": {
                 "mode": self.selected_mode,
@@ -1520,6 +2219,28 @@ class RBFServerController:
             self.state.last_frontend_payload = payload
             slider_values = payload.get("slider_values") or {}
             button_values = payload.get("button_values") or {}
+
+            if self._is_idle():
+                # No model and/or no dataset: nothing to interpolate or decode. Stay idle, but allow
+                # switching to another dataset when a model is loaded.
+                requested_dataset = str(button_values.get("datasetName", self.dataset_name) or "")
+                if (
+                    self.runtime is not None
+                    and requested_dataset
+                    and requested_dataset != self.dataset_name
+                    and requested_dataset in self._list_available_datasets()
+                ):
+                    self.dataset_name = requested_dataset
+                    self.hparams.dataset_name = requested_dataset
+                    self._load_latent_pool()
+                    self._rebuild_pool_dependent_state(reset_modes=False)
+                self.state.decode_enabled = False
+                self.state.render_enabled = False
+                self.reconstruction_matrix.fill(0.0)
+                self.decode_status = "idle"
+                self.decode_progress_step = -1
+                return self._build_response(midi_buffer=None, encode_midi=False)
+
             prev_points_snapshot = self.state.control_points.copy()
 
             cursor = np.asarray(payload.get("cursor", self.state.cursor), dtype=np.float32).reshape(2)
@@ -1778,10 +2499,31 @@ class RBFServerController:
             return self._build_response(midi_buffer=midi_buffer, encode_midi=encode_midi)
 
 
-def create_app(sample_count: int = 10, sample_seed: int = 42):
+def _training_device_label() -> str:
+    if torch.cuda.is_available():
+        return f"cuda ({torch.cuda.get_device_name(0)})"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _torch_compile_default() -> bool:
+    """torch.compile is only used on CUDA and needs a C compiler."""
+    return bool(torch.cuda.is_available() and (shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")))
+
+
+def create_app(sample_count: int = 10, sample_seed: int = 42, hparams_path: str | os.PathLike | None = None):
     controller = RBFServerController(sample_count=sample_count, sample_seed=sample_seed)
+    # A running worker must never outlive the server.
+    atexit.register(controller.training.terminate)
     app = Flask(__name__, template_folder=os.path.dirname(__file__))
     socketio = SocketIO(app, cors_allowed_origins="*")
+
+    def _on_dataset_job_finished(final_state: str):
+        socketio.emit("ds_list", {"datasets": dataset_tools.list_datasets(), "state": final_state})
+
+    dataset_jobs = dataset_tools.DatasetJobManager(on_finish=_on_dataset_job_finished)
+    atexit.register(dataset_jobs.cancel)
     assets_dir = (Path(__file__).resolve().parent.parent / "assets").resolve()
 
     def decode_broadcast_loop():
@@ -1810,8 +2552,28 @@ def create_app(sample_count: int = 10, sample_seed: int = 42):
                 socketio.emit("frame", response)
             socketio.sleep(0.03)
 
+    def train_broadcast_loop():
+        last_version = -1
+        while True:
+            version = controller.training.version
+            if version != last_version:
+                last_version = version
+                socketio.emit("train_update", controller.training.snapshot())
+            socketio.sleep(0.25)  # ~4 Hz
+
+    def dataset_broadcast_loop():
+        last_version = -1
+        while True:
+            version = dataset_jobs.version
+            if version != last_version:
+                last_version = version
+                socketio.emit("ds_update", dataset_jobs.snapshot())
+            socketio.sleep(0.25)  # ~4 Hz
+
     socketio.start_background_task(decode_broadcast_loop)
     socketio.start_background_task(render_broadcast_loop)
+    socketio.start_background_task(train_broadcast_loop)
+    socketio.start_background_task(dataset_broadcast_loop)
 
     @app.get("/")
     def index():
@@ -1823,10 +2585,197 @@ def create_app(sample_count: int = 10, sample_seed: int = 42):
 
     @app.get("/api/health")
     def health():
-        return {"ok": True, "device": str(controller.runtime.device), "cuda_ready": torch.cuda.is_available()}
+        status = controller._app_status()
+        device = str(controller.runtime.device) if controller.runtime is not None else None
+        return {"ok": True, "device": device, "cuda_ready": torch.cuda.is_available(), **status}
+
+    @app.get("/api/train/status")
+    def train_status():
+        return controller.training.snapshot()
+
+    @app.get("/api/dataset/status")
+    def dataset_status():
+        return dataset_jobs.snapshot()
+
+    def run_dataset_task(event: str, func):
+        """Run a (possibly slow) dataset query off the socket handler and answer only the asking client."""
+        sid = request.sid
+
+        def _work():
+            try:
+                payload = {"ok": True, **func()}
+            except Exception as exc:
+                if not isinstance(exc, (FileNotFoundError, ValueError)):
+                    traceback.print_exc()
+                payload = {"ok": False, "error": str(exc)}
+            socketio.emit(event, payload, to=sid)
+
+        socketio.start_background_task(_work)
+
+    def build_dataset_state() -> dict:
+        return {
+            "branch": safe_branch_name(get_current_branch()),
+            "data_dir": str(dataset_tools.data_dir()),
+            "datasets": dataset_tools.list_datasets(),
+            "job": dataset_jobs.snapshot(),
+            "mappings": list(dataset_tools.MAPPING_CHOICES),
+            "hparams": {
+                "width": int(dataset_tools.HP.width), "n_timing": int(dataset_tools.HP.n_timing),
+                "n_vel": int(dataset_tools.HP.n_vel), "max_seq_len": int(dataset_tools.HP.max_seq_len),
+                "n_pitch": int(dataset_tools.HP.max_pitch_token - dataset_tools.HP.min_pitch_token),
+            },
+        }
+
+    @socketio.on("ds_get_state")
+    def on_ds_get_state():
+        try:
+            emit("ds_state", build_dataset_state())
+        except Exception as exc:
+            traceback.print_exc()
+            emit("error", {"message": str(exc)})
+
+    @socketio.on("ds_browse")
+    def on_ds_browse(payload=None):
+        payload = payload if isinstance(payload, dict) else {}
+        run_dataset_task("ds_browse_result", lambda: dataset_tools.browse_dir(
+            payload.get("path"), show_hidden=bool(payload.get("show_hidden", False))))
+
+    @socketio.on("ds_scan")
+    def on_ds_scan(payload=None):
+        payload = payload if isinstance(payload, dict) else {}
+
+        def _scan():
+            result = dataset_tools.scan_midi_folder(str(payload.get("path") or ""))
+            if not result.get("ok"):
+                raise ValueError(result.get("error", "Scan failed"))
+            result.pop("ok", None)
+            return result
+
+        run_dataset_task("ds_scan_result", _scan)
+
+    @socketio.on("ds_start")
+    def on_ds_start(payload=None):
+        payload = payload if isinstance(payload, dict) else {}
+        kind = str(payload.get("kind") or "")
+        try:
+            ok, errors = dataset_jobs.start(kind, payload.get("params"))
+        except Exception as exc:
+            traceback.print_exc()
+            ok, errors = False, {"general": str(exc)}
+        emit("ds_start_result", {"ok": bool(ok), "kind": kind, "errors": errors})
+
+    @socketio.on("ds_cancel")
+    def on_ds_cancel(payload=None):
+        emit("ds_cancel_result", {"ok": bool(dataset_jobs.cancel())})
+
+    @socketio.on("ds_info")
+    def on_ds_info(payload=None):
+        name = str((payload or {}).get("name") or "") if isinstance(payload, dict) else ""
+        run_dataset_task("ds_info_result", lambda: {"dataset": dataset_tools.dataset_info(name)})
+
+    @socketio.on("ds_sequence")
+    def on_ds_sequence(payload=None):
+        payload = payload if isinstance(payload, dict) else {}
+        name = str(payload.get("name") or "")
+        index = _safe_int(payload.get("index"), 0)
+        run_dataset_task("ds_sequence_result", lambda: {"sequence": dataset_tools.sequence_view(name, index)})
+
+    @socketio.on("ds_save_info")
+    def on_ds_save_info(payload=None):
+        payload = payload if isinstance(payload, dict) else {}
+        name = str(payload.get("name") or "")
+        try:
+            info = dataset_tools.update_dataset_info(name, payload.get("patch"))
+            emit("ds_save_info_result", {"ok": True, "name": name, "info": info})
+            socketio.emit("ds_list", {"datasets": dataset_tools.list_datasets(), "state": "info"})
+        except Exception as exc:
+            if not isinstance(exc, (FileNotFoundError, ValueError)):
+                traceback.print_exc()
+            emit("ds_save_info_result", {"ok": False, "name": name, "error": str(exc)})
+
+    @socketio.on("ds_delete")
+    def on_ds_delete(payload=None):
+        payload = payload if isinstance(payload, dict) else {}
+        name = str(payload.get("name") or "")
+        try:
+            if dataset_jobs.is_active():
+                raise ValueError("A dataset job is running; wait until it has finished or cancel it first.")
+            if controller.training.is_active():
+                raise ValueError("A training is running; datasets cannot be deleted until it has ended.")
+            deleted = dataset_tools.delete_dataset(name)
+            with controller._lock:
+                if controller.runtime is not None and controller.dataset_name == deleted:
+                    # The inference pool was built from the deleted file: switch to another dataset (or idle).
+                    controller._refresh_dataset(None)
+                    controller._load_latent_pool()
+                    controller._rebuild_pool_dependent_state(reset_modes=False)
+            emit("ds_delete_result", {"ok": True, "name": deleted})
+            socketio.emit("ds_list", {"datasets": dataset_tools.list_datasets(), "state": "deleted"})
+        except Exception as exc:
+            if not isinstance(exc, (FileNotFoundError, ValueError)):
+                traceback.print_exc()
+            emit("ds_delete_result", {"ok": False, "name": name, "error": str(exc)})
+
+    def build_train_config_payload() -> dict:
+        return {
+            "defaults": controller.train_defaults(),
+            "datasets": controller._list_available_datasets(),
+            "model_options": controller._build_model_catalog(),
+            "options": {"torch_compile": _torch_compile_default(), "log_interval": 25},
+            "branch": safe_branch_name(get_current_branch()),
+            "device": _training_device_label(),
+            "keys": {"train": TRAIN_KEYS, "model": MODEL_KEYS, "architecture": ARCHITECTURE_KEYS},
+            "state": controller.training.snapshot(),
+        }
+
+    @socketio.on("train_get_config")
+    def on_train_get_config():
+        try:
+            emit("train_config", build_train_config_payload())
+        except Exception as exc:
+            traceback.print_exc()
+            emit("error", {"message": str(exc)})
+
+    @socketio.on("train_start")
+    def on_train_start(payload):
+        try:
+            ok, errors = controller.start_training(payload)
+        except Exception as exc:
+            traceback.print_exc()
+            ok, errors = False, {"general": str(exc)}
+        emit("train_start_result", {"ok": bool(ok), "errors": errors})
+
+    @socketio.on("train_stop")
+    def on_train_stop(payload=None):
+        force = bool((payload or {}).get("force", False)) if isinstance(payload, dict) else False
+        emit("train_stop_result", {"ok": bool(controller.stop_training(force=force))})
+
+    @socketio.on("hparams_save")
+    def on_hparams_save(payload):
+        changes = (payload or {}).get("changes", {}) if isinstance(payload, dict) else {}
+        try:
+            result = save_hparams(changes, path=hparams_path)
+            emit("hparams_save_result", {
+                "ok": True,
+                "changed": result["changed"],
+                "unchanged": result["unchanged"],
+                "derived": result["derived"],
+                "backup": result["backup"],
+                "message": (
+                    f"Saved {len(result['changed'])} parameter(s) to hparams.py (backup: hparams.py.bak). "
+                    "Training uses the new values immediately; the running inference model is unaffected until restart."
+                    if result["changed"] else "hparams.py already contains these values; nothing changed."
+                ),
+            })
+        except HparamsSaveError as exc:
+            emit("hparams_save_result", {"ok": False, "errors": exc.errors, "message": str(exc)})
+        except Exception as exc:
+            traceback.print_exc()
+            emit("hparams_save_result", {"ok": False, "errors": {}, "message": str(exc)})
 
     @socketio.on("bootstrap")
     def on_bootstrap():
+        controller.recheck_resources()
         payload = {
             "cursor": [0.0, 0.0],
             "draggable_points": controller.state.control_points.tolist(),

@@ -159,50 +159,141 @@ class Decoder(nn.Module):
         logits = self.fc_out(out)
         return logits
 
+    # ------------------------- KV-cache incremental decoding -------------------------
+    # The functions below mirror `forward` (post-norm / pre-norm nn.TransformerDecoderLayer) for one new token
+    # at a time. Self-attention keys/values of all previous positions and the cross-attention keys/values of
+    # the latent memory are cached, so every step costs O(T) instead of re-running the whole sequence.
+    # They are meant for inference (eval mode, no dropout).
+    @staticmethod
+    def _split_heads(x: torch.Tensor, n_heads: int) -> torch.Tensor:
+        B, T, D = x.shape
+        return x.view(B, T, n_heads, D // n_heads).transpose(1, 2)
+
+    @torch.no_grad()
+    def init_cache(self, z: torch.Tensor) -> dict:
+        """Build a decoding cache for a batch of latent vectors z: [B, latent_dim]."""
+        B = z.size(0)
+        D = self.emb_size
+        memory = self.z_to_mem(z).view(B, self.n_memory_tokens, D)
+        mem_kv = []
+        for layer in self.transformer_decoder.layers:
+            mha = layer.multihead_attn
+            w, b = mha.in_proj_weight, mha.in_proj_bias
+            k = F.linear(memory, w[D:2 * D], None if b is None else b[D:2 * D])
+            v = F.linear(memory, w[2 * D:], None if b is None else b[2 * D:])
+            mem_kv.append((self._split_heads(k, mha.num_heads), self._split_heads(v, mha.num_heads)))
+        return {
+            'mem_kv': mem_kv,
+            'self_kv': [None] * len(mem_kv),
+            'pad_bias': torch.zeros(B, 1, 1, 0, dtype=memory.dtype, device=memory.device),
+            'n_steps': torch.zeros(B, dtype=torch.long, device=memory.device),
+            'pos': 0,
+        }
+
+    @torch.no_grad()
+    def decode_step(self, tokens: torch.Tensor, cache: dict) -> torch.Tensor:
+        """Feed one token per sequence (tokens: [B]) and return the next-token logits [B, vocab].
+
+        The first call must feed the SOS token. Beat tokens are tracked inside the cache
+        (0 for the first position, afterwards 1 + number of STEP tokens seen so far).
+        """
+        pos = cache['pos']
+        if pos >= self.max_seq_len:
+            raise ValueError(f"pos={pos} >= max_seq_len={self.max_seq_len}")
+        B = tokens.size(0)
+        D = self.emb_size
+
+        cache['n_steps'] = cache['n_steps'] + (tokens == self.step_token).to(torch.long)
+        if pos == 0:
+            beat = torch.zeros_like(tokens)
+        else:
+            beat = (cache['n_steps'] + 1).clamp(max=self.beat_embedding.num_embeddings - 1)
+
+        x = self.projection(torch.cat((self.token_embedding(tokens), self.beat_embedding(beat)), dim=-1))
+        x = (x + self.pos_embedding.weight[pos]).unsqueeze(1)  # [B, 1, D]
+
+        # Same quirk as the training path: the float padding mask is added to the attention scores.
+        pad_now = (tokens == self.pad_token).to(x.dtype).view(B, 1, 1, 1)
+        pad_bias = torch.cat((cache['pad_bias'], pad_now), dim=-1)
+        cache['pad_bias'] = pad_bias
+
+        for i, layer in enumerate(self.transformer_decoder.layers):
+            sa, ca = layer.self_attn, layer.multihead_attn
+            H = sa.num_heads
+
+            def self_attn_block(h):
+                q, k, v = F.linear(h, sa.in_proj_weight, sa.in_proj_bias).chunk(3, dim=-1)
+                q, k, v = (self._split_heads(t, H) for t in (q, k, v))
+                prev = cache['self_kv'][i]
+                if prev is not None:
+                    k = torch.cat((prev[0], k), dim=2)
+                    v = torch.cat((prev[1], v), dim=2)
+                cache['self_kv'][i] = (k, v)
+                o = F.scaled_dot_product_attention(q, k, v, attn_mask=pad_bias)
+                return sa.out_proj(o.transpose(1, 2).reshape(B, 1, D))
+
+            def cross_attn_block(h):
+                b = ca.in_proj_bias
+                q = F.linear(h, ca.in_proj_weight[:D], None if b is None else b[:D])
+                q = self._split_heads(q, H)
+                k, v = cache['mem_kv'][i]
+                o = F.scaled_dot_product_attention(q, k, v)
+                return ca.out_proj(o.transpose(1, 2).reshape(B, 1, D))
+
+            def ff_block(h):
+                return layer.linear2(layer.activation(layer.linear1(h)))
+
+            if layer.norm_first:
+                x = x + self_attn_block(layer.norm1(x))
+                x = x + cross_attn_block(layer.norm2(x))
+                x = x + ff_block(layer.norm3(x))
+            else:
+                x = layer.norm1(x + self_attn_block(x))
+                x = layer.norm2(x + cross_attn_block(x))
+                x = layer.norm3(x + ff_block(x))
+
+        if self.transformer_decoder.norm is not None:
+            x = self.transformer_decoder.norm(x)
+        cache['pos'] = pos + 1
+        return self.fc_out(x[:, 0, :])
+
+    @torch.no_grad()
+    def generate(self, z, max_len=None, temperature=1.0, sample=False, pad_after_eos=True):
+        """Batched autoregressive generation with KV-cache. Returns tokens [B, L] (without SOS).
+
+        With `pad_after_eos=True` finished sequences are filled with PAD after their EOS token,
+        otherwise they keep generating (legacy behaviour of `sample`).
+        """
+        device = z.device
+        B = z.size(0)
+        max_len = int(self.max_seq_len if max_len is None else max_len)
+        cache = self.init_cache(z)
+        cur = torch.full((B,), self.sos_token, dtype=torch.long, device=device)
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+        pad = torch.full((B,), self.pad_token, dtype=torch.long, device=device)
+        out = []
+        for _ in range(max_len):
+            if cache['pos'] >= self.max_seq_len or finished.all():
+                break
+            logits = self.decode_step(cur, cache) / max(1e-8, temperature)
+            if sample:
+                nxt = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1).squeeze(1)
+            else:
+                nxt = torch.argmax(logits, dim=-1)
+            if pad_after_eos:
+                nxt = torch.where(finished, pad, nxt)
+            finished = finished | (nxt == self.eos_token)
+            out.append(nxt)
+            cur = nxt
+        if not out:
+            return torch.zeros((B, 0), dtype=torch.long, device=device)
+        return torch.stack(out, dim=1)
+
     @torch.no_grad()
     def sample(self, z, max_len, temperature=1.0, sample=True, device=None):
-        z = z.to(device)
-        B = z.size(0)
         device = device or next(self.parameters()).device
-        max_beat_index = self.beat_embedding.num_embeddings - 1
-        cur_tokens = torch.full((B, 1), self.sos_token, dtype=torch.long, device=device)
-        beat_tokens = torch.zeros((B, 1), dtype=torch.long, device=device)
-        memory = self.z_to_mem(z).view(B, self.n_memory_tokens, self.emb_size)
-        finished = torch.zeros(B, dtype=torch.bool, device=device)
-
-        for t in range(max_len):
-            T = cur_tokens.size(1)
-            if T > self.max_seq_len or finished.all():
-                break
-            emb = self.token_embedding(cur_tokens)
-            beat_emb = self.beat_embedding(beat_tokens)
-            emb = self.projection(torch.cat((emb, beat_emb), dim=-1))
-            pos_emb = self.pos_embedding(torch.arange(T, device=device)).unsqueeze(0)
-            emb = emb + pos_emb
-
-            tgt_mask = nn.Transformer.generate_square_subsequent_mask(T).to(device)
-            tgt_key_padding_mask = (cur_tokens == self.pad_token).float()
-            out = self.transformer_decoder(tgt=emb, memory=memory, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask)
-            logits = self.fc_out(out)
-            last_logits = logits[:, -1, :] / max(1e-8, temperature)
-            probs = F.softmax(last_logits, dim=-1)
-            if sample:
-                next_tok = torch.multinomial(probs, num_samples=1)
-            else:
-                next_tok = torch.argmax(probs, dim=-1, keepdim=True)
-
-
-            cur_tokens = torch.cat([cur_tokens, next_tok], dim=1)
-
-            # #make sure beat_tokens[0] = 0, and afterwards starting with 1
-            is_step = (cur_tokens == self.step_token).to(torch.long)  # [B, T] in {0,1}
-            beat_tokens = torch.cumsum(is_step, dim=1)  # [B, T]
-            beat_tokens += 1
-            beat_tokens[:, 0] = 0
-            beat_tokens = beat_tokens.clamp(min=0, max=max_beat_index)
-
-            finished |= (next_tok.squeeze(1) == self.eos_token)
-        return cur_tokens[:, 1:]
+        z = z.to(device)
+        return self.generate(z, max_len=max_len, temperature=temperature, sample=sample, pad_after_eos=False)
 
 
 # ------------------------- VAE wrapper -------------------------
@@ -351,14 +442,39 @@ def vae_loss(logits, targets, mu, logvar, beta=1.0, free_bits=0.0, pad_token=0):
     #     f"CE/token: {recon.item():.4f} "
     #     f"PPL: {torch.exp(torch.clamp(recon, max=20)).item():.4f} "
     # )
-    perplexity = torch.exp(torch.clamp(recon, max=20)).item()
+    # Kept as a tensor so the training loop does not need a host sync per batch.
+    perplexity = torch.exp(torch.clamp(recon.detach(), max=20))
 
     return total_loss, recon, kl, perplexity, token_count.float()
 
+
+def _atomic_torch_save(obj, path):
+    """Write a checkpoint to a temp file first and rename it, so an abort never leaves a half-written file."""
+    path = str(path)
+    tmp_path = path + '.tmp'
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
+
 def train_vae(
         model: TransformerVAE, dataloader: DataLoader, _hparams: SimpleNamespace,
-    optimizer, device=None, annealing_style='sigmoid', scheduler=None, val_loader=None, resume_state=None):
-    
+    optimizer, device=None, annealing_style='sigmoid', scheduler=None, val_loader=None, resume_state=None,
+    on_event=None, should_stop=None, log_interval=25, torch_compile=True):
+    """Train the VAE.
+
+    dataloader / val_loader: any iterable of [B, T] token tensors with __len__ (DataLoader or TensorBatcher).
+    on_event(dict): optional callback receiving progress events (batch, epoch, checkpoint, log).
+    should_stop() -> bool: optional, polled once per batch. When it returns True the current state is saved
+        as model_last_*.pt and model_*.pt and the function returns a result dict with stopped=True.
+    Returns a dict with timestamp, checkpoint paths, log file and the stopped flag.
+    """
+
+    def _emit(event):
+        if on_event is not None:
+            on_event(event)
+
+    def _stop_requested():
+        return bool(should_stop()) if should_stop is not None else False
+
     # Device selection with priority: CUDA > MPS > CPU
     if torch.cuda.is_available():
         device = torch.device('cuda')
@@ -454,6 +570,8 @@ def train_vae(
     use_compile = False  # torch.compile for optimization
     scaler = None
     autocast_ctx = None
+    # Keep a handle on the uncompiled module: checkpoints must not carry the '_orig_mod.' key prefix.
+    raw_model = model
 
     if device.type == 'cuda':
         # Check for H100/A100 (compute capability 8.0+) for TF32 and other optimizations
@@ -471,18 +589,21 @@ def train_vae(
         # Enable cuDNN benchmarking for optimal kernels
         torch.backends.cudnn.benchmark = True
 
-        # Use Automatic Mixed Precision (FP16) for H100
-        # H100 has excellent FP16 and even FP8 support
+        # Use Automatic Mixed Precision. bf16 needs no GradScaler; fall back to fp16 + scaler otherwise.
         use_amp = True
-        if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
-            scaler = torch.amp.GradScaler('cuda')
-            autocast_ctx = lambda: torch.amp.autocast(device_type='cuda')
+        if torch.cuda.is_bf16_supported():
+            autocast_ctx = lambda: torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+            print("Automatic Mixed Precision (bf16, no grad scaler) enabled")
         else:
-            scaler = torch.cuda.amp.GradScaler()
-            autocast_ctx = lambda: torch.cuda.amp.autocast()
-        print("Automatic Mixed Precision (AMP) enabled")
+            if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
+                scaler = torch.amp.GradScaler('cuda')
+                autocast_ctx = lambda: torch.amp.autocast(device_type='cuda')
+            else:
+                scaler = torch.cuda.amp.GradScaler()
+                autocast_ctx = lambda: torch.cuda.amp.autocast()
+            print("Automatic Mixed Precision (fp16 + grad scaler) enabled")
 
-        if resume_state is not None:
+        if resume_state is not None and scaler is not None:
             scaler_state = resume_state.get('scaler_state_dict', None)
             if scaler_state is not None:
                 try:
@@ -492,7 +613,9 @@ def train_vae(
                     print(f"Warning: could not load AMP scaler state: {e}")
 
         # torch.compile for PyTorch 2.0+ (significant speedup on modern GPUs)
-        if hasattr(torch, 'compile') and compute_capability >= 8.0:
+        if not torch_compile:
+            print("torch.compile disabled by option")
+        elif hasattr(torch, 'compile') and compute_capability >= 8.0:
             compiler = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
             if compiler is None:
                 print("torch.compile disabled: no system C compiler found (cc/gcc/clang)")
@@ -525,6 +648,10 @@ def train_vae(
             'remaining_time_seconds', 'saved_cache'
         ])
 
+    def _log(text):
+        print(text, flush=True)
+        _emit({'type': 'log', 'text': str(text)})
+
     prev_loss = None
     best_val_loss = float('inf')
     best_train_loss = float('inf')
@@ -537,9 +664,7 @@ def train_vae(
                 if torch.is_tensor(v):
                     state[k] = v.to(device)
 
-
-
-    global_step = 0 + _hparams.global_step
+    global_step = int(getattr(_hparams, 'global_step', 0) or 0)
     train_step = 0
 
     best_val_path = os.path.join(model_dir, f'model_best_val_{timestamp}.pt')
@@ -555,7 +680,7 @@ def train_vae(
 
     def _build_checkpoint(epoch, global_step_value, best_val_loss_value, best_train_loss_value, train_loss_value, val_loss_value):
         return {
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': raw_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict() if optimizer is not None else None,
             'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
             'scaler_state_dict': scaler.state_dict() if use_amp and scaler is not None else None,
@@ -570,41 +695,74 @@ def train_vae(
             'global_step': int(global_step_value),
         }
 
+    def _save_checkpoint(checkpoint, path, kind):
+        _atomic_torch_save(checkpoint, path)
+        _emit({'type': 'checkpoint', 'kind': kind, 'path': str(path)})
+
+    n_batches = len(dataloader)
+    if n_batches == 0:
+        raise ValueError('Training data is empty: the data loader has no batches.')
+    try:
+        n_train_samples = len(dataloader.dataset)
+    except (AttributeError, TypeError):
+        n_train_samples = int(getattr(_hparams, 'n_samples', 0) or 0)
+    n_train_samples = max(int(n_train_samples), 1)
+
+    stopped = False
+    lr = optimizer.param_groups[0]['lr']
+    weighted_beta = _annealed_beta_at_progress(0.0, annealing_points, annealing_slope)
+    train_loss_epoch = float('inf')
+    val_loss_epoch = None
+    completed_epochs = 0
+    perplexity = torch.tensor(1000.0)
+
     train_start_time = time.time()
     prev_epoch_time = time.time()
     print()
-    print(f"Starting training for {epochs} epochs ({total_train_steps} total steps)")
+    _log(f"Starting training for {epochs} epochs ({total_train_steps} total steps)")
     for epoch in range(1, epochs + 1):
         model.train()
-        running = {'loss': 0.0, 'rec': 0.0, 'kl': 0.0, 'n_tokens': 0.0}
+        running = {
+            'loss': torch.zeros((), device=device),
+            'rec': torch.zeros((), device=device),
+            'kl': torch.zeros((), device=device),
+            'n_tokens': torch.zeros((), device=device),
+        }
         batch_iteration = 0
         prev_time = time.time()
-        perplexity = 1000
+        last_event_time = time.time()
+        last_event_iteration = 0
         print('-' * 100)
         for batch in dataloader:
+            if _stop_requested():
+                stopped = True
+                break
             normalized_step = train_step / max(total_train_steps - 1, 1)
             weighted_beta = _annealed_beta_at_progress(normalized_step, annealing_points, annealing_slope)
             global_step += 1
             train_step += 1
-            # weighted_beta = beta_multiplier * annealed_beta
-            annealing_factor = weighted_beta
             time_elapsed = time.time() - prev_time
             prev_time = time.time()
-            batch = batch.to(device)
-            optimizer.zero_grad()
+            batch = batch.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
 
-            # Use automatic mixed precision if enabled
             if use_amp:
                 with autocast_ctx():
                     logits, mu, logvar = model(batch)
                     loss, rec, kl, perplexity, token_count = vae_loss(logits, batch, mu, logvar, beta=weighted_beta, free_bits=free_bits, pad_token=_hparams.pad_token)
 
-                # Scaled backward pass for mixed precision
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler is not None:
+                    # fp16: scaled backward pass
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    # bf16: no scaling needed
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
             else:
                 # Standard FP32 training
                 logits, mu, logvar = model(batch)
@@ -612,7 +770,6 @@ def train_vae(
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-            print(f'\rEpoch {epoch:03d}/{epochs} | Step {batch_iteration + 1:2d}/{len(dataloader)} | step_time: {time_elapsed:.2f}s', end='')
             batch_iteration += 1
             if scheduler is not None:
                 scheduler.step()
@@ -620,16 +777,45 @@ def train_vae(
             running['rec'] += rec.detach()
             running['kl'] += kl.detach()
             running['n_tokens'] += token_count.detach()
-        n_batches = len(dataloader)
+
+            if on_event is None:
+                print(f'\rEpoch {epoch:03d}/{epochs} | Step {batch_iteration:2d}/{n_batches} | step_time: {time_elapsed:.2f}s', end='')
+            elif batch_iteration % max(int(log_interval), 1) == 0 or batch_iteration == n_batches:
+                # The only host sync of the batch loop: once per event interval.
+                loss_value = float(loss.detach())
+                now_event = time.time()
+                steps_since = max(batch_iteration - last_event_iteration, 1)
+                step_time = (now_event - last_event_time) / steps_since
+                last_event_time = now_event
+                last_event_iteration = batch_iteration
+                _emit({
+                    'type': 'batch',
+                    'epoch': epoch,
+                    'step': batch_iteration,
+                    'steps': n_batches,
+                    'loss': loss_value,
+                    'beta': float(weighted_beta),
+                    'lr': float(optimizer.param_groups[0]['lr']),
+                    'step_time': step_time,
+                })
         print()
 
+        if stopped:
+            break
+
         # Validation evaluation
-        val_metrics = {'loss': 0.0, 'rec': 0.0, 'kl': 0.0, 'perplexity': 0.0}
+        val_metrics = None
         if val_loader is not None:
             model.eval()
+            val_sums = {
+                'loss': torch.zeros((), device=device),
+                'rec': torch.zeros((), device=device),
+                'kl': torch.zeros((), device=device),
+                'perplexity': torch.zeros((), device=device),
+            }
             with torch.no_grad():
                 for val_batch in val_loader:
-                    val_batch = val_batch.to(device)
+                    val_batch = val_batch.to(device, non_blocking=True)
 
                     # Use AMP for validation if enabled
                     if use_amp:
@@ -646,16 +832,13 @@ def train_vae(
                             free_bits=free_bits, pad_token=_hparams.pad_token
                         )
 
-                    val_metrics['loss'] += val_loss.detach()
-                    val_metrics['rec'] += val_rec.detach()
-                    val_metrics['kl'] += val_kl.detach()
-                    val_metrics['perplexity'] += val_perplexity
+                    val_sums['loss'] += val_loss.detach()
+                    val_sums['rec'] += val_rec.detach()
+                    val_sums['kl'] += val_kl.detach()
+                    val_sums['perplexity'] += val_perplexity.detach()
 
-            n_val_batches = len(val_loader)
-            val_metrics['loss'] /= n_val_batches
-            val_metrics['rec'] /= n_val_batches
-            val_metrics['kl'] /= n_val_batches
-            val_metrics['perplexity'] /= n_val_batches
+            n_val_batches = max(len(val_loader), 1)
+            val_metrics = {k: float(v) / n_val_batches for k, v in val_sums.items()}
 
         now = time.time()
         epoch_time = now - prev_epoch_time
@@ -666,10 +849,19 @@ def train_vae(
         _hparams.global_epoch = global_step // n_batches
         _hparams.learning_rate = lr
         _hparams.weighted_beta = weighted_beta
-        loss_history.append(running['loss']/n_batches)
 
-        train_loss_epoch = (running['loss']/n_batches).item()
-        val_loss_epoch = val_metrics['loss'].item() if val_loader is not None else None
+        train_epoch = {
+            'loss': float(running['loss']) / n_batches,
+            'rec': float(running['rec']) / n_batches,
+            'kl': float(running['kl']) / n_batches,
+            'ppl': float(perplexity),
+            'n_tokens': float(running['n_tokens']),
+        }
+        loss_history.append(train_epoch['loss'])
+
+        train_loss_epoch = train_epoch['loss']
+        val_loss_epoch = val_metrics['loss'] if val_metrics is not None else None
+        completed_epochs = epoch
         save_cache = False
 
         # Always save the latest full resume checkpoint.
@@ -681,7 +873,7 @@ def train_vae(
             train_loss_value=train_loss_epoch,
             val_loss_value=val_loss_epoch,
         )
-        torch.save(last_checkpoint, last_path)
+        _save_checkpoint(last_checkpoint, last_path, 'last')
 
         # Track and save best train checkpoint.
         if train_loss_epoch < best_train_loss:
@@ -694,7 +886,7 @@ def train_vae(
                 train_loss_value=train_loss_epoch,
                 val_loss_value=val_loss_epoch,
             )
-            torch.save(best_train_checkpoint, best_train_path)
+            _save_checkpoint(best_train_checkpoint, best_train_path, 'best_train')
             save_cache = True
 
         # Track and save best validation checkpoint when validation is available.
@@ -708,7 +900,7 @@ def train_vae(
                 train_loss_value=train_loss_epoch,
                 val_loss_value=val_loss_epoch,
             )
-            torch.save(best_val_checkpoint, best_val_path)
+            _save_checkpoint(best_val_checkpoint, best_val_path, 'best_val')
             save_cache = True
 
         # If no validation loader exists, best_val follows best_train for compatibility.
@@ -722,13 +914,13 @@ def train_vae(
                 val_loss_value=val_loss_epoch,
             )
 
-        prev_loss = min(running['loss']/n_batches, prev_loss) if prev_loss is not None else running['loss']/n_batches
+        prev_loss = min(train_loss_epoch, prev_loss) if prev_loss is not None else train_loss_epoch
 
-        print(f"Train Loss {running['loss']/n_batches:.4f} | rec {running['rec']/n_batches:.4f} | kl {running['kl']/n_batches:.4f} | Epoch_time: {epoch_time:.2f}s | saved cache: {save_cache} | lr: {lr:.10f}")
-        if val_loader is not None:
-            print(f"Val Loss {val_metrics['loss']:.4f} | rec {val_metrics['rec']:.4f} | kl {val_metrics['kl']:.4f} | perplexity {val_metrics['perplexity']:.4f}")
-        print(f'Model Perplexity: {perplexity} | Avg tokens per sequence: {running["n_tokens"]/_hparams.n_samples:.2f}')
-
+        _log(f"Epoch {epoch}/{epochs} | Train Loss {train_epoch['loss']:.4f} | rec {train_epoch['rec']:.4f} | kl {train_epoch['kl']:.4f} | Epoch_time: {epoch_time:.2f}s | saved cache: {save_cache} | lr: {lr:.10f}")
+        if val_metrics is not None:
+            _log(f"Val Loss {val_metrics['loss']:.4f} | rec {val_metrics['rec']:.4f} | kl {val_metrics['kl']:.4f} | perplexity {val_metrics['perplexity']:.4f}")
+        avg_tokens = train_epoch['n_tokens'] / n_train_samples
+        print(f"Model Perplexity: {train_epoch['ppl']} | Avg tokens per sequence: {avg_tokens:.2f}")
 
         # print time elapsed and remaining
         elapsed_time = time.time() - train_start_time
@@ -741,42 +933,82 @@ def train_vae(
         r_seconds = int(remaining_time % 60)
         print(f"Elapsed: {e_hours:.2f}h {e_minutes}min {e_seconds}s | Remaining: {r_hours}h {r_minutes}m {r_seconds}s")
 
+        _emit({
+            'type': 'epoch',
+            'epoch': epoch,
+            'epochs': epochs,
+            'train': {k: train_epoch[k] for k in ('loss', 'rec', 'kl', 'ppl')},
+            'val': dict(val_metrics, ppl=val_metrics['perplexity']) if val_metrics is not None else None,
+            'beta': float(weighted_beta),
+            'lr': float(lr),
+            'epoch_time': epoch_time,
+            'elapsed': elapsed_time,
+            'remaining': remaining_time,
+            'global_step': global_step,
+        })
+
         # Log metrics to CSV
         with open(log_file, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
                 epoch,
                 _hparams.batch_size,
-                f"{(running['loss']/n_batches).item():.6f}",
-                f"{(running['rec']/n_batches).item():.6f}",
-                f"{(running['kl']/n_batches).item():.6f}",
-                f"{perplexity:.4f}",
-                f"{running['n_tokens']/_hparams.n_samples:.2f}",
+                f"{train_epoch['loss']:.6f}",
+                f"{train_epoch['rec']:.6f}",
+                f"{train_epoch['kl']:.6f}",
+                f"{train_epoch['ppl']:.4f}",
+                f"{avg_tokens:.2f}",
                 f"{lr:.10f}",
                 f"{weighted_beta:.6f}",
-                f"{annealing_factor:.6f}",
-                f"{val_metrics['loss'].item():.6f}" if val_loader is not None else "",
-                f"{val_metrics['rec'].item():.6f}" if val_loader is not None else "",
-                f"{val_metrics['kl'].item():.6f}" if val_loader is not None else "",
-                f"{val_metrics['perplexity']:.4f}" if val_loader is not None else "",
+                f"{weighted_beta:.6f}",
+                f"{val_metrics['loss']:.6f}" if val_metrics is not None else "",
+                f"{val_metrics['rec']:.6f}" if val_metrics is not None else "",
+                f"{val_metrics['kl']:.6f}" if val_metrics is not None else "",
+                f"{val_metrics['perplexity']:.4f}" if val_metrics is not None else "",
                 f"{epoch_time:.2f}",
                 f"{elapsed_time:.2f}",
                 f"{remaining_time:.2f}",
                 save_cache
             ])
 
-        
+    if stopped:
+        # Persist the exact stop state (mid-epoch) as resume checkpoint.
+        _hparams.global_step = global_step
+        _hparams.learning_rate = optimizer.param_groups[0]['lr']
+        _hparams.weighted_beta = weighted_beta
+        partial_loss = float(running['loss']) / batch_iteration if batch_iteration > 0 else train_loss_epoch
+        stop_checkpoint = _build_checkpoint(
+            epoch=completed_epochs,
+            global_step_value=global_step,
+            best_val_loss_value=best_val_loss,
+            best_train_loss_value=best_train_loss,
+            train_loss_value=partial_loss,
+            val_loss_value=val_loss_epoch,
+        )
+        _save_checkpoint(stop_checkpoint, last_path, 'last')
+        _log(f"Training stopped by request after {completed_epochs} completed epoch(s), {batch_iteration} batch(es) of the current one.")
+        final_checkpoint = best_val_checkpoint if best_val_checkpoint is not None else stop_checkpoint
+    else:
+        final_checkpoint = best_val_checkpoint
 
     # Save the primary best model at the end of training.
-    if best_val_checkpoint is not None:
-        torch.save(best_val_checkpoint, model_name)
+    if final_checkpoint is not None:
+        _save_checkpoint(final_checkpoint, model_name, 'final')
         if val_loader is not None:
             print(f"\nBest validation model saved to {model_name} (val loss: {best_val_loss:.4f})")
         else:
             print(f"\nBest training model saved to {model_name} (train loss: {best_train_loss:.4f})")
     else:
         # Fallback: save current model if no best was found
-        save_model(_hparams, model, model_name, scheduler, optimizer, scaler=scaler, loss_history=loss_history)
+        fallback_checkpoint = _build_checkpoint(
+            epoch=completed_epochs,
+            global_step_value=global_step,
+            best_val_loss_value=best_val_loss,
+            best_train_loss_value=best_train_loss,
+            train_loss_value=train_loss_epoch,
+            val_loss_value=val_loss_epoch,
+        )
+        _save_checkpoint(fallback_checkpoint, model_name, 'final')
         print(f"\nModel saved to {model_name}")
 
     print(f"Best-train checkpoint: {best_train_path}")
@@ -785,6 +1017,17 @@ def train_vae(
 
     print(f"Training took {(time.time() - train_start_time)/60:.2f} minutes")
     print(f'Training log saved to {log_file}')
+    return {
+        'timestamp': timestamp,
+        'stopped': bool(stopped),
+        'epochs_completed': int(completed_epochs),
+        'global_step': int(global_step),
+        'model_path': model_name,
+        'last_path': last_path,
+        'best_train_path': best_train_path,
+        'best_val_path': best_val_path,
+        'log_file': log_file,
+    }
 
 def save_model(_hparams, model, model_name='../models/model.pt', scheduler=None, optimizer=None, scaler=None, loss_history=None):
     if loss_history is not None:

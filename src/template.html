@@ -58,13 +58,95 @@
     .render-progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #5aa37a, #2d9d5b); transition: width 80ms linear; }
     .render-progress-text { font-size: 12px; color: #405347; margin-top: 4px; }
     .controls-disabled { opacity: 0.6; }
-    @media (max-width: 980px) { .app { grid-template-columns: 1fr; } }
+    .app-banner { display: none; margin: 0 0 10px; padding: 10px 12px; border-radius: 8px; border: 1px solid #d9a441; background: #fff4d6; color: #5c4210; font-size: 13px; line-height: 1.4; }
+    .app-banner.visible { display: block; }
+    .app-banner strong { display: block; margin-bottom: 4px; }
+    .app-banner ul { margin: 4px 0 0 18px; padding: 0; word-break: break-all; }
+    .panel.idle-app canvas { opacity: 0.45; }
+    .tabs { max-width: 1180px; margin: 0 auto; padding: 12px 12px 0; display: flex; gap: 6px; }
+    .tabs button { border-radius: 8px; padding: 8px 18px; font-weight: 600; }
+    .train-app { max-width: 1180px; margin: 0 auto; padding: 12px; display: none; grid-template-columns: 1fr 1.1fr; gap: 12px; align-items: start; }
+    .train-app.visible { display: grid; }
+    .train-app fieldset, .ds-app fieldset { border: 1px solid #d8d7cf; border-radius: 8px; margin: 0 0 10px; padding: 6px 10px 8px; }
+    .train-app legend, .ds-app legend { font-size: 12px; font-weight: 700; color: #405347; padding: 0 6px; }
+    .trow { display: grid; grid-template-columns: 170px 1fr; gap: 2px 8px; align-items: center; margin: 5px 0; font-size: 13px; }
+    .trow input[type=number], .trow input[type=text], .trow select { width: 100%; box-sizing: border-box; padding: 5px 6px; border: 1px solid #ced3cc; border-radius: 6px; background: #fff; }
+    .trow input:disabled, .trow select:disabled { background: #eceee8; color: #77807a; }
+    .trow input.invalid, .trow select.invalid { border-color: #b3261e; background: #fff1f0; }
+    .ferr { grid-column: 2; color: #b3261e; font-size: 11px; }
+    .ferr:empty { display: none; }
+    .hint { font-size: 11px; color: #5b6a60; margin: 2px 0 6px; }
+    .anneal-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .anneal-table th { text-align: left; font-weight: 600; color: #405347; padding: 2px 3px; }
+    .anneal-table td { padding: 2px 3px; }
+    .anneal-table input { width: 100%; box-sizing: border-box; padding: 4px; border: 1px solid #ced3cc; border-radius: 6px; }
+    .train-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 4px; }
+    button.primary { background: #2d9d5b; color: #fff; border-color: #217a45; }
+    button.danger { background: #c94d44; color: #fff; border-color: #9c342d; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .chart-grid canvas { height: 150px; }
+    .chart-title { font-size: 12px; font-weight: 700; margin: 4px 0 2px; }
+    .train-log { max-height: 220px; overflow: auto; }
+    .train-ckpts { font-size: 12px; margin: 4px 0 0 18px; padding: 0; word-break: break-all; }
+    .app-banner.err { border-color: #c94d44; background: #fde8e6; color: #6b1d17; }
+    .app-banner.ok { border-color: #2d9d5b; background: #e3f4ea; color: #1d4d31; }
+    .ds-app { max-width: 1180px; margin: 0 auto; padding: 12px; display: none; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 12px; align-items: start; }
+    .ds-app.visible { display: grid; }
+    .ds-app > .panel { min-width: 0; }
+    .ds-app .trow { grid-template-columns: 170px minmax(0, 1fr); }
+    .ds-app fieldset { min-width: 0; }
+    .ds-app pre, .ds-app .hint, .ds-app .ferr, .ds-app .render-progress-text, .ds-app .app-banner, .ds-app .ds-list td, .ds-app .ds-kv span { overflow-wrap: anywhere; word-break: break-word; }
+    .ds-app textarea.ds-path { flex: 1; min-width: 0; width: auto; min-height: 0; height: 30px; resize: none; overflow: hidden; box-sizing: border-box; padding: 5px 6px; border: 1px solid #ced3cc; border-radius: 6px; font: inherit; font-size: 13px; line-height: 1.3; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-all; background: #fff; }
+    .ds-app textarea.ds-path:disabled { background: #eceee8; color: #77807a; }
+    .ds-app textarea.ds-path.invalid { border-color: #b3261e; background: #fff1f0; }
+    .ds-app .ds-inline:has(textarea.ds-path) { align-items: flex-start; }
+    .ds-app .trow textarea { width: 100%; box-sizing: border-box; min-height: 70px; }
+    .ds-app .trow textarea.ds-path { width: auto; min-height: 0; }
+    .ds-app .trow input[type=checkbox] { justify-self: start; }
+    .ds-inline { display: flex; gap: 6px; align-items: center; }
+    .ds-stack { display: flex; flex-direction: column; gap: 6px; align-items: stretch; min-width: 0; }
+    .ds-stack > button { align-self: flex-start; }
+    .ds-stack > .ds-inline > button { flex: 0 0 auto; }
+    .ds-app .ds-stack > textarea.ds-path, .ds-app .trow .ds-stack > textarea.ds-path { flex: none; width: 100%; }
+    .ds-list td.ds-del { white-space: nowrap; width: 1%; text-align: right; }
+    .ds-list td.ds-del button { white-space: nowrap; padding: 1px 7px; line-height: 1.2; }
+    .ds-inline input { flex: 1; min-width: 0; box-sizing: border-box; padding: 5px 6px; border: 1px solid #ced3cc; border-radius: 6px; }
+    .ds-browser { border: 1px solid #cfd6c9; border-radius: 8px; padding: 8px; margin: 6px 0; background: #fafbf6; }
+    .ds-dirlist { max-height: 230px; overflow: auto; border: 1px solid #d8d7cf; border-radius: 6px; background: #fff; margin: 6px 0; font-size: 13px; }
+    .ds-dirlist div { padding: 3px 8px; cursor: pointer; white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
+    .ds-dirlist div:hover { background: #e8f3f2; }
+    .ds-dirlist div.file { color: #6b756e; cursor: default; background: transparent; }
+    .ds-shortcuts { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px; }
+    .ds-shortcuts button { padding: 2px 7px; font-size: 12px; }
+    .ds-list { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .ds-list th { text-align: left; font-weight: 600; color: #405347; padding: 3px 5px; border-bottom: 1px solid #d8d7cf; }
+    .ds-list td { padding: 3px 5px; cursor: pointer; border-bottom: 1px solid #eceee8; }
+    .ds-list tr.sel td { background: #cbeceb; }
+    .ds-kv { display: grid; grid-template-columns: 150px minmax(0, 1fr); font-size: 12px; gap: 2px 8px; margin-bottom: 8px; overflow-wrap: anywhere; }
+    .ds-kv b { color: #405347; font-weight: 600; }
+    .ds-merge-list { max-height: 150px; overflow: auto; border: 1px solid #d8d7cf; border-radius: 6px; background: #fff; padding: 4px 8px; font-size: 13px; }
+    .ds-merge-list label { display: block; padding: 1px 0; }
+    .ds-chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .ds-chart-grid canvas, #dsRoll { width: 100%; box-sizing: border-box; border: 1px solid #e3e5dc; border-radius: 6px; background: #fff; }
+    .ds-chart-grid canvas { height: 140px; }
+    .ds-chart-grid .wide { grid-column: span 2; }
+    .ds-chart-grid canvas.tall { height: 210px; }
+    #dsRoll { height: 240px; }
+    .ds-pre { background: #f1fbfb; border: 1px solid #d2eeee; border-radius: 8px; padding: 8px; min-height: 20px; font-size: 12px; white-space: pre-wrap; margin: 4px 0; max-height: 260px; overflow: auto; }
+    @media (max-width: 980px) { .app { grid-template-columns: 1fr; } .train-app.visible, .ds-app.visible { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
-  <div class="app">
+  <div class="tabs">
+    <button id="tabLatent" class="active" type="button">Latent Field</button>
+    <button id="tabTrain" type="button">Training</button>
+    <button id="tabDataset" type="button">Dataset</button>
+  </div>
+  <div class="app" id="latentTab">
     <div class="panel">
       <h3>RBF Latent Field Server</h3>
+      <div id="appBanner" class="app-banner"></div>
       <div class="field-wrap">
         <canvas id="field"></canvas>
         <svg id="worldOverlay" aria-hidden="true"></svg>
@@ -122,6 +204,179 @@
       <pre id="status">connecting...</pre>
     </div>
   </div>
+
+  <div class="train-app" id="trainTab">
+    <div class="panel">
+      <h3>Training</h3>
+      <div id="trainBanner" class="app-banner"></div>
+      <div class="hint" id="trainEnv"></div>
+      <div class="train-actions">
+        <button id="tStartBtn" class="primary" type="button" title="Validate the settings and start the training on the server. Inference is paused while it runs.">Start training</button>
+        <button id="tStopBtn" class="danger" type="button" title="Stop after the current batch and save the last state as a checkpoint. A second click kills the process." disabled>Stop</button>
+        <button id="tResetBtn" type="button" title="Discard your edits in this form and reload the values currently stored in hparams.py.">Reset to hparams.py</button>
+        <button id="tSaveBtn" type="button" title="Write the changed values of this form permanently into hparams.py (a backup hparams.py.bak is created).">Save to hparams.py</button>
+      </div>
+      <div class="hint" id="tSaveMsg"></div>
+      <div class="ferr" id="terr_general" style="grid-column:auto"></div>
+      <fieldset>
+        <legend>Mode &amp; checkpoint</legend>
+        <div class="trow" title="New training starts from scratch. Resume continues from a checkpoint of this branch including optimizer and scheduler state."><label for="tMode">Mode</label>
+          <select id="tMode" title="New training starts from scratch. Resume continues from a checkpoint of this branch including optimizer and scheduler state."><option value="new">New training</option><option value="resume">Resume / retrain from checkpoint</option></select></div>
+        <div id="tResumeBox" style="display:none">
+          <div class="trow" title="Which kind of checkpoint to continue from: best_val, best_train, last (latest full state) or none (final model_<timestamp>.pt)."><label for="tResumeMode">Checkpoint kind</label><select id="tResumeMode" title="Which kind of checkpoint to continue from: best_val, best_train, last (latest full state) or none (final model_<timestamp>.pt)."></select></div>
+          <div class="trow" title="Which checkpoint of the selected kind to load (newest first)."><label for="tResumeStamp">Checkpoint</label><select id="tResumeStamp" title="Which checkpoint of the selected kind to load (newest first)."></select><div class="ferr" id="terr_resume"></div></div>
+          <div class="trow" title="Keep beta (KL weight) constant at the value reached in the checkpoint instead of following the annealing curve again."><label for="tContinueBeta">Keep beta constant</label><input id="tContinueBeta" type="checkbox" title="Keep beta (KL weight) constant at the value reached in the checkpoint instead of following the annealing curve again." /></div>
+          <div class="trow" title="Learning rate the scheduler starts with when resuming. Empty = scheduler start LR."><label for="tResumeStartLr">Warm start LR</label><input id="tResumeStartLr" type="number" step="any" placeholder="(scheduler start LR)" title="Learning rate the scheduler starts with when resuming. Empty = scheduler start LR." /><div class="ferr" id="terr_resume_start_lr"></div></div>
+          <div class="trow" title="Final learning rate of the resumed run as a factor of the start learning rate (e.g. 0.1 = decay to 10 %). Empty = scheduler end LR."><label for="tResumeEndFactor">End LR factor</label><input id="tResumeEndFactor" type="number" step="any" placeholder="(e.g. 0.1 x checkpoint LR)" title="Final learning rate of the resumed run as a factor of the start learning rate (e.g. 0.1 = decay to 10 %). Empty = scheduler end LR." /><div class="ferr" id="terr_resume_end_lr_factor"></div></div>
+          <div class="hint">Resume: only fields you changed override the checkpoint's values. Optimizer and scheduler state are restored; model architecture comes from the checkpoint.</div>
+        </div>
+      </fieldset>
+      <div id="tFormGroups"></div>
+      <fieldset>
+        <legend>Options</legend>
+        <div class="trow" title="Compile the model with torch.compile (CUDA only, needs a C compiler). Faster steps after a slow first batch."><label for="tTorchCompile">torch.compile</label><input id="tTorchCompile" type="checkbox" title="Compile the model with torch.compile (CUDA only, needs a C compiler). Faster steps after a slow first batch." /></div>
+        <div class="trow" title="Send a live progress event every N batches. Smaller values update the live chart more often but synchronize with the device more often."><label for="tLogInterval">Event interval (batches)</label><input id="tLogInterval" type="number" min="1" max="1000" step="1" value="25" title="Send a live progress event every N batches. Smaller values update the live chart more often but synchronize with the device more often." /><div class="ferr" id="terr_log_interval"></div></div>
+      </fieldset>
+    </div>
+    <div class="panel">
+      <h3>Progress</h3>
+      <div class="render-progress-wrap">
+        <div class="render-progress-track"><div id="tProgFill" class="render-progress-fill"></div></div>
+        <div id="tProgText" class="render-progress-text">Idle</div>
+      </div>
+      <pre id="tStatus">idle</pre>
+      <div class="chart-grid">
+        <div><div class="chart-title">Loss (epoch: train / val)</div><canvas id="chLoss"></canvas></div>
+        <div><div class="chart-title">KL (epoch: train / val)</div><canvas id="chKl"></canvas></div>
+        <div><div class="chart-title">Beta</div><canvas id="chBeta"></canvas></div>
+        <div><div class="chart-title">Learning rate</div><canvas id="chLr"></canvas></div>
+      </div>
+      <div class="chart-title">Batch loss (live)</div><canvas id="chBatch" style="height:120px"></canvas>
+      <h4>Log</h4>
+      <pre id="tLog" class="train-log"></pre>
+      <h4>Checkpoints written</h4>
+      <ul id="tCkpts" class="train-ckpts"></ul>
+    </div>
+  </div>
+
+  <div class="ds-app" id="datasetTab">
+    <div class="panel">
+      <h3>Dataset</h3>
+      <div id="dsBanner" class="app-banner"></div>
+      <div class="hint" id="dsEnv"></div>
+      <fieldset>
+        <legend>Job</legend>
+        <div class="render-progress-wrap">
+          <div class="render-progress-track"><div id="dsProgFill" class="render-progress-fill"></div></div>
+          <div id="dsProgText" class="render-progress-text">Idle</div>
+        </div>
+        <pre id="dsStatus" class="ds-pre">idle</pre>
+        <div class="train-actions"><button id="dsCancelBtn" class="danger" type="button" disabled title="Cancel the running job. Nothing is written to disk when a job is cancelled.">Cancel job</button></div>
+        <div class="ferr" id="dserr_general" style="grid-column:auto"></div>
+        <pre id="dsLog" class="train-log"></pre>
+      </fieldset>
+      <fieldset>
+        <legend>1 &middot; Extract MIDI folder &rarr; dataset</legend>
+        <div class="trow" title="Folder with MIDI files on the server (sub folders are included). All computation and all paths live on the server; the browser only shows them."><label for="dsFolder">MIDI folder (server)</label>
+          <div class="ds-stack"><button id="dsBrowseBtn" type="button" title="Open the server folder browser.">Browse server&hellip;</button><textarea id="dsFolder" class="ds-path" rows="1" spellcheck="false" placeholder="/path/on/the/server" title="Absolute path of the MIDI folder on the server."></textarea></div>
+          <div class="ferr" id="dserr_extract_folder"></div></div>
+        <div id="dsBrowser" class="ds-browser" style="display:none">
+          <div class="ds-stack">
+            <div class="ds-inline" style="justify-content:flex-start">
+              <button id="dsUpBtn" type="button" title="Go to the parent folder.">&uarr; Up</button>
+              <button id="dsGoBtn" type="button" title="Open the typed server path.">Go</button>
+            </div>
+            <textarea id="dsBrowsePath" class="ds-path" rows="1" spellcheck="false" title="Current server folder. Edit and press Enter to jump to another path."></textarea>
+          </div>
+          <div class="ds-shortcuts" id="dsShortcuts"></div>
+          <div class="ds-dirlist" id="dsDirList"></div>
+          <div class="hint" id="dsBrowseInfo"></div>
+          <label class="hint"><input type="checkbox" id="dsShowHidden" /> show hidden folders</label>
+          <div class="train-actions">
+            <button id="dsSelectBtn" class="primary" type="button" title="Use the folder shown above as the MIDI source.">Select this folder</button>
+            <button id="dsCloseBrowserBtn" type="button">Close</button>
+          </div>
+        </div>
+        <div class="hint" id="dsScanInfo"></div>
+        <div id="dsExtractFields"></div>
+        <div class="train-actions"><button id="dsExtractBtn" class="primary" type="button" title="Extract all MIDI files of the folder on the server and write data/&lt;branch&gt;/&lt;name&gt;.npz. Progress is shown above.">Start extraction</button></div>
+      </fieldset>
+      <fieldset>
+        <legend>2 &middot; Merge datasets</legend>
+        <div class="hint">Select two or more datasets of this branch. Sequences and metadata are concatenated into a new dataset.</div>
+        <div id="dsMergeList" class="ds-merge-list" title="Datasets to merge (data/&lt;branch&gt;/)."></div>
+        <div class="ferr" id="dserr_merge_sources" style="grid-column:auto"></div>
+        <div id="dsMergeFields"></div>
+        <div class="train-actions"><button id="dsMergeBtn" type="button" title="Merge the selected datasets into a new dataset.">Merge</button></div>
+      </fieldset>
+      <fieldset>
+        <legend>3 &middot; Augment dataset</legend>
+        <div id="dsAugmentFields"></div>
+        <div class="train-actions"><button id="dsAugmentBtn" type="button" title="Create a new dataset with only augmented sequences (note removals, velocity scaling, micro-shifts).">Augment</button></div>
+      </fieldset>
+    </div>
+    <div class="panel">
+      <h3>Datasets in this branch</h3>
+      <table class="ds-list"><thead><tr><th>Name</th><th>Sequences</th><th>Size</th><th>Type</th><th>Modified</th><th style="width:1%"></th></tr></thead><tbody id="dsListBody"></tbody></table>
+      <div class="hint" id="dsDeleteMsg"></div>
+      <div class="hint" id="dsListEmpty"></div>
+      <div id="dsDetail" style="display:none">
+        <h4 id="dsDetailTitle"></h4>
+        <div class="ds-kv" id="dsSummary"></div>
+        <fieldset>
+          <legend>Meta info (stored inside the dataset file)</legend>
+          <div class="trow" title="Short description of the dataset."><label for="dsMetaDesc">Description</label><input id="dsMetaDesc" type="text" maxlength="2000" title="Short description of the dataset." /></div>
+          <div class="trow" title="Comma separated tags, e.g. groove, drums, 4-4."><label for="dsMetaTags">Tags</label><input id="dsMetaTags" type="text" placeholder="comma separated" title="Comma separated tags." /></div>
+          <div class="trow" title="Free notes: origin, licence, preprocessing, known problems &hellip;"><label for="dsMetaNotes">Notes</label><textarea id="dsMetaNotes" title="Free notes about the dataset."></textarea></div>
+          <div class="hint">Custom fields (key / value)</div>
+          <table class="anneal-table"><tbody id="dsMetaCustom"></tbody></table>
+          <div class="train-actions">
+            <button id="dsMetaAdd" type="button" title="Add a custom key/value field.">+ Add field</button>
+            <button id="dsMetaSave" class="primary" type="button" title="Write description, tags, notes and custom fields into the dataset file (the sequences are not changed).">Save meta info</button>
+          </div>
+          <div class="hint" id="dsMetaMsg"></div>
+          <details><summary class="hint">Automatic info (read-only: type, source, options, creation)</summary><pre id="dsAutoInfo" class="ds-pre"></pre></details>
+        </fieldset>
+        <h4>Statistics</h4>
+        <div class="ds-chart-grid">
+          <div class="wide"><div class="chart-title">Pitch usage (notes per chromatic pitch)</div><canvas id="dsChPitch" class="tall"></canvas></div>
+          <div><div class="chart-title">Velocity</div><canvas id="dsChVel"></canvas></div>
+          <div><div class="chart-title">Microtiming (center = on grid)</div><canvas id="dsChTiming"></canvas></div>
+          <div><div class="chart-title">Notes per sequence</div><canvas id="dsChNotes"></canvas></div>
+          <div><div class="chart-title">BPM</div><canvas id="dsChBpm"></canvas></div>
+        </div>
+        <h4>Sequence viewer</h4>
+        <div class="ds-inline">
+          <button id="dsPrev" type="button" title="Previous sequence">&#9664;</button>
+          <input id="dsSeqIndex" type="number" min="0" step="1" style="flex:0 0 90px" title="Sequence index" />
+          <span id="dsSeqCount" class="hint"></span>
+          <button id="dsNext" type="button" title="Next sequence">&#9654;</button>
+          <button id="dsRandom" type="button" title="Jump to a random sequence">Random</button>
+        </div>
+        <input id="dsSeqSlider" type="range" min="0" max="0" step="1" value="0" style="width:100%" />
+        <div class="hint" id="dsSeqInfo"></div>
+        <canvas id="dsRoll"></canvas>
+        <fieldset>
+          <legend>MIDI playback (browser MIDI output port)</legend>
+          <div class="trow" title="MIDI output port of this computer (Web MIDI). 'Browser synth' plays a simple preview sound without a MIDI device."><label for="dsMidiOut">MIDI output</label>
+            <div class="ds-inline"><select id="dsMidiOut" style="flex:1"></select><button id="dsMidiBtn" type="button" title="Ask the browser for access to MIDI ports and refresh the list.">Connect MIDI</button></div></div>
+          <div class="trow" title="MIDI channel (10 = drums in General MIDI)."><label for="dsMidiCh">Channel</label><select id="dsMidiCh" title="MIDI channel (10 = drums in General MIDI)."></select></div>
+          <div class="trow" title="How chromatic pitch indices are mapped to MIDI notes."><label for="dsMidiMap">Pitch mapping</label>
+            <select id="dsMidiMap" title="How chromatic pitch indices are mapped to MIDI notes."><option value="midi">Chromatic + 36 (like server playback)</option><option value="generic">Generic MIDI mapping</option></select></div>
+          <div class="trow" title="Tempo override. Empty = BPM stored in the dataset (120 if unknown)."><label for="dsMidiBpm">BPM override</label><input id="dsMidiBpm" type="number" min="20" max="400" step="1" placeholder="from dataset" title="Tempo override. Empty = BPM stored in the dataset." /></div>
+          <div class="trow" title="Repeat the sequence until stopped."><label for="dsMidiLoop">Loop</label><input id="dsMidiLoop" type="checkbox" checked title="Repeat the sequence until stopped." /></div>
+          <div class="trow" title="On: only pitches used in this sequence are shown (folded). Off: the piano roll shows every chromatic pitch row from 0 up to the highest pitch of the sequence."><label for="dsFold">Fold piano roll</label><input id="dsFold" type="checkbox" checked title="On: only pitches used in this sequence are shown (folded). Off: all pitch rows up to the highest pitch are shown." /></div>
+          <div class="trow" title="Quantize the notes of the current sequence to the 16th grid: 0 % = original microtiming, 100 % = every note exactly on the grid. Changes are applied live, also during playback."><label for="dsQuant">Quantize</label>
+            <div class="ds-inline"><input id="dsQuant" type="range" min="0" max="100" step="1" value="0" style="padding:0;border:0" title="0 % = original microtiming, 100 % = fully quantized to the 16th grid. Applied live." /><span id="dsQuantVal" class="hint" style="flex:0 0 44px;text-align:right">0 %</span></div></div>
+          <div class="train-actions">
+            <button id="dsPlayBtn" class="primary" type="button" title="Start playback of the current sequence on the selected MIDI output.">&#9654; Start playback</button>
+            <button id="dsStopBtn" class="danger" type="button" disabled title="Stop playback and silence all notes.">&#9632; Stop</button>
+          </div>
+          <div class="hint" id="dsMidiStatus"></div>
+        </fieldset>
+      </div>
+    </div>
+  </div>
 <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
 <script>
 const S = {
@@ -165,6 +420,9 @@ const S = {
   snappedCursor: [0, 0],
   snappedPoints: [],
   overlayStatus: "loading",
+  appIdle: false,
+  appMessages: [],
+  activeTab: "latent",
 };
 
 const field = document.getElementById("field");
@@ -292,7 +550,7 @@ function renderDatasetSelector() {
   if (options.length === 0) {
     const opt = document.createElement("option");
     opt.value = "";
-    opt.textContent = "(no datasets found)";
+    opt.textContent = "no dataset found";
     datasetSelectEl.appendChild(opt);
     datasetSelectEl.disabled = true;
     S.datasetName = "";
@@ -333,7 +591,8 @@ function setRenderingUiState() {
     renderProgressText.textContent = "Idle";
   }
 
-  const disableControls = isRendering;
+  const appIdle = !!S.appIdle;
+  const disableControls = isRendering || appIdle;
   [
     gridEl,
     sampleCountEl,
@@ -346,21 +605,59 @@ function setRenderingUiState() {
     latentFallbackEl,
     quantizeBtn,
     mapBtn,
-    datasetSelectEl,
-    checkpointModeEl,
-    checkpointStampEl,
+    renderBtn,
     blendLowEl,
     blendHighEl,
   ].forEach((el) => {
     el.disabled = disableControls;
     el.classList.toggle("controls-disabled", disableControls);
   });
+  // Dataset / checkpoint selectors stay usable while the app is idle so the user can pick another source.
+  // While a training runs the model is released, so nothing can be switched.
+  const lockSelectors = isRendering || !!S.appTraining;
+  [datasetSelectEl, checkpointModeEl, checkpointStampEl].forEach((el) => {
+    el.disabled = lockSelectors;
+    el.classList.toggle("controls-disabled", lockSelectors);
+  });
 
   fieldOverlay.style.pointerEvents = disableControls ? "none" : "auto";
 }
 
+function applyAppStatus(appStatus) {
+  const status = appStatus || { ready: true, messages: [] };
+  S.appIdle = status.ready === false;
+  S.appTraining = !!status.training;
+  S.appMessages = Array.isArray(status.messages) ? status.messages : [];
+  const banner = document.getElementById("appBanner");
+  banner.innerHTML = "";
+  if (S.appIdle) {
+    const title = document.createElement("strong");
+    const noModel = status.model_available === false;
+    const noData = status.dataset_available === false;
+    title.textContent = status.training ? "Idle: Training läuft / training is running"
+      : (noModel && noData ? "Idle: no model and no dataset available"
+        : (noModel ? "Idle: no model available" : "Idle: no dataset available"));
+    banner.appendChild(title);
+    const list = document.createElement("ul");
+    S.appMessages.forEach((msg) => {
+      const li = document.createElement("li");
+      li.textContent = String(msg);
+      list.appendChild(li);
+    });
+    banner.appendChild(list);
+    const hint = document.createElement("div");
+    hint.textContent = status.training
+      ? "The model is loaded again automatically when the training ends."
+      : "Add the missing files and reload this page.";
+    banner.appendChild(hint);
+  }
+  banner.classList.toggle("visible", S.appIdle);
+  document.querySelectorAll("#latentTab .panel").forEach((p) => p.classList.toggle("idle-app", S.appIdle));
+}
+
 function syncRenderHeartbeat() {
-  const shouldPoll = S.renderEnabled || S.renderStatus === "rendering";
+  // The heartbeat only runs while the Latent Field tab is visible.
+  const shouldPoll = (S.renderEnabled || S.renderStatus === "rendering") && S.activeTab === "latent";
   if (shouldPoll && renderHeartbeatId === null) {
     renderHeartbeatId = setInterval(() => {
       // Poll progress via normal frame responses; this keeps UI live even
@@ -647,6 +944,9 @@ function render() {
     `aspect=${S.mapMode ? "map" : "square"}`,
     `overlay=${S.overlayStatus}`,
   ];
+  if (S.appIdle) {
+    baseLines.unshift("app=IDLE (no model and/or dataset)", ...S.appMessages.map((m) => `  - ${m}`));
+  }
 
   statusEl.textContent = baseLines.join("\n");
 }
@@ -1046,6 +1346,7 @@ socket.on("bootstrap", (data) => {
   setHoveredAnchor(-1);
   modelCatalog = data.model_options || { modes: {} };
   modelSelection = data.model_selection || { mode: "none", previous: 0, timestamp: null };
+  applyAppStatus(data.app_status);
   gridEl.value = String(S.grid);
   syncSampleControls();
   sigmaEl.value = String(S.sigma);
@@ -1150,6 +1451,7 @@ socket.on("frame", (data) => {
   if (!pendingModelSwitch && data.model_selection) {
     modelSelection = data.model_selection;
   }
+  applyAppStatus(data.app_status);
   gridEl.value = String(S.grid);
   syncSampleControls();
   sigmaEl.value = String(S.sigma);
@@ -1211,6 +1513,1748 @@ updateRefinedBlendVisibility();
 applyFieldAspectMode(false);
 updateModelStatus();
 render();
+</script>
+<script>
+// ---------------------------------------------------------------------------------------------
+// Training tab. Training runs on the server (subprocess); this page is only GUI and monitoring.
+// ---------------------------------------------------------------------------------------------
+(function () {
+  const TRAIN_GROUPS = [
+    ["data", "Data"],
+    ["optim", "Optimization"],
+    ["beta", "Beta / annealing"],
+    ["model", "Model"],
+  ];
+  const TRAIN_FIELDS = [
+    { group: "data", key: "dataset_name", label: "Dataset", type: "select",
+      tip: "Dataset (.npz) used for training. Only datasets from data/<branch>/ of the current branch are listed." },
+    { group: "data", key: "validation_split", label: "Validation split", type: "number", step: "0.01", min: "0", max: "0.99",
+      tip: "Fraction of the samples held out for validation (0 = no validation, 0.1 = 10 %). Used to track best_val and overfitting." },
+    { group: "data", key: "n_samples", label: "Samples (0 = all)", type: "number", step: "1", min: "0",
+      tip: "Number of samples taken from the dataset (the first N). 0 uses the whole dataset." },
+    { group: "data", key: "batch_size", label: "Batch size", type: "number", step: "1", min: "1",
+      tip: "Sequences per optimizer step. Larger batches are faster per epoch but need more memory and give fewer steps per epoch." },
+    { group: "data", key: "seed", label: "Seed", type: "number", step: "1", min: "0",
+      tip: "Random seed for shuffling, the train/validation split and weight initialization (reproducible runs)." },
+    { group: "optim", key: "n_epochs", label: "Epochs", type: "number", step: "1", min: "1",
+      tip: "Number of passes over the training data. Also defines the length of the beta and learning-rate curves." },
+    { group: "optim", key: "learning_rate", label: "Learning rate", type: "number", step: "any",
+      tip: "Base learning rate of the AdamW optimizer. The scheduler overrides it with the start/end values below during the run." },
+    { group: "optim", key: "scheduler_start_lr", label: "Scheduler start LR", type: "number", step: "any",
+      tip: "Learning rate at the first step of the run. The scheduler decays from here to the end LR." },
+    { group: "optim", key: "scheduler_end_lr", label: "Scheduler end LR", type: "number", step: "any",
+      tip: "Learning rate at the last step of the run." },
+    { group: "optim", key: "scheduler_exp_curve_factor", label: "LR curve factor", type: "number", step: "any",
+      tip: "Shape of the LR decay: 0 = linear, larger values = faster decay early in the run (exponential curve), negative = slower at first." },
+    { group: "optim", key: "weight_decay", label: "Weight decay", type: "number", step: "any",
+      tip: "L2-style regularization of the AdamW optimizer. Larger values keep the weights small and reduce overfitting." },
+    { group: "beta", key: "free_bits", label: "Free bits", type: "number", step: "any", min: "0",
+      tip: "Minimum KL (per latent dimension) that is not penalized. Prevents posterior collapse; 0 disables it." },
+    { group: "beta", key: "annealing_slope", label: "Annealing slope", type: "number", step: "0.01", min: "0", max: "1",
+      tip: "Smoothing between the points of the beta curve (0 = hard linear segments, 1 = very smooth transitions)." },
+    { group: "model", key: "d_model", label: "d_model", type: "number", step: "1", min: "8", arch: true,
+      tip: "Width of the transformer (embedding size). Must be divisible by Heads. Changes the architecture; locked when resuming." },
+    { group: "model", key: "n_heads", label: "Heads", type: "number", step: "1", min: "1", arch: true,
+      tip: "Number of attention heads. d_model must be divisible by this value. Locked when resuming." },
+    { group: "model", key: "n_layers", label: "Layers", type: "number", step: "1", min: "1", arch: true,
+      tip: "Number of transformer layers in the encoder and the decoder. More layers = more capacity and slower training. Locked when resuming." },
+    { group: "model", key: "ff_dim", label: "Feed-forward dim", type: "number", step: "1", min: "1", arch: true,
+      tip: "Hidden size of the feed-forward block inside each transformer layer. Locked when resuming." },
+    { group: "model", key: "dropout", label: "Dropout", type: "number", step: "0.01", min: "0", max: "0.99", arch: true,
+      tip: "Probability of randomly dropping activations during training (regularization). 0 = off. Locked when resuming." },
+    { group: "model", key: "latent_dim", label: "Latent dim", type: "number", step: "1", min: "1", arch: true,
+      tip: "Size of the latent vector z (the bottleneck between encoder and decoder). Larger = more detail, harder to interpolate. Locked when resuming." },
+    { group: "model", key: "n_memory_tokens", label: "Memory tokens", type: "number", step: "1", min: "1", arch: true,
+      tip: "Number of memory tokens the decoder derives from z and attends to via cross-attention. Locked when resuming." },
+  ];
+  const ANNEAL_TIPS = {
+    section: "Beta curve: the weight of the KL term over the run. Each row is a point (position in the run, beta value); values between points are interpolated.",
+    pos: "Position within the whole run: 0 = first step, 1 = last step. Positions must be strictly ascending.",
+    beta: "Weight of the KL term at this position. Small = better reconstruction, large = smoother latent space.",
+    add: "Add another point to the beta curve.",
+    del: "Remove this point from the beta curve.",
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const tabLatentBtn = $("tabLatent");
+  const tabTrainBtn = $("tabTrain");
+  const tabDatasetBtn = $("tabDataset");
+  const latentTab = $("latentTab");
+  const trainTab = $("trainTab");
+  const modeEl = $("tMode");
+  const resumeBox = $("tResumeBox");
+  const resumeModeEl = $("tResumeMode");
+  const resumeStampEl = $("tResumeStamp");
+  const continueBetaEl = $("tContinueBeta");
+  const resumeStartLrEl = $("tResumeStartLr");
+  const resumeEndFactorEl = $("tResumeEndFactor");
+  const compileEl = $("tTorchCompile");
+  const logIntervalEl = $("tLogInterval");
+  const startBtn = $("tStartBtn");
+  const stopBtn = $("tStopBtn");
+  const resetBtn = $("tResetBtn");
+  const saveBtn = $("tSaveBtn");
+  const saveMsgEl = $("tSaveMsg");
+  const bannerEl = $("trainBanner");
+  const envEl = $("trainEnv");
+  const statusEl2 = $("tStatus");
+  const progFillEl = $("tProgFill");
+  const progTextEl = $("tProgText");
+  const logEl = $("tLog");
+  const ckptsEl = $("tCkpts");
+
+  const fieldEls = {};
+  let annealRows = [];          // [{pos, beta}] as strings, edited by the user
+  let annealDirty = false;
+  let annealBody = null;
+  let cfg = null;               // last train_config payload
+  let snap = null;              // last train snapshot
+  let wasActive = false;
+  let shownRunConfig = false;
+  let starting = false;
+
+  // ------------------------------------------------------------------ tabs
+  function showTab(name) {
+    S.activeTab = name;
+    const train = name === "train";
+    const dataset = name === "dataset";
+    latentTab.style.display = (train || dataset) ? "none" : "";
+    trainTab.classList.toggle("visible", train);
+    $("datasetTab").classList.toggle("visible", dataset);
+    tabLatentBtn.classList.toggle("active", !train && !dataset);
+    tabTrainBtn.classList.toggle("active", train);
+    tabDatasetBtn.classList.toggle("active", dataset);
+    if (window.__datasetTab) window.__datasetTab.setActive(dataset);
+    if (train) {
+      syncRenderHeartbeat();
+      redrawCharts();
+    } else if (dataset) {
+      syncRenderHeartbeat();
+    } else {
+      syncRenderHeartbeat();
+      render();
+    }
+    try { history.replaceState(null, "", train ? "#train" : (dataset ? "#dataset" : "#latent")); } catch (e) { /* ignore */ }
+  }
+  window.showAppTab = showTab;
+  tabLatentBtn.addEventListener("click", () => showTab("latent"));
+  tabTrainBtn.addEventListener("click", () => showTab("train"));
+  tabDatasetBtn.addEventListener("click", () => showTab("dataset"));
+
+  // ------------------------------------------------------------------ form
+  function el(tag, attrs, children) {
+    const node = document.createElement(tag);
+    Object.entries(attrs || {}).forEach(([k, v]) => {
+      if (k === "class") node.className = v;
+      else if (k === "text") node.textContent = v;
+      else node.setAttribute(k, v);
+    });
+    (children || []).forEach((c) => node.appendChild(c));
+    return node;
+  }
+
+  function buildForm() {
+    const host = $("tFormGroups");
+    TRAIN_GROUPS.forEach(([groupId, title]) => {
+      const fs = el("fieldset", {}, [el("legend", { text: title })]);
+      TRAIN_FIELDS.filter((f) => f.group === groupId).forEach((f) => {
+        const id = `tf_${f.key}`;
+        let input;
+        if (f.type === "select") {
+          input = el("select", { id });
+        } else {
+          input = el("input", { id, type: "number", step: f.step || "any" });
+          if (f.min !== undefined) input.min = f.min;
+          if (f.max !== undefined) input.max = f.max;
+        }
+        input.addEventListener("input", () => { input.dataset.dirty = "1"; input.classList.remove("invalid"); });
+        input.addEventListener("change", () => { input.dataset.dirty = "1"; });
+        fieldEls[f.key] = input;
+        const tip = f.tip ? `${f.label}: ${f.tip}` : f.label;
+        input.title = tip;
+        fs.appendChild(el("div", { class: "trow", title: tip }, [
+          el("label", { for: id, text: f.label, title: tip }),
+          input,
+          el("div", { class: "ferr", id: `terr_${f.key}` }),
+        ]));
+      });
+      if (groupId === "beta") {
+        const table = el("table", { class: "anneal-table", title: ANNEAL_TIPS.section });
+        table.appendChild(el("thead", {}, [el("tr", {}, [
+          el("th", { text: "Position (0..1)", title: ANNEAL_TIPS.pos }), el("th", { text: "Beta", title: ANNEAL_TIPS.beta }), el("th", { text: "" }),
+        ])]));
+        annealBody = el("tbody");
+        table.appendChild(annealBody);
+        fs.appendChild(el("div", { class: "hint", title: ANNEAL_TIPS.section, text: "Beta curve over the whole run (positions ascending, segments are smoothed)." }));
+        fs.appendChild(table);
+        const addBtn = el("button", { type: "button", id: "tAnnealAdd", text: "+ Add point", title: ANNEAL_TIPS.add });
+        addBtn.addEventListener("click", () => {
+          const last = annealRows.length ? annealRows[annealRows.length - 1] : { pos: "0", beta: "0" };
+          annealRows.push({ pos: String(Math.min(1, (Number(last.pos) || 0) + 0.1)), beta: last.beta });
+          annealDirty = true;
+          renderAnneal();
+        });
+        fs.appendChild(addBtn);
+        fs.appendChild(el("div", { class: "ferr", id: "terr_annealing_list", style: "grid-column:auto" }));
+      }
+      host.appendChild(fs);
+    });
+  }
+
+  function renderAnneal() {
+    annealBody.innerHTML = "";
+    annealRows.forEach((row, idx) => {
+      const pos = el("input", { type: "number", step: "0.01", min: "0", max: "1", title: ANNEAL_TIPS.pos });
+      pos.value = row.pos;
+      pos.addEventListener("input", () => { row.pos = pos.value; annealDirty = true; });
+      const beta = el("input", { type: "number", step: "any", min: "0", title: ANNEAL_TIPS.beta });
+      beta.value = row.beta;
+      beta.addEventListener("input", () => { row.beta = beta.value; annealDirty = true; });
+      const del = el("button", { type: "button", text: "\u2715", title: ANNEAL_TIPS.del });
+      del.addEventListener("click", () => { annealRows.splice(idx, 1); annealDirty = true; renderAnneal(); });
+      annealBody.appendChild(el("tr", {}, [el("td", {}, [pos]), el("td", {}, [beta]), el("td", {}, [del])]));
+    });
+    updateControls();
+  }
+
+  function setField(key, value, allowUnlisted) {
+    const node = fieldEls[key];
+    if (!node) return;
+    if (key === "dataset_name") {
+      const listed = [...node.options].some((o) => o.value === value);
+      // Only datasets that really exist in data/<branch>/ are offered. A name that is not on disk
+      // (e.g. the default from hparams.py) is shown only when it belongs to a running training.
+      if (value && !listed && allowUnlisted) {
+        node.appendChild(el("option", { value, text: value }));
+      }
+      if (value && [...node.options].some((o) => o.value === value)) node.value = value;
+    } else {
+      node.value = String(value);
+    }
+  }
+
+  function setAnnealing(list) {
+    annealRows = (Array.isArray(list) ? list : []).map((p) => ({ pos: String(p[0]), beta: String(p[1]) }));
+    renderAnneal();
+  }
+
+  function fillDefaults(defaults, force) {
+    if (!defaults) return;
+    TRAIN_FIELDS.forEach((f) => {
+      if (defaults[f.key] === undefined) return;
+      if (force || fieldEls[f.key].dataset.dirty !== "1") {
+        setField(f.key, defaults[f.key]);
+        if (force) delete fieldEls[f.key].dataset.dirty;
+      }
+    });
+    if (defaults.annealing_list && (force || !annealDirty)) {
+      setAnnealing(defaults.annealing_list);
+      if (force) annealDirty = false;
+    }
+  }
+
+  function parseNumber(node) {
+    const raw = node.value.trim();
+    if (raw === "") return "";
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : raw;
+  }
+
+  function collectFields(onlyDirty, skipArchitecture) {
+    const out = {};
+    TRAIN_FIELDS.forEach((f) => {
+      if (skipArchitecture && f.arch) return;
+      const node = fieldEls[f.key];
+      if (onlyDirty && node.dataset.dirty !== "1") return;
+      out[f.key] = f.type === "select" ? node.value : parseNumber(node);
+    });
+    if (!onlyDirty || annealDirty) {
+      out.annealing_list = annealRows.map((r) => [parseNumber({ value: String(r.pos) }), parseNumber({ value: String(r.beta) })]);
+    }
+    return out;
+  }
+
+  function collectConfig() {
+    const mode = modeEl.value;
+    const config = {
+      mode,
+      overrides: collectFields(mode === "resume", mode === "resume"),
+      options: { torch_compile: compileEl.checked, log_interval: parseNumber(logIntervalEl) },
+    };
+    if (mode === "resume") {
+      config.resume = {
+        mode: resumeModeEl.value,
+        previous: Number(resumeStampEl.value || 0),
+        continue_beta: continueBetaEl.checked,
+      };
+      if (resumeStartLrEl.value.trim() !== "") config.resume.start_lr = parseNumber(resumeStartLrEl);
+      if (resumeEndFactorEl.value.trim() !== "") config.resume.end_lr_factor = parseNumber(resumeEndFactorEl);
+    }
+    return config;
+  }
+
+  // ------------------------------------------------------------------ errors / banner
+  function clearErrors() {
+    document.querySelectorAll("#trainTab .ferr").forEach((n) => { n.textContent = ""; });
+    document.querySelectorAll("#trainTab .invalid").forEach((n) => n.classList.remove("invalid"));
+  }
+
+  function showErrors(errors) {
+    clearErrors();
+    const general = [];
+    Object.entries(errors || {}).forEach(([key, message]) => {
+      let target = null;
+      let input = null;
+      if (key === "resume_mode" || key === "resume_previous") {
+        target = $("terr_resume");
+        input = resumeStampEl;
+      } else if (key === "resume_start_lr") {
+        target = $("terr_resume_start_lr");
+        input = resumeStartLrEl;
+      } else if (key === "resume_end_lr_factor") {
+        target = $("terr_resume_end_lr_factor");
+        input = resumeEndFactorEl;
+      } else {
+        target = $(`terr_${key}`);
+        input = fieldEls[key] || (key === "log_interval" ? logIntervalEl : null);
+      }
+      if (target) {
+        target.textContent = target.textContent ? `${target.textContent}; ${message}` : String(message);
+        if (input) input.classList.add("invalid");
+      } else {
+        general.push(`${key}: ${message}`);
+      }
+      if (key === "general") general.push(String(message));
+    });
+    $("terr_general").textContent = [...new Set(general)].join(" | ");
+  }
+
+  function setBanner(kind, title, lines) {
+    bannerEl.className = "app-banner visible" + (kind ? ` ${kind}` : "");
+    bannerEl.innerHTML = "";
+    const strong = document.createElement("strong");
+    strong.textContent = title;
+    bannerEl.appendChild(strong);
+    (lines || []).forEach((line) => {
+      const div = document.createElement("div");
+      div.textContent = line;
+      bannerEl.appendChild(div);
+    });
+  }
+
+  function hideBanner() {
+    bannerEl.className = "app-banner";
+  }
+
+  // ------------------------------------------------------------------ controls
+  function isActive() { return !!(snap && snap.active); }
+
+  function updateControls() {
+    const active = isActive();
+    const resume = modeEl.value === "resume";
+    const noDatasetsFound = !cfg || !(cfg.datasets && cfg.datasets.length);
+    TRAIN_FIELDS.forEach((f) => {
+      fieldEls[f.key].disabled = active || (resume && !!f.arch) || (f.key === "dataset_name" && noDatasetsFound);
+    });
+    [modeEl, resumeModeEl, resumeStampEl, continueBetaEl, resumeStartLrEl, resumeEndFactorEl, compileEl, logIntervalEl, resetBtn, saveBtn]
+      .forEach((n) => { n.disabled = active; });
+    const noDatasets = !cfg || !(cfg.datasets && cfg.datasets.length);
+    startBtn.disabled = active || starting || noDatasets;
+    stopBtn.disabled = !active;
+    stopBtn.textContent = snap && snap.state === "stopping" ? "Force kill" : "Stop";
+    document.querySelectorAll("#trainTab .anneal-table input, #trainTab .anneal-table button, #tAnnealAdd")
+      .forEach((n) => { n.disabled = active; });
+    resumeBox.style.display = resume ? "" : "none";
+  }
+
+  function renderResumeSelectors() {
+    const modes = (cfg && cfg.model_options && cfg.model_options.modes) || {};
+    const currentKind = resumeModeEl.value;
+    const currentStamp = resumeStampEl.value;
+    resumeModeEl.innerHTML = "";
+    ["last", "best_val", "best_train", "none"].forEach((kind) => {
+      const info = modes[kind];
+      if (!info) return;
+      const opt = el("option", { value: kind, text: `${info.label}${info.enabled ? "" : " (none)"}` });
+      opt.disabled = !info.enabled;
+      resumeModeEl.appendChild(opt);
+    });
+    const firstEnabled = [...resumeModeEl.options].find((o) => !o.disabled);
+    resumeModeEl.value = (currentKind && [...resumeModeEl.options].some((o) => o.value === currentKind && !o.disabled))
+      ? currentKind : (firstEnabled ? firstEnabled.value : "");
+    renderResumeStamps(currentStamp);
+  }
+
+  function renderResumeStamps(keep) {
+    const modes = (cfg && cfg.model_options && cfg.model_options.modes) || {};
+    const items = ((modes[resumeModeEl.value] || {}).items) || [];
+    resumeStampEl.innerHTML = "";
+    items.forEach((item) => {
+      resumeStampEl.appendChild(el("option", { value: String(item.previous), text: item.previous === 0 ? `${item.timestamp} (latest)` : item.timestamp }));
+    });
+    if (keep !== undefined && [...resumeStampEl.options].some((o) => o.value === keep)) resumeStampEl.value = keep;
+  }
+  resumeModeEl.addEventListener("change", () => renderResumeStamps());
+  modeEl.addEventListener("change", updateControls);
+
+  // ------------------------------------------------------------------ charts
+  function fmt(v) {
+    if (!Number.isFinite(v)) return "";
+    const a = Math.abs(v);
+    if (a !== 0 && (a < 0.001 || a >= 10000)) return v.toExponential(1);
+    return Number(v.toPrecision(3)).toString();
+  }
+
+  function drawChart(canvas, series, emptyText) {
+    const r = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(1, Math.floor(r.width * dpr));
+    const h = Math.max(1, Math.floor(r.height * dpr));
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, w, h);
+    ctx.save();
+    ctx.scale(dpr, dpr);
+    const W = w / dpr;
+    const H = h / dpr;
+    const left = 46, right = 8, top = 14, bottom = 16;
+    const values = [];
+    let n = 0;
+    series.forEach((s) => { n = Math.max(n, s.data.length); s.data.forEach((v) => { if (Number.isFinite(v)) values.push(v); }); });
+    ctx.font = "10px Helvetica, Arial, sans-serif";
+    ctx.fillStyle = "#5b6a60";
+    if (!values.length) {
+      ctx.fillText(emptyText || "no data yet", left, H / 2);
+      ctx.restore();
+      return;
+    }
+    let lo = Math.min(...values);
+    let hi = Math.max(...values);
+    if (hi - lo < 1e-12) { const pad = Math.abs(hi) * 0.1 || 0.5; lo -= pad; hi += pad; }
+    const px = (i) => left + (n <= 1 ? 0.5 : i / (n - 1)) * (W - left - right);
+    const py = (v) => top + (1 - (v - lo) / (hi - lo)) * (H - top - bottom);
+    ctx.strokeStyle = "#e3e5dc";
+    ctx.lineWidth = 1;
+    for (let g = 0; g <= 3; g++) {
+      const v = lo + ((hi - lo) * g) / 3;
+      const y = py(v);
+      ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(W - right, y); ctx.stroke();
+      ctx.fillText(fmt(v), 2, y + 3);
+    }
+    ctx.fillText(n > 1 ? `1 \u2026 ${n}` : "1", left, H - 3);
+    series.forEach((s) => {
+      ctx.strokeStyle = s.color;
+      ctx.fillStyle = s.color;
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      let open = false;
+      s.data.forEach((v, i) => {
+        if (!Number.isFinite(v)) { open = false; return; }
+        if (!open) { ctx.moveTo(px(i), py(v)); open = true; } else { ctx.lineTo(px(i), py(v)); }
+      });
+      ctx.stroke();
+      if (n <= 40) {
+        s.data.forEach((v, i) => { if (Number.isFinite(v)) { ctx.beginPath(); ctx.arc(px(i), py(v), 2, 0, Math.PI * 2); ctx.fill(); } });
+      }
+    });
+    // legend (one line)
+    let lx = left;
+    series.forEach((s) => {
+      ctx.fillStyle = s.color;
+      ctx.fillRect(lx, 3, 8, 3);
+      ctx.fillStyle = "#405347";
+      ctx.fillText(s.label, lx + 11, 8);
+      lx += 11 + ctx.measureText(s.label).width + 10;
+    });
+    ctx.restore();
+  }
+
+  function redrawCharts() {
+    if (S.activeTab !== "train") return;
+    const epochs = (snap && snap.epochs) || [];
+    const pick = (fn) => epochs.map((e) => { try { const v = fn(e); return v === null || v === undefined ? NaN : Number(v); } catch (err) { return NaN; } });
+    drawChart($("chLoss"), [
+      { label: "train", color: "#2b7e7a", data: pick((e) => e.train.loss) },
+      { label: "val", color: "#d06c3b", data: pick((e) => e.val && e.val.loss) },
+    ]);
+    drawChart($("chKl"), [
+      { label: "train", color: "#2b7e7a", data: pick((e) => e.train.kl) },
+      { label: "val", color: "#d06c3b", data: pick((e) => e.val && e.val.kl) },
+    ]);
+    drawChart($("chBeta"), [{ label: "beta", color: "#6a5acd", data: pick((e) => e.beta) }]);
+    drawChart($("chLr"), [{ label: "lr", color: "#a34922", data: pick((e) => e.lr) }]);
+    const batches = (snap && snap.batches) || [];
+    drawChart($("chBatch"), [{ label: "loss", color: "#2d9d5b", data: batches.map((b) => Number(b.loss)) }]);
+  }
+  window.addEventListener("resize", redrawCharts);
+
+  // ------------------------------------------------------------------ monitoring
+  function fmtDuration(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) return "-";
+    const s = Math.round(seconds);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    return h > 0 ? `${h}h ${m}m ${sec}s` : (m > 0 ? `${m}m ${sec}s` : `${sec}s`);
+  }
+
+  function renderMonitor() {
+    const s = snap;
+    if (!s) return;
+    const epochs = s.epochs || [];
+    const lastEpoch = epochs.length ? epochs[epochs.length - 1] : null;
+    const batch = s.last_batch;
+    const totalEpochs = lastEpoch ? lastEpoch.epochs
+      : (s.config && s.config.overrides && s.config.overrides.n_epochs) || (cfg && cfg.defaults && cfg.defaults.n_epochs) || 0;
+    let fraction = 0;
+    if (totalEpochs > 0) {
+      const done = lastEpoch ? lastEpoch.epoch : 0;
+      let partial = 0;
+      if (batch && batch.steps > 0 && (!lastEpoch || batch.epoch > lastEpoch.epoch)) partial = batch.step / batch.steps;
+      fraction = Math.min(1, (done + partial) / totalEpochs);
+    }
+    if (s.state === "finished" && !s.stopped && epochs.length) fraction = 1;
+    progFillEl.style.width = `${(fraction * 100).toFixed(1)}%`;
+    const remaining = lastEpoch && s.active ? lastEpoch.remaining : null;
+    progTextEl.textContent = s.state === "idle" ? "Idle"
+      : `${s.state}${totalEpochs ? ` \u2013 epoch ${lastEpoch ? Math.min(lastEpoch.epoch + (s.active ? 1 : 0), totalEpochs) : 1}/${totalEpochs}` : ""}`
+        + ` \u2013 ${(fraction * 100).toFixed(0)}%${remaining !== null ? ` \u2013 about ${fmtDuration(remaining)} left` : ""}`;
+
+    const lines = [`state: ${s.state}${s.stopped ? " (stopped)" : ""}${s.status_text ? ` \u2013 ${s.status_text}` : ""}`];
+    if (batch) {
+      lines.push(`epoch ${batch.epoch}, step ${batch.step}/${batch.steps}, loss ${fmt(Number(batch.loss))}, beta ${fmt(Number(batch.beta))}, lr ${fmt(Number(batch.lr))}, ${Number(batch.step_time).toFixed(3)} s/step`);
+    }
+    if (lastEpoch) {
+      const v = lastEpoch.val ? `, val ${fmt(lastEpoch.val.loss)}` : "";
+      lines.push(`last epoch ${lastEpoch.epoch}: train ${fmt(lastEpoch.train.loss)} (rec ${fmt(lastEpoch.train.rec)}, kl ${fmt(lastEpoch.train.kl)})${v}, ppl ${fmt(lastEpoch.train.ppl)}, ${lastEpoch.epoch_time.toFixed(1)} s/epoch`);
+    }
+    lines.push(`elapsed ${fmtDuration(s.elapsed)}${remaining !== null ? `, remaining ~${fmtDuration(remaining)}` : ""}${s.pid ? `, pid ${s.pid}` : ""}`);
+    if (s.error) lines.push(`error: ${s.error}`);
+    statusEl2.textContent = lines.join("\n");
+
+    const stick = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 8;
+    logEl.textContent = (s.logs || []).map((l) => l.text).join("\n");
+    if (stick) logEl.scrollTop = logEl.scrollHeight;
+
+    ckptsEl.innerHTML = "";
+    const seen = new Map();
+    (s.checkpoints || []).forEach((c) => seen.set(`${c.kind}|${c.path}`, c));
+    [...seen.values()].slice(-14).reverse().forEach((c) => {
+      const li = document.createElement("li");
+      li.textContent = `${c.kind}: ${String(c.path || "").split(/[\\/]/).pop()}`;
+      ckptsEl.appendChild(li);
+    });
+    redrawCharts();
+  }
+
+  function renderBanner() {
+    if (!snap) return;
+    if (snap.state === "starting" || snap.state === "running") {
+      setBanner("", "Training l\u00e4uft / training is running",
+        ["The latent field is paused and the model is released. It returns automatically when the training ends."]);
+    } else if (snap.state === "stopping") {
+      setBanner("", "Stopping \u2026", ["Waiting for the current batch to finish; the last state is saved as model_last_*.pt. The first batch with torch.compile can take long \u2013 'Force kill' ends the process immediately."]);
+    } else if (snap.state === "failed") {
+      setBanner("err", "Training failed", [snap.error || "unknown error"]);
+    } else if (snap.state === "finished") {
+      setBanner("ok", snap.stopped ? "Training stopped" : "Training finished",
+        ["The new checkpoint is available in the Latent Field tab (Model Checkpoint)."]);
+    } else {
+      hideBanner();
+    }
+  }
+
+  function applySnapshot(next) {
+    if (!next) return;
+    snap = next;
+    const active = isActive();
+    if (active && !shownRunConfig && snap.config && snap.config.overrides) {
+      // Page loaded (or another client started) while a training runs: show what is running.
+      shownRunConfig = true;
+      modeEl.value = snap.config.mode === "resume" ? "resume" : "new";
+      Object.entries(snap.config.overrides).forEach(([key, value]) => {
+        if (key === "annealing_list") setAnnealing(value); else setField(key, value, true);
+      });
+      if (snap.config.options) {
+        compileEl.checked = !!snap.config.options.torch_compile;
+        if (snap.config.options.log_interval) logIntervalEl.value = String(snap.config.options.log_interval);
+      }
+    }
+    if (!active) shownRunConfig = false;
+    if (active) starting = false;
+    renderBanner();
+    renderMonitor();
+    updateControls();
+    if (wasActive && !active) {
+      // Training ended: inference is reloaded on the server; refresh the latent field and the checkpoint lists.
+      socket.emit("bootstrap");
+      socket.emit("train_get_config");
+    }
+    wasActive = active;
+  }
+
+  // ------------------------------------------------------------------ socket events
+  function applyConfig(payload) {
+    cfg = payload;
+    const select = fieldEls.dataset_name;
+    const currentDataset = select.value;
+    select.innerHTML = "";
+    (cfg.datasets || []).forEach((name) => select.appendChild(el("option", { value: name, text: name })));
+    if (!(cfg.datasets || []).length) {
+      select.appendChild(el("option", { value: "", text: "no dataset found" }));
+    }
+    select.disabled = !(cfg.datasets || []).length;
+    fillDefaults(cfg.defaults, false);
+    if (currentDataset && [...select.options].some((o) => o.value === currentDataset) && select.dataset.dirty === "1") select.value = currentDataset;
+    if (!shownRunConfig && !compileEl.dataset.touched) compileEl.checked = !!(cfg.options && cfg.options.torch_compile);
+    envEl.textContent = `Branch: ${cfg.branch} \u00b7 device: ${cfg.device} \u00b7 data/${cfg.branch}/: ${(cfg.datasets || []).length} dataset(s)`;
+    renderResumeSelectors();
+    if (cfg.state) applySnapshot(cfg.state);
+    updateControls();
+  }
+  compileEl.addEventListener("change", () => { compileEl.dataset.touched = "1"; });
+
+  socket.on("connect", () => { socket.emit("train_get_config"); });
+  if (socket.connected) socket.emit("train_get_config");
+  socket.on("train_config", applyConfig);
+  socket.on("train_update", applySnapshot);
+
+  socket.on("train_start_result", (result) => {
+    starting = false;
+    if (result && result.ok) {
+      clearErrors();
+      saveMsgEl.textContent = "";
+      setBanner("", "Training starting \u2026", ["Releasing the model and starting the worker process."]);
+    } else {
+      showErrors((result && result.errors) || { general: "start failed" });
+      setBanner("err", "Training could not be started", ["Fix the marked fields and try again."]);
+    }
+    updateControls();
+  });
+
+  socket.on("train_stop_result", (result) => {
+    if (result && result.ok === false) saveMsgEl.textContent = "No running training to stop.";
+  });
+
+  socket.on("hparams_save_result", (result) => {
+    if (result && result.ok) {
+      clearErrors();
+      let text = result.message || "Saved.";
+      const derived = Object.entries(result.derived || {});
+      if (derived.length) text += ` Derived values changed too: ${derived.map(([k, v]) => `${k}=${v}`).join(", ")}.`;
+      saveMsgEl.textContent = text;
+      socket.emit("train_get_config");
+    } else {
+      showErrors((result && result.errors) || {});
+      saveMsgEl.textContent = `Not saved: ${(result && result.message) || "unknown error"}`;
+    }
+  });
+
+  // ------------------------------------------------------------------ buttons
+  startBtn.addEventListener("click", () => {
+    clearErrors();
+    starting = true;
+    updateControls();
+    socket.emit("train_start", collectConfig());
+  });
+
+  stopBtn.addEventListener("click", () => {
+    if (!snap || !snap.active) return;
+    if (snap.state === "stopping") {
+      if (confirm("Kill the training process now? The last epoch checkpoint is kept, but the current epoch is lost.")) {
+        socket.emit("train_stop", { force: true });
+      }
+      return;
+    }
+    socket.emit("train_stop", { force: false });
+  });
+
+  resetBtn.addEventListener("click", () => {
+    clearErrors();
+    saveMsgEl.textContent = "";
+    if (cfg) fillDefaults(cfg.defaults, true);
+  });
+
+  saveBtn.addEventListener("click", () => {
+    clearErrors();
+    saveMsgEl.textContent = "Saving \u2026";
+    const changes = collectFields(false, modeEl.value === "resume");
+    socket.emit("hparams_save", { changes });
+  });
+
+  buildForm();
+  renderAnneal();
+  updateControls();
+  showTab(window.location.hash === "#train" ? "train" : (window.location.hash === "#dataset" ? "dataset" : "latent"));
+})();
+</script>
+<script>
+// ---------------------------------------------------------------------------------------------
+// Dataset tab. All computation and all paths live on the server (MIDI extraction, merge, augmentation,
+// statistics, note lists). This page only shows them, and plays the current sequence on a Web MIDI output.
+// ---------------------------------------------------------------------------------------------
+(function () {
+  const $ = (id) => document.getElementById(id);
+  function el(tag, attrs, children) {
+    const node = document.createElement(tag);
+    Object.entries(attrs || {}).forEach(([k, v]) => {
+      if (k === "class") node.className = v;
+      else if (k === "text") node.textContent = v;
+      else node.setAttribute(k, v);
+    });
+    (children || []).forEach((c) => node.appendChild(c));
+    return node;
+  }
+
+  const LOOKAHEAD_MS = 100;
+  const ds = {
+    state: null, job: null, datasets: [], selected: null, info: null, seq: null, seqIndex: 0,
+    active: false, loaded: false, mine: false, merge: new Set(), lastJobState: "idle", hparams: null,
+  };
+
+  // ------------------------------------------------------------------ field definitions (with tooltips)
+  const EXTRACT_FIELDS = [
+    { key: "name", label: "Dataset name", type: "text", ph: "e.g. dataset-groove",
+      tip: "Name of the new dataset. It is saved on the server as data/<branch>/<name>.npz." },
+    { key: "mapping", label: "Pitch mapping", type: "select", options: [
+        ["none", "None (wrap to 24 pitches, default)"],
+        ["groove_to_specific", "Groove \u2192 specific chromatic"],
+        ["generic_midi_mapping", "Generic MIDI mapping (fan-out)"],
+        ["generic_to_chromatic", "Generic \u2192 chromatic"]],
+      tip: "How MIDI drum pitches are mapped to the chromatic pitch tokens. 'None' only wraps the pitches to 24 values ((pitch - 12) % 24). 'Groove \u2192 specific' is a deterministic mapping of Groove-MIDI style drum maps onto 54 chromatic pitches." },
+    { key: "drums_only", label: "Drums only", type: "checkbox", def: false,
+      tip: "Only use drum tracks and remap them to the drum kit range. Use it for multi-instrument collections (e.g. Lakh)." },
+    { key: "filter_duplicates", label: "Filter duplicates", type: "checkbox", def: true,
+      tip: "Remove identical token sequences (and their metadata) after the extraction." },
+    { key: "clip", label: "Clip pitch range", type: "checkbox", def: false,
+      tip: "Drop notes outside the 25 drum pitches 36..60 (hi-hat edge notes 22/26 are mapped to 42/46)." },
+    { key: "roland", label: "Roland mapping", type: "checkbox", def: true,
+      tip: "Use the Roland drum layout when clipping or remapping drum pitches." },
+    { key: "remap", label: "Remap pitches", type: "checkbox", def: false,
+      tip: "Apply the predefined pitch remapping table before tokenizing." },
+    { key: "pitch_randomness", label: "Randomize pitches", type: "checkbox", def: false,
+      tip: "Randomly permute the pitches that occur in a file (augmentation, destroys the instrument meaning)." },
+    { key: "skip", label: "Skip files", type: "number", min: "0", step: "1", def: "0",
+      tip: "Number of MIDI files to skip at the start (files are sorted by path)." },
+    { key: "take", label: "Take files (0 = all)", type: "number", min: "0", step: "1", def: "0",
+      tip: "Number of MIDI files to use after skipping. 0 uses all remaining files." },
+    { key: "jump", label: "Window jump (bars)", type: "number", min: "1", step: "1", def: "1",
+      tip: "Step between two extracted 2-bar windows of a file, in windows. 1 = every window, 2 = every second window, \u2026" },
+    { key: "randomize_velocity", label: "Velocity noise", type: "number", min: "0", max: "1", step: "0.01", def: "0",
+      tip: "Random velocity deviation as a fraction of the full range (0 = exact velocities, 0.1 = \u00b110 %)." },
+    { key: "qnt_strength", label: "Quantize strength", type: "number", min: "0", max: "1", step: "0.01", def: "0",
+      tip: "How strongly note starts are pulled to the 16th grid (0 = keep the micro timing, 1 = fully quantized)." },
+    { key: "qnt_randomness", label: "Quantize randomness", type: "number", min: "0", max: "1", step: "0.01", def: "0",
+      tip: "Random variation of the quantize strength per file (0..1)." },
+    { key: "overwrite", label: "Overwrite existing", type: "checkbox", def: false,
+      tip: "Allow replacing a dataset with the same name. Without it, existing datasets are protected." },
+  ];
+  const MERGE_FIELDS = [
+    { key: "name", label: "Output name", type: "text", ph: "e.g. dataset-merged",
+      tip: "Name of the merged dataset (data/<branch>/<name>.npz). It must differ from the sources." },
+    { key: "dedupe", label: "Remove duplicates", type: "checkbox", def: false,
+      tip: "Drop identical token sequences that appear in more than one source." },
+    { key: "overwrite", label: "Overwrite existing", type: "checkbox", def: false,
+      tip: "Allow replacing a dataset with the same name." },
+  ];
+  const AUGMENT_FIELDS = [
+    { key: "source", label: "Source dataset", type: "select", options: [],
+      tip: "Dataset (data/<branch>/) that is augmented. The source itself is not changed." },
+    { key: "name", label: "Output name", type: "text", ph: "e.g. dataset-augmented",
+      tip: "Name of the augmented dataset. The output contains only augmented sequences, capped to the source size." },
+    { key: "keep_percentage", label: "Keep percentage", type: "number", min: "0.1", max: "100", step: "any", def: "100",
+      tip: "Randomly keep this percentage of the generated augmented sequences (100 = all up to the source size)." },
+    { key: "velocity_scales", label: "Velocity scales", type: "text", def: "0.5, 0.75, 1.25",
+      tip: "Comma separated global velocity factors applied to a whole sequence (0.5 = half as loud)." },
+    { key: "microshift_deltas", label: "Micro-shift steps", type: "text", def: "-2, 2",
+      tip: "Comma separated shifts of all timing tokens in timing steps (+/- moves every note slightly early or late)." },
+    { key: "seed", label: "Seed (optional)", type: "number", min: "0", step: "1", ph: "random",
+      tip: "Random seed for reproducible augmentation. Empty = different result every time." },
+    { key: "overwrite", label: "Overwrite existing", type: "checkbox", def: false,
+      tip: "Allow replacing a dataset with the same name." },
+  ];
+
+  function buildFields(host, prefix, fields) {
+    const els = {};
+    fields.forEach((f) => {
+      const id = `ds_${prefix}_${f.key}`;
+      let input;
+      if (f.type === "select") {
+        input = el("select", { id });
+        (f.options || []).forEach(([v, t]) => input.appendChild(el("option", { value: v, text: t })));
+      } else if (f.type === "checkbox") {
+        input = el("input", { id, type: "checkbox" });
+        input.checked = !!f.def;
+      } else {
+        input = el("input", { id, type: f.type === "number" ? "number" : "text" });
+        if (f.min !== undefined) input.min = f.min;
+        if (f.max !== undefined) input.max = f.max;
+        if (f.step !== undefined) input.step = f.step;
+        if (f.ph) input.placeholder = f.ph;
+        if (f.def !== undefined) input.value = f.def;
+      }
+      const tip = `${f.label}: ${f.tip}`;
+      input.title = tip;
+      input.addEventListener("input", () => input.classList.remove("invalid"));
+      host.appendChild(el("div", { class: "trow", title: tip }, [
+        el("label", { for: id, text: f.label, title: tip }),
+        input,
+        el("div", { class: "ferr", id: `dserr_${prefix}_${f.key}` }),
+      ]));
+      els[f.key] = input;
+    });
+    return els;
+  }
+
+  function collect(els, fields) {
+    const out = {};
+    fields.forEach((f) => {
+      const node = els[f.key];
+      out[f.key] = f.type === "checkbox" ? node.checked : node.value;
+    });
+    return out;
+  }
+
+  const extractEls = buildFields($("dsExtractFields"), "extract", EXTRACT_FIELDS);
+  const mergeEls = buildFields($("dsMergeFields"), "merge", MERGE_FIELDS);
+  const augmentEls = buildFields($("dsAugmentFields"), "augment", AUGMENT_FIELDS);
+
+  // ------------------------------------------------------------------ helpers
+  function fmtBytes(n) {
+    if (n === null || n === undefined) return "-";
+    if (n >= 1048576) return `${(n / 1048576).toFixed(1)} MB`;
+    if (n >= 1024) return `${(n / 1024).toFixed(0)} kB`;
+    return `${n} B`;
+  }
+  function fmtTime(sec) {
+    if (sec === null || sec === undefined || !isFinite(sec)) return "-";
+    sec = Math.round(sec);
+    const m = Math.floor(sec / 60);
+    return m > 0 ? `${m}m ${String(sec % 60).padStart(2, "0")}s` : `${sec}s`;
+  }
+  function fmtDate(iso) {
+    if (!iso) return "-";
+    const d = new Date(iso);
+    return isNaN(d.getTime()) ? String(iso) : d.toLocaleString();
+  }
+  function fmtCount(v) {
+    if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+    if (v >= 1e3) return `${(v / 1e3).toFixed(v >= 1e4 ? 0 : 1)}k`;
+    return String(Math.round(v));
+  }
+  function showBanner(kind, html) {
+    const b = $("dsBanner");
+    if (!html) { b.className = "app-banner"; b.textContent = ""; return; }
+    b.className = `app-banner visible${kind ? " " + kind : ""}`;
+    b.textContent = html;
+  }
+  function clearErrors() {
+    document.querySelectorAll("#datasetTab [id^='dserr_']").forEach((n) => { n.textContent = ""; });
+    document.querySelectorAll("#datasetTab .invalid").forEach((n) => n.classList.remove("invalid"));
+  }
+  function showErrors(prefix, errors) {
+    clearErrors();
+    Object.entries(errors || {}).forEach(([key, msg]) => {
+      const node = $(`dserr_${prefix}_${key}`) || $("dserr_general");
+      node.textContent = node.id === "dserr_general" && key !== "general" ? `${key}: ${msg}` : String(msg);
+      const input = $(`ds_${prefix}_${key}`) || (key === "folder" ? $("dsFolder") : null);
+      if (input) input.classList.add("invalid");
+    });
+  }
+  function prepCanvas(c) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = c.clientWidth, h = c.clientHeight;
+    if (!w || !h) return null;
+    if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
+      c.width = Math.round(w * dpr);
+      c.height = Math.round(h * dpr);
+    }
+    const ctx = c.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    return { ctx, w, h };
+  }
+
+  // ------------------------------------------------------------------ server folder browser
+  const folderEl = $("dsFolder");
+  const browsePathEl = $("dsBrowsePath");
+  let browseState = null;
+
+  // Path fields are wrapping text areas that grow with their content, so the whole path is always visible.
+  function autoGrow(node) {
+    node.style.height = "auto";
+    node.style.height = `${Math.max(30, node.scrollHeight + 2)}px`;
+  }
+  function setPath(node, value) {
+    node.value = value;
+    autoGrow(node);
+  }
+  [folderEl, browsePathEl].forEach((node) => {
+    node.addEventListener("input", () => autoGrow(node));
+    node.addEventListener("keydown", (e) => { if (e.key === "Enter") e.preventDefault(); });
+  });
+  window.addEventListener("resize", () => { autoGrow(folderEl); autoGrow(browsePathEl); });
+
+  function browse(path) {
+    $("dsBrowser").style.display = "";
+    autoGrow(browsePathEl);
+    socket.emit("ds_browse", { path: path === undefined ? (browseState ? browseState.path : folderEl.value) : path, show_hidden: $("dsShowHidden").checked });
+  }
+  $("dsBrowseBtn").addEventListener("click", () => {
+    if ($("dsBrowser").style.display === "none") browse(folderEl.value.trim()); else $("dsBrowser").style.display = "none";
+  });
+  $("dsCloseBrowserBtn").addEventListener("click", () => { $("dsBrowser").style.display = "none"; });
+  $("dsUpBtn").addEventListener("click", () => { if (browseState && browseState.parent) browse(browseState.parent); });
+  $("dsGoBtn").addEventListener("click", () => browse($("dsBrowsePath").value.trim()));
+  browsePathEl.addEventListener("keydown", (e) => { if (e.key === "Enter") browse(browsePathEl.value.trim()); });
+  $("dsShowHidden").addEventListener("change", () => browse());
+  $("dsSelectBtn").addEventListener("click", () => {
+    if (!browseState) return;
+    setPath(folderEl, browseState.path);
+    folderEl.classList.remove("invalid");
+    $("dsBrowser").style.display = "none";
+    scanFolder();
+  });
+  folderEl.addEventListener("change", scanFolder);
+
+  function scanFolder() {
+    const path = folderEl.value.trim();
+    $("dsScanInfo").textContent = path ? "Scanning \u2026" : "";
+    if (path) socket.emit("ds_scan", { path });
+  }
+
+  socket.on("ds_browse_result", (res) => {
+    if (!res.ok) { $("dsBrowseInfo").textContent = `Error: ${res.error}`; return; }
+    browseState = res;
+    setPath(browsePathEl, res.path);
+    $("dsUpBtn").disabled = !res.parent;
+    const sc = $("dsShortcuts");
+    sc.innerHTML = "";
+    (res.shortcuts || []).forEach((s) => {
+      const b = el("button", { type: "button", text: s.label, title: s.path });
+      b.addEventListener("click", () => browse(s.path));
+      sc.appendChild(b);
+    });
+    const list = $("dsDirList");
+    list.innerHTML = "";
+    res.dirs.forEach((d) => {
+      const row = el("div", { text: `\uD83D\uDCC1 ${d.name}`, title: d.path });
+      row.addEventListener("click", () => browse(d.path));
+      list.appendChild(row);
+    });
+    res.midi_files.forEach((name) => list.appendChild(el("div", { class: "file", text: `\u266A ${name}` })));
+    if (!res.dirs.length && !res.midi_files.length) list.appendChild(el("div", { class: "file", text: "(empty)" }));
+    let info = `${res.dirs.length} sub folder(s) \u00b7 ${res.midi_count} MIDI file(s) in this folder`;
+    if (res.midi_count > res.midi_files.length) info += ` (first ${res.midi_files.length} shown)`;
+    if (res.truncated) info += " \u00b7 list truncated";
+    if (res.error) info += ` \u00b7 ${res.error}`;
+    $("dsBrowseInfo").textContent = info;
+  });
+
+  socket.on("ds_scan_result", (res) => {
+    if (!res.ok) { $("dsScanInfo").textContent = res.error; return; }
+    let text = `${res.midi_files} MIDI file(s) in ${res.folders} folder(s)`;
+    if (res.skipped_numbered_duplicates) text += ` \u00b7 ${res.skipped_numbered_duplicates} numbered duplicate(s) ignored`;
+    if (res.truncated) text += " \u00b7 scan stopped early (large folder)";
+    $("dsScanInfo").textContent = text;
+  });
+
+  // ------------------------------------------------------------------ jobs
+  const KIND_LABEL = { extract: "MIDI extraction", merge: "Merge", augment: "Augmentation" };
+  const jobButtons = ["dsExtractBtn", "dsMergeBtn", "dsAugmentBtn", "dsBrowseBtn"];
+
+  function isBusy() { return !!ds.job && (ds.job.state === "running" || ds.job.state === "cancelling"); }
+
+  function updateControls() {
+    const busy = isBusy();
+    jobButtons.forEach((id) => { $(id).disabled = busy; });
+    folderEl.disabled = busy;
+    [extractEls, mergeEls, augmentEls].forEach((els) => Object.values(els).forEach((n) => { n.disabled = busy; }));
+    $("dsMergeList").querySelectorAll("input").forEach((n) => { n.disabled = busy; });
+    $("dsCancelBtn").disabled = !(ds.job && ds.job.state === "running");
+  }
+
+  function applyJob(job) {
+    ds.job = job;
+    const pct = Math.round((job.progress || 0) * 100);
+    $("dsProgFill").style.width = `${pct}%`;
+    const busy = job.state === "running" || job.state === "cancelling";
+    let progress = "Idle";
+    if (job.state !== "idle") {
+      progress = `${job.phase || job.state}`;
+      if (job.total) progress += ` \u00b7 ${job.done}/${job.total}`;
+      progress += ` \u00b7 ${pct} %  \u00b7 elapsed ${fmtTime(job.elapsed)}`;
+      if (busy && job.eta !== null) progress += ` \u00b7 ETA ${fmtTime(job.eta)}`;
+    }
+    $("dsProgText").textContent = progress;
+    const lines = [];
+    if (job.kind) lines.push(`${KIND_LABEL[job.kind] || job.kind}: ${job.state}`);
+    if (job.message) lines.push(job.message);
+    const st = job.stats || {};
+    if (job.kind === "extract" && Object.keys(st).length) {
+      lines.push(`sequences so far: ${st.sequences} \u00b7 1-bar patterns: ${st.one_bar_patterns}`);
+      lines.push(`skipped files: invalid ${st.skipped_invalid}, time signature ${st.skipped_time_signature}, no drums ${st.skipped_no_drums}, too short ${st.skipped_too_short}`);
+    }
+    if (job.error) lines.push(`error: ${job.error}`);
+    $("dsStatus").textContent = lines.length ? lines.join("\n") : "idle";
+    const log = $("dsLog");
+    const stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 8;
+    log.textContent = (job.logs || []).map((l) => `${l.t}  ${l.text}`).join("\n");
+    if (stick) log.scrollTop = log.scrollHeight;
+
+    if (job.state === "finished" && job.result) showBanner("ok", `${KIND_LABEL[job.kind]} finished: ${job.result.name} (${job.result.n_sequences} sequences) saved to ${job.result.path}`);
+    else if (job.state === "failed") showBanner("err", `${KIND_LABEL[job.kind] || "Job"} failed: ${job.error || "unknown error"}`);
+    else if (job.state === "cancelled") showBanner("", `${KIND_LABEL[job.kind] || "Job"} cancelled. Nothing was written.`);
+    else if (busy) showBanner("", `${KIND_LABEL[job.kind] || "Job"} running on the server \u2026 you can close this page; progress is kept.`);
+    else showBanner("", "");
+
+    // A job that is new to this page (identified by its start time; short jobs may skip the 'running' update).
+    if (job.state === "finished" && job.result && job.started !== ds.lastFinishedId) {
+      ds.lastFinishedId = job.started;
+      if (ds.mine || ds.selected === job.result.name) selectDataset(job.result.name, true);
+    }
+    if (job.state !== "running" && job.state !== "cancelling") ds.mine = false;
+    ds.lastJobState = job.state;
+    updateControls();
+  }
+
+  function startJob(kind, prefix, params) {
+    clearErrors();
+    ds.mine = true;
+    socket.emit("ds_start", { kind, params });
+    ds.pendingPrefix = prefix;
+  }
+  $("dsExtractBtn").addEventListener("click", () => {
+    const params = collect(extractEls, EXTRACT_FIELDS);
+    params.folder = folderEl.value.trim();
+    startJob("extract", "extract", params);
+  });
+  $("dsMergeBtn").addEventListener("click", () => {
+    const params = collect(mergeEls, MERGE_FIELDS);
+    params.sources = Array.from(ds.merge);
+    startJob("merge", "merge", params);
+  });
+  $("dsAugmentBtn").addEventListener("click", () => startJob("augment", "augment", collect(augmentEls, AUGMENT_FIELDS)));
+  $("dsCancelBtn").addEventListener("click", () => socket.emit("ds_cancel"));
+
+  socket.on("ds_start_result", (res) => {
+    if (res.ok) { clearErrors(); return; }
+    ds.mine = false;
+    showErrors(res.kind || ds.pendingPrefix, res.errors);
+  });
+  socket.on("ds_update", (job) => applyJob(job));
+
+  // ------------------------------------------------------------------ dataset list
+  function renderList() {
+    const body = $("dsListBody");
+    body.innerHTML = "";
+    ds.datasets.forEach((d) => {
+      const tr = el("tr", { class: d.name === ds.selected ? "sel" : "", title: d.description || d.name });
+      [d.name, d.n_sequences === null ? "-" : String(d.n_sequences), fmtBytes(d.size), d.kind || "legacy", fmtDate(d.mtime)]
+        .forEach((text) => tr.appendChild(el("td", { text })));
+      const delBtn = el("button", { type: "button", class: "danger", text: "\u{1F5D1}", title: `Delete dataset '${d.name}' from the server (asks for confirmation).` });
+      delBtn.setAttribute("aria-label", `Delete dataset ${d.name}`);
+      delBtn.disabled = isBusy();
+      delBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        if (isBusy()) return;
+        const count = d.n_sequences === null ? "" : ` (${d.n_sequences} sequences)`;
+        if (!window.confirm(`Delete dataset '${d.name}'${count} permanently from the server?\n\nThis cannot be undone.`)) return;
+        $("dsDeleteMsg").textContent = `Deleting ${d.name} \u2026`;
+        socket.emit("ds_delete", { name: d.name });
+      });
+      const delTd = el("td", { class: "ds-del" }, [delBtn]);
+      tr.appendChild(delTd);
+      tr.addEventListener("click", () => selectDataset(d.name));
+      body.appendChild(tr);
+    });
+    $("dsListEmpty").textContent = ds.datasets.length ? "Click a dataset to see its statistics and sequences." : "no dataset found";
+
+    const mergeBox = $("dsMergeList");
+    mergeBox.innerHTML = "";
+    ds.merge = new Set(Array.from(ds.merge).filter((n) => ds.datasets.some((d) => d.name === n)));
+    ds.datasets.forEach((d) => {
+      const cb = el("input", { type: "checkbox" });
+      cb.checked = ds.merge.has(d.name);
+      cb.disabled = isBusy();
+      cb.addEventListener("change", () => { if (cb.checked) ds.merge.add(d.name); else ds.merge.delete(d.name); });
+      mergeBox.appendChild(el("label", { title: `${d.n_sequences} sequences` }, [cb, document.createTextNode(` ${d.name} (${d.n_sequences === null ? "?" : d.n_sequences})`)]));
+    });
+    if (!ds.datasets.length) mergeBox.textContent = "no dataset found";
+
+    const sel = augmentEls.source;
+    const current = sel.value;
+    sel.innerHTML = "";
+    ds.datasets.forEach((d) => sel.appendChild(el("option", { value: d.name, text: d.name })));
+    if (!ds.datasets.length) sel.appendChild(el("option", { value: "", text: "no dataset found" }));
+    if (ds.datasets.some((d) => d.name === current)) sel.value = current;
+    else if (ds.selected && ds.datasets.some((d) => d.name === ds.selected)) sel.value = ds.selected;
+    sel.disabled = isBusy() || !ds.datasets.length;
+  }
+
+  socket.on("ds_state", (st) => {
+    ds.state = st;
+    ds.datasets = st.datasets || [];
+    ds.hparams = st.hparams;
+    // a job that finished before this page was loaded must not hijack the selection
+    if (!ds.loaded && st.job && st.job.state === "finished") ds.lastFinishedId = st.job.started;
+    ds.loaded = true;
+    $("dsEnv").textContent = `Branch: ${st.branch} \u00b7 data/${st.branch}/: ${ds.datasets.length} dataset(s) \u00b7 ${st.data_dir}`;
+    renderList();
+    applyJob(st.job);
+    if (ds.selected && !ds.datasets.some((d) => d.name === ds.selected)) clearSelection();
+    if (!ds.selected && ds.datasets.length && ds.active) selectDataset(ds.datasets[0].name);
+  });
+  socket.on("ds_delete_result", (res) => {
+    $("dsDeleteMsg").textContent = res.ok ? `Deleted ${res.name}.` : `Delete failed: ${res.error || "unknown error"}`;
+  });
+  socket.on("ds_list", (payload) => {
+    ds.datasets = payload.datasets || [];
+    if (ds.state) $("dsEnv").textContent = `Branch: ${ds.state.branch} \u00b7 data/${ds.state.branch}/: ${ds.datasets.length} dataset(s) \u00b7 ${ds.state.data_dir}`;
+    renderList();
+    if (ds.selected && !ds.datasets.some((d) => d.name === ds.selected)) clearSelection();
+    // the training tab and the latent field offer the same datasets: let them refresh
+    if (payload.state !== "info" && typeof socket.emit === "function") socket.emit("train_get_config");
+  });
+
+  // ------------------------------------------------------------------ dataset detail
+  let metaCustom = [];
+
+  function clearSelection() {
+    stopPlayback();
+    ds.selected = null; ds.info = null; ds.seq = null;
+    $("dsDetail").style.display = "none";
+    renderList();
+  }
+
+  function selectDataset(name, force) {
+    if (!name) return;
+    if (name === ds.selected && ds.info && !force) return;
+    stopPlayback();
+    if (name !== ds.selected) ds.seqIndex = 0;
+    ds.selected = name;
+    ds.info = null; ds.seq = null;
+    $("dsDetail").style.display = "";
+    $("dsDetailTitle").textContent = `${name} \u2013 loading \u2026`;
+    $("dsSummary").innerHTML = "";
+    $("dsMetaMsg").textContent = "";
+    renderList();
+    socket.emit("ds_info", { name });
+  }
+
+  function kv(parent, label, value) {
+    parent.appendChild(el("b", { text: label }));
+    parent.appendChild(el("span", { text: value === null || value === undefined || value === "" ? "-" : String(value) }));
+  }
+
+  function sourceText(src) {
+    if (!src) return "";
+    if (src.folder) return `${src.folder} (${src.midi_files} MIDI files)`;
+    if (src.datasets) return src.datasets.map((d) => `${d.name} (${d.n_sequences})`).join(" + ");
+    if (src.dataset) return `${src.dataset} (${src.n_sequences} sequences)`;
+    return "";
+  }
+
+  function renderMetaCustom() {
+    const body = $("dsMetaCustom");
+    body.innerHTML = "";
+    metaCustom.forEach((row, idx) => {
+      const k = el("input", { type: "text", placeholder: "key", title: "Name of the custom field" });
+      k.value = row[0];
+      k.addEventListener("input", () => { row[0] = k.value; });
+      const v = el("input", { type: "text", placeholder: "value", title: "Value of the custom field" });
+      v.value = row[1];
+      v.addEventListener("input", () => { row[1] = v.value; });
+      const del = el("button", { type: "button", text: "\u2715", title: "Remove this field" });
+      del.addEventListener("click", () => { metaCustom.splice(idx, 1); renderMetaCustom(); });
+      body.appendChild(el("tr", {}, [el("td", {}, [k]), el("td", {}, [v]), el("td", {}, [del])]));
+    });
+  }
+  $("dsMetaAdd").addEventListener("click", () => { metaCustom.push(["", ""]); renderMetaCustom(); });
+
+  function renderDetail() {
+    const d = ds.info;
+    if (!d) return;
+    const info = d.info || {};
+    const st = d.stats || {};
+    $("dsDetailTitle").textContent = d.name;
+    const sum = $("dsSummary");
+    sum.innerHTML = "";
+    kv(sum, "Sequences", st.n_sequences);
+    kv(sum, "Shape / dtype", `${d.shape.join(" \u00d7 ")} / ${d.dtype}`);
+    kv(sum, "File size", fmtBytes(d.size));
+    kv(sum, "Type", info.kind);
+    kv(sum, "Created", fmtDate(info.created));
+    kv(sum, "Modified", fmtDate(info.modified));
+    kv(sum, "Source", sourceText(info.source));
+    kv(sum, "Source files", d.has_metadata ? st.source_files : "no metadata");
+    kv(sum, "Unique sequences", st.unique_sequences !== undefined ? `${st.unique_sequences} (${st.duplicate_sequences} duplicates)` : "");
+    if (st.notes) {
+      kv(sum, "Notes / sequence", `${st.notes.mean} (min ${st.notes.min}, max ${st.notes.max}), total ${st.notes.total}`);
+      kv(sum, "Tokens / sequence", `${st.tokens.mean} (min ${st.tokens.min}, max ${st.tokens.max})`);
+      kv(sum, "Without EOS / empty", `${st.without_eos} / ${st.empty_sequences}`);
+    }
+    if (st.bpm && st.bpm.count) kv(sum, "BPM", `${st.bpm.min} \u2013 ${st.bpm.max} (mean ${st.bpm.mean}, median ${st.bpm.median}) in ${st.bpm.count} sequences`);
+    else kv(sum, "BPM", "not stored");
+    kv(sum, "Path on server", d.path);
+
+    $("dsMetaDesc").value = info.description || "";
+    $("dsMetaTags").value = (info.tags || []).join(", ");
+    $("dsMetaNotes").value = info.notes || "";
+    metaCustom = Object.entries(info.custom || {}).map(([k, v]) => [k, v]);
+    renderMetaCustom();
+    const auto = { schema: info.schema, kind: info.kind, branch: info.branch, created: info.created, modified: info.modified,
+                   source: info.source, options: info.options, stats: info.stats };
+    $("dsAutoInfo").textContent = info.has_info ? JSON.stringify(auto, null, 2) : "No automatic info stored (dataset created by an older version).";
+
+    const count = st.n_sequences || 0;
+    $("dsSeqSlider").max = String(Math.max(0, count - 1));
+    $("dsSeqIndex").max = String(Math.max(0, count - 1));
+    $("dsSeqCount").textContent = `/ ${Math.max(0, count - 1)}`;
+    redrawCharts();
+  }
+
+  socket.on("ds_info_result", (res) => {
+    if (!res.ok) {
+      if (ds.selected) $("dsDetailTitle").textContent = `${ds.selected} \u2013 ${res.error}`;
+      return;
+    }
+    if (!res.dataset || res.dataset.name !== ds.selected) return;
+    ds.info = res.dataset;
+    renderDetail();
+    requestSeq(Math.min(ds.seqIndex, Math.max(0, (res.dataset.stats.n_sequences || 1) - 1)));
+  });
+
+  $("dsMetaSave").addEventListener("click", () => {
+    if (!ds.selected) return;
+    const custom = {};
+    metaCustom.forEach(([k, v]) => { if (String(k).trim()) custom[String(k).trim()] = v; });
+    $("dsMetaMsg").textContent = "Saving \u2026";
+    socket.emit("ds_save_info", { name: ds.selected, patch: {
+      description: $("dsMetaDesc").value, tags: $("dsMetaTags").value, notes: $("dsMetaNotes").value, custom } });
+  });
+  socket.on("ds_save_info_result", (res) => {
+    if (!res.ok) { $("dsMetaMsg").textContent = `Error: ${res.error}`; return; }
+    if (res.name !== ds.selected) return;
+    if (ds.info) ds.info.info = res.info;
+    $("dsMetaMsg").textContent = `Saved to ${res.name} (${new Date().toLocaleTimeString()}).`;
+    renderDetail();
+  });
+
+  // ------------------------------------------------------------------ statistics charts
+  function drawEmpty(canvas, text) {
+    const p = prepCanvas(canvas);
+    if (!p) return;
+    p.ctx.fillStyle = "#77807a";
+    p.ctx.font = "12px Helvetica, Arial, sans-serif";
+    p.ctx.fillText(text, 10, p.h / 2);
+    canvas._bars = null;
+  }
+
+  function drawBars(canvas, values, opt) {
+    const p = prepCanvas(canvas);
+    if (!p) return;
+    const { ctx, w, h } = p;
+    const n = values.length;
+    if (!n) { drawEmpty(canvas, "no data"); return; }
+    const left = 38, right = 4, top = 8, bottom = 18;
+    const plotW = w - left - right, plotH = h - top - bottom;
+    const max = Math.max(1, ...values);
+    ctx.font = "10px Helvetica, Arial, sans-serif";
+    ctx.textBaseline = "middle";
+    ctx.textAlign = "right";
+    [0, 0.5, 1].forEach((f) => {
+      const y = top + plotH - plotH * f;
+      ctx.strokeStyle = "#e3e5dc";
+      ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(w - right, y); ctx.stroke();
+      ctx.fillStyle = "#5b6a60";
+      ctx.fillText(fmtCount(max * f), left - 4, y);
+    });
+    const bw = plotW / n;
+    values.forEach((v, i) => {
+      const bh = plotH * v / max;
+      ctx.fillStyle = opt.highlight === i ? "#d06c3b" : (opt.color || "#2b7e7a");
+      ctx.fillRect(left + i * bw + 0.5, top + plotH - bh, Math.max(1, bw - 1), bh);
+    });
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.fillStyle = "#405347";
+    const every = opt.every || Math.max(1, Math.ceil(n / 9));
+    for (let i = 0; i < n; i += every) ctx.fillText(opt.xlabel ? opt.xlabel(i) : String(i), left + (i + 0.5) * bw, top + plotH + 3);
+    canvas._bars = { left, bw, n, tip: opt.tip };
+  }
+
+  ["dsChPitch", "dsChVel", "dsChTiming", "dsChNotes", "dsChBpm"].forEach((id) => {
+    const c = $(id);
+    c.addEventListener("mousemove", (e) => {
+      const b = c._bars;
+      if (!b) { c.title = ""; return; }
+      const rect = c.getBoundingClientRect();
+      const i = Math.floor((e.clientX - rect.left - b.left) / b.bw);
+      c.title = i >= 0 && i < b.n ? b.tip(i) : "";
+    });
+  });
+
+  function redrawCharts() {
+    if (!ds.active || !ds.info) return;
+    const st = ds.info.stats || {};
+    if (!st.pitch_hist) {
+      ["dsChPitch", "dsChVel", "dsChTiming", "dsChNotes", "dsChBpm"].forEach((id) => drawEmpty($(id), "no statistics (empty dataset)"));
+      return;
+    }
+    const labels = st.pitch_labels || [];
+    drawBars($("dsChPitch"), st.pitch_hist, {
+      every: 3, xlabel: (i) => String(i),
+      tip: (i) => `pitch ${i}${labels[i] ? " \u2013 " + labels[i] : ""}: ${st.pitch_hist[i]} notes`,
+    });
+    drawBars($("dsChVel"), st.velocity_hist, {
+      every: 4, color: "#5aa37a", tip: (i) => `velocity token ${i} (~${Math.round(i / Math.max(1, st.velocity_hist.length - 1) * 127)}): ${st.velocity_hist[i]}`,
+    });
+    drawBars($("dsChTiming"), st.timing_hist, {
+      highlight: st.timing_center, every: 4, xlabel: (i) => String(i - st.timing_center), color: "#7a8fb8",
+      tip: (i) => `timing offset ${i - st.timing_center}${i === st.timing_center ? " (on grid)" : ""}: ${st.timing_hist[i]}`,
+    });
+    const nh = st.notes.hist;
+    drawBars($("dsChNotes"), nh, {
+      color: "#b08a3a", xlabel: (i) => (i === st.notes.hist_cap ? `${i}+` : String(i)),
+      tip: (i) => `${i === st.notes.hist_cap ? i + "+" : i} notes: ${nh[i]} sequences`,
+    });
+    if (st.bpm && st.bpm.count) {
+      const e = st.bpm.edges;
+      drawBars($("dsChBpm"), st.bpm.counts, {
+        color: "#a0627a", every: Math.max(1, Math.ceil(st.bpm.counts.length / 5)), xlabel: (i) => String(Math.round(e[i])),
+        tip: (i) => `${e[i]} \u2013 ${e[i + 1]} BPM: ${st.bpm.counts[i]} sequences`,
+      });
+    } else {
+      drawEmpty($("dsChBpm"), "no BPM stored in this dataset");
+    }
+    drawRoll();
+  }
+
+  // ------------------------------------------------------------------ sequence viewer + piano roll
+  let seqTimer = null;
+  function requestSeq(index) {
+    if (!ds.selected || !ds.info) return;
+    const count = ds.info.stats.n_sequences || 0;
+    if (!count) { ds.seq = null; $("dsSeqInfo").textContent = "empty dataset"; drawRoll(); return; }
+    ds.seqIndex = Math.max(0, Math.min(count - 1, index | 0));
+    $("dsSeqIndex").value = String(ds.seqIndex);
+    $("dsSeqSlider").value = String(ds.seqIndex);
+    socket.emit("ds_sequence", { name: ds.selected, index: ds.seqIndex });
+  }
+  $("dsPrev").addEventListener("click", () => requestSeq(ds.seqIndex - 1));
+  $("dsNext").addEventListener("click", () => requestSeq(ds.seqIndex + 1));
+  $("dsRandom").addEventListener("click", () => {
+    const count = ds.info ? ds.info.stats.n_sequences : 0;
+    if (count) requestSeq(Math.floor(Math.random() * count));
+  });
+  $("dsSeqIndex").addEventListener("change", () => requestSeq(parseInt($("dsSeqIndex").value, 10) || 0));
+  $("dsSeqSlider").addEventListener("input", () => {
+    $("dsSeqIndex").value = $("dsSeqSlider").value;
+    clearTimeout(seqTimer);
+    seqTimer = setTimeout(() => requestSeq(parseInt($("dsSeqSlider").value, 10) || 0), 120);
+  });
+  window.addEventListener("keydown", (e) => {
+    if (!ds.active || !ds.seq) return;
+    const tag = (e.target && e.target.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    if (e.key === "ArrowLeft") requestSeq(ds.seqIndex - 1);
+    else if (e.key === "ArrowRight") requestSeq(ds.seqIndex + 1);
+  });
+
+  socket.on("ds_sequence_result", (res) => {
+    if (!res.ok) { $("dsSeqInfo").textContent = res.error; return; }
+    const seq = res.sequence;
+    if (seq.name !== ds.selected) return;
+    if (seq.index !== ds.seqIndex) return;  // stale answer while scrubbing
+    ds.seq = seq;
+    if (play.playing) rescheduleFromNow();  // keep playing, now with the new sequence from the current position
+    const parts = [`#${seq.index}`, seq.filename ? `file: ${seq.filename}` : null, seq.window !== null ? `window ${seq.window}` : null,
+      seq.bpm ? `${seq.bpm} BPM` : "no BPM", `${seq.notes.length} notes`, `${seq.n_tokens} tokens`];
+    $("dsSeqInfo").textContent = parts.filter(Boolean).join(" \u00b7 ");
+    drawRoll();
+  });
+
+  // Start position (in steps) of a note after applying the quantize amount (0..1) of the playback panel.
+  function notePos(n, steps) {
+    const q = Math.max(0, Math.min(1, (parseFloat($("dsQuant").value) || 0) / 100));
+    let p = Math.max(0, n.pos);
+    if (q > 0) {
+      p += (Math.round(p) - p) * q;
+      if (p >= steps) p -= steps;
+    }
+    return p;
+  }
+
+  function rollPitches(seq) {
+    if (!$("dsFold").checked) {
+      // Unfolded: every chromatic row from 0 up to the highest pitch of THIS sequence.
+      const top = seq.notes.reduce((m, n) => Math.max(m, n.pitch), 0);
+      return Array.from({ length: top + 1 }, (_, i) => i);
+    }
+    return Array.from(new Set(seq.notes.map((n) => n.pitch))).sort((a, b) => a - b);
+  }
+  try { $("dsFold").checked = localStorage.getItem("ds.roll.fold") !== "0"; } catch (e) { /* ignore */ }
+  $("dsFold").addEventListener("change", () => {
+    try { localStorage.setItem("ds.roll.fold", $("dsFold").checked ? "1" : "0"); } catch (e) { /* ignore */ }
+    drawRoll();
+  });
+
+  function drawRoll(playStep) {
+    const c = $("dsRoll");
+    if (!ds.active) return;
+    // Unfolded: about 10 px per row up to the highest pitch of the current sequence, so the labels stay readable.
+    if ($("dsFold").checked || !ds.seq) c.style.height = "";
+    else c.style.height = `${Math.max(120, rollPitches(ds.seq).length * 10 + 18)}px`;
+    const p = prepCanvas(c);
+    if (!p) return;
+    const { ctx, w, h } = p;
+    const seq = ds.seq;
+    if (!seq) {
+      ctx.fillStyle = "#77807a"; ctx.font = "12px Helvetica, Arial, sans-serif";
+      ctx.fillText(ds.info ? "loading sequence \u2026" : "select a dataset", 10, h / 2);
+      return;
+    }
+    const steps = seq.steps || 32;
+    const pitches = rollPitches(seq);
+    const rows = Math.max(1, pitches.length);
+    const left = 120, right = 6, top = 14, bottom = 4;
+    const plotW = w - left - right, plotH = h - top - bottom;
+    const rowH = plotH / rows, stepW = plotW / steps;
+    const labels = (ds.info && ds.info.stats && ds.info.stats.pitch_labels) || [];
+    // grid
+    for (let s = 0; s <= steps; s++) {
+      const x = left + s * stepW;
+      ctx.strokeStyle = s % 16 === 0 ? "#8a948c" : (s % 4 === 0 ? "#c4cbc2" : "#eceee8");
+      ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, top + plotH); ctx.stroke();
+      if (s % 4 === 0 && s < steps) {
+        ctx.fillStyle = "#5b6a60"; ctx.font = "9px Helvetica, Arial, sans-serif"; ctx.textAlign = "left"; ctx.textBaseline = "top";
+        ctx.fillText(`${Math.floor(s / 16) + 1}.${(s % 16) / 4 + 1}`, x + 2, 2);
+      }
+    }
+    pitches.forEach((pitch, r) => {
+      const y = top + plotH - (r + 1) * rowH;
+      ctx.fillStyle = r % 2 ? "rgba(0,0,0,0.025)" : "rgba(0,0,0,0)";
+      ctx.fillRect(left, y, plotW, rowH);
+      if (rowH >= 8) {
+        ctx.fillStyle = "#405347"; ctx.font = `${Math.min(11, Math.floor(rowH))}px Helvetica, Arial, sans-serif`;
+        ctx.textAlign = "right"; ctx.textBaseline = "middle";
+        ctx.fillText(`${pitch}${labels[pitch] ? " " + labels[pitch] : ""}`.slice(0, 22), left - 5, y + rowH / 2);
+      }
+    });
+    // notes
+    const index = new Map(pitches.map((pt, r) => [pt, r]));
+    seq.notes.forEach((n) => {
+      const r = index.get(n.pitch);
+      const x = left + notePos(n, steps) * stepW;
+      const y = top + plotH - (r + 1) * rowH + 1;
+      const light = 80 - 50 * n.vel_norm;
+      ctx.fillStyle = `hsl(172, 62%, ${light}%)`;
+      ctx.strokeStyle = `hsl(172, 62%, ${Math.max(15, light - 25)}%)`;
+      const nw = Math.max(3, stepW * 0.8), nh = Math.max(3, rowH - 2);
+      ctx.fillRect(x, y, nw, nh);
+      ctx.strokeRect(x + 0.5, y + 0.5, nw - 1, nh - 1);
+    });
+    if (playStep !== undefined && playStep !== null) {
+      const x = left + Math.max(0, Math.min(steps, playStep)) * stepW;
+      ctx.strokeStyle = "#c94d44"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(x, top - 2); ctx.lineTo(x, top + plotH); ctx.stroke();
+      ctx.lineWidth = 1;
+    }
+  }
+  $("dsRoll").addEventListener("mousemove", (e) => {
+    const seq = ds.seq;
+    if (!seq) return;
+    const c = $("dsRoll");
+    const rect = c.getBoundingClientRect();
+    const left = 120, right = 6, top = 14, bottom = 4;
+    const plotW = rect.width - left - right, plotH = rect.height - top - bottom;
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    const pitches = rollPitches(seq);
+    const rowH = plotH / Math.max(1, pitches.length);
+    const r = Math.floor((top + plotH - y) / rowH);
+    const step = (x - left) / (plotW / (seq.steps || 32));
+    const hit = seq.notes.find((n) => {
+      const np = notePos(n, seq.steps || 32);
+      return n.pitch === pitches[r] && step >= np - 0.05 && step <= np + 0.9;
+    });
+    c.title = hit ? `pitch ${hit.pitch} (MIDI ${hit.midi}) \u00b7 step ${hit.step} \u00b7 velocity ${hit.vel} \u00b7 shift ${hit.shift.toFixed(2)}` : "";
+  });
+  window.addEventListener("resize", () => { if (ds.active) { redrawCharts(); drawRoll(); } });
+
+  // ------------------------------------------------------------------ Web MIDI playback
+  const midi = { access: null, audio: null, noise: null };
+  const play = { playing: false, queue: [], sounding: new Map(), nextStart: 0, timer: null, raf: null, passes: [], port: null, ch: 9, endAt: 0, sentUntil: 0, firstPass: false };
+  const SYNTH = "__synth__";
+  const mapSel = $("dsMidiMap"), outSel = $("dsMidiOut"), chSel = $("dsMidiCh");
+
+  for (let i = 1; i <= 16; i++) chSel.appendChild(el("option", { value: String(i - 1), text: String(i) }));
+  const store = {
+    get: (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } },
+    set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) { /* ignore */ } },
+  };
+  chSel.value = store.get("ds.midi.ch", "9");
+  mapSel.value = store.get("ds.midi.map", "midi");
+  $("dsMidiLoop").checked = store.get("ds.midi.loop", "1") === "1";
+  chSel.addEventListener("change", () => store.set("ds.midi.ch", chSel.value));
+  mapSel.addEventListener("change", () => store.set("ds.midi.map", mapSel.value));
+  $("dsMidiLoop").addEventListener("change", () => store.set("ds.midi.loop", $("dsMidiLoop").checked ? "1" : "0"));
+  outSel.addEventListener("change", () => { store.set("ds.midi.out", outSel.value); if (play.playing) { stopPlayback(); } });
+  $("dsQuant").value = store.get("ds.midi.quant", "0");
+  function updateQuant() {
+    $("dsQuantVal").textContent = `${parseInt($("dsQuant").value, 10) || 0} %`;
+  }
+  updateQuant();
+  $("dsQuant").addEventListener("input", () => {
+    store.set("ds.midi.quant", $("dsQuant").value);
+    updateQuant();
+    if (ds.active) drawRoll();
+    if (play.playing) rescheduleFromNow();  // quantization is applied in real time
+  });
+  $("dsMidiBpm").addEventListener("input", () => { if (play.playing) rescheduleFromNow(); });
+
+  function refreshOutputs() {
+    const wanted = outSel.value || store.get("ds.midi.out", SYNTH);
+    outSel.innerHTML = "";
+    outSel.appendChild(el("option", { value: SYNTH, text: "Browser synth (preview, no MIDI device)" }));
+    if (midi.access) {
+      midi.access.outputs.forEach((out) => outSel.appendChild(el("option", { value: out.id, text: `${out.name}${out.manufacturer ? " (" + out.manufacturer + ")" : ""}${out.state === "disconnected" ? " [disconnected]" : ""}` })));
+    }
+    outSel.value = Array.from(outSel.options).some((o) => o.value === wanted) ? wanted : SYNTH;
+    const n = midi.access ? midi.access.outputs.size : 0;
+    $("dsMidiStatus").textContent = midi.access ? `${n} MIDI output port(s) found.` : "Press 'Connect MIDI' to list the MIDI output ports of this computer.";
+  }
+
+  async function connectMidi() {
+    if (!navigator.requestMIDIAccess) {
+      $("dsMidiStatus").textContent = "Web MIDI is not available in this browser (use Chrome/Edge/Opera). Only the browser synth can be used.";
+      return;
+    }
+    if (!window.isSecureContext) {
+      $("dsMidiStatus").textContent = "Web MIDI needs a secure page: open the server as http://localhost:<port> or via https.";
+    }
+    try {
+      midi.access = await navigator.requestMIDIAccess({ sysex: false });
+      midi.access.onstatechange = refreshOutputs;
+      refreshOutputs();
+    } catch (err) {
+      $("dsMidiStatus").textContent = `MIDI access denied: ${err && err.message ? err.message : err}`;
+    }
+  }
+  $("dsMidiBtn").addEventListener("click", connectMidi);
+  refreshOutputs();
+
+  function ensureAudio() {
+    if (!midi.audio) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return null;
+      midi.audio = new Ctx();
+      const len = midi.audio.sampleRate * 0.5;
+      const buf = midi.audio.createBuffer(1, len, midi.audio.sampleRate);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+      midi.noise = buf;
+    }
+    if (midi.audio.state === "suspended") midi.audio.resume();
+    return midi.audio;
+  }
+
+  function synthHit(pitch, vel, whenMs) {
+    const ctx = ensureAudio();
+    if (!ctx) return;
+    const t = ctx.currentTime + Math.max(0, (whenMs - performance.now()) / 1000);
+    const gain = ctx.createGain();
+    const peak = Math.max(0.02, vel / 127) * 0.6;
+    gain.connect(ctx.destination);
+    const noiseHit = (freq, type, dur) => {
+      const src = ctx.createBufferSource(); src.buffer = midi.noise;
+      const filt = ctx.createBiquadFilter(); filt.type = type; filt.frequency.value = freq;
+      src.connect(filt); filt.connect(gain);
+      gain.gain.setValueAtTime(peak, t); gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
+      src.start(t); src.stop(t + dur + 0.02);
+    };
+    if (pitch <= 36 + 1) {
+      const osc = ctx.createOscillator(); osc.type = "sine";
+      osc.frequency.setValueAtTime(130, t); osc.frequency.exponentialRampToValueAtTime(45, t + 0.15);
+      osc.connect(gain); gain.gain.setValueAtTime(peak * 1.4, t); gain.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+      osc.start(t); osc.stop(t + 0.25);
+    } else if (pitch === 38 || pitch === 40 || pitch === 39) {
+      noiseHit(1800, "bandpass", 0.13);
+    } else if (pitch === 42 || pitch === 44 || pitch === 46 || pitch >= 49) {
+      noiseHit(7000, "highpass", pitch === 46 ? 0.28 : 0.06);
+    } else {
+      const osc = ctx.createOscillator(); osc.type = "triangle";
+      osc.frequency.value = 110 * Math.pow(2, (pitch - 41) / 12);
+      osc.connect(gain); gain.gain.setValueAtTime(peak, t); gain.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+      osc.start(t); osc.stop(t + 0.2);
+    }
+  }
+
+  function currentPort() {
+    if (outSel.value === SYNTH || !midi.access) return null;
+    return midi.access.outputs.get(outSel.value) || null;
+  }
+  function sendEvent(ev) {
+    const key = `${ev.pitch}`;
+    if (ev.type === "on") {
+      play.sounding.set(key, ev.pitch);
+      if (play.port) { try { play.port.send([0x90 | play.ch, ev.pitch, Math.max(1, ev.vel)], ev.t); } catch (e) { /* port gone */ } }
+      else synthHit(ev.pitch, ev.vel, ev.t);
+    } else {
+      play.sounding.delete(key);
+      if (play.port) { try { play.port.send([0x80 | play.ch, ev.pitch, 0], ev.t); } catch (e) { /* port gone */ } }
+    }
+  }
+  function mapPitch(n) {
+    const value = mapSel.value === "generic" ? n.generic : n.midi;
+    return Math.max(0, Math.min(127, value | 0));
+  }
+
+  function passTiming(seq) {
+    const override = parseFloat($("dsMidiBpm").value);
+    const bpm = override > 0 ? override : (seq.bpm || 120);
+    return { bpm, stepMs: 60000 / bpm / 4 };
+  }
+
+  // Queue the events of one pass of the current sequence starting at t0 (ms). Events before minT are skipped.
+  function buildPass(t0, minT) {
+    const seq = ds.seq;
+    if (!seq) return 0;
+    const cut = minT === undefined ? -Infinity : minT;
+    const steps = seq.steps || 32;
+    const { bpm, stepMs } = passTiming(seq);
+    const total = steps * stepMs;
+    seq.notes.forEach((n) => {
+      const pitch = mapPitch(n);
+      const on = t0 + notePos(n, steps) * stepMs;
+      if (on < cut) return;
+      play.queue.push({ t: on, type: "on", pitch, vel: n.vel });
+      play.queue.push({ t: on + stepMs * 0.9, type: "off", pitch, vel: 0 });
+    });
+    play.queue.sort((a, b) => a.t - b.t);
+    play.passes.push({ start: t0, dur: total, stepMs, bpm });
+    if (play.passes.length > 3) play.passes.shift();
+    return total;
+  }
+
+  // Switch to the current ds.seq / quantize / BPM without a break: continue at the position the playback is at now.
+  function rescheduleFromNow() {
+    const seq = ds.seq;
+    if (!play.playing || !seq) return;
+    const now = performance.now();
+    const base = play.passes.find((p) => now < p.start + p.dur);
+    if (!base) return;  // nothing scheduled yet: tick() builds the next pass from the current sequence
+    const steps = seq.steps || 32;
+    let phase = (now - base.start) / base.stepMs;  // current position in steps (negative before the pass starts)
+    if (phase >= steps) phase %= steps;
+    // Events already handed to the port / synth cannot be recalled, so the new events start after them.
+    let cutoff = Math.max(now, play.sentUntil);
+    const pending = Array.from(play.sounding.values());
+    play.queue = [];
+    if (play.port && typeof play.port.clear === "function") {
+      try { play.port.clear(); } catch (e) { /* not supported */ }
+      pending.forEach((pitch) => { try { play.port.send([0x80 | play.ch, pitch, 0]); } catch (e) { /* ignore */ } });
+      play.sounding.clear();
+      cutoff = now;
+    } else {
+      pending.forEach((pitch) => play.queue.push({ t: cutoff, type: "off", pitch, vel: 0 }));
+    }
+    const { stepMs } = passTiming(seq);
+    const start = now - phase * stepMs;
+    play.passes = [];
+    const total = buildPass(start, cutoff);
+    play.endAt = start + total;
+    play.nextStart = start + total;
+    play.firstPass = false;
+  }
+
+  function tick() {
+    if (!play.playing) return;
+    const now = performance.now();
+    if (now + 400 >= play.nextStart && (play.firstPass || $("dsMidiLoop").checked) && !(play.endAt && !$("dsMidiLoop").checked)) {
+      const total = buildPass(play.nextStart);
+      if (!total) { stopPlayback(); return; }
+      play.endAt = play.nextStart + total;
+      play.nextStart += total;
+      play.firstPass = false;
+    }
+    while (play.queue.length && play.queue[0].t < now + LOOKAHEAD_MS) sendEvent(play.queue.shift());
+    play.sentUntil = now + LOOKAHEAD_MS;
+    if (!$("dsMidiLoop").checked && now > play.endAt + 50 && !play.queue.length) { stopPlayback(); return; }
+  }
+
+  function animate() {
+    if (!play.playing) return;
+    const now = performance.now();
+    const pass = play.passes.find((p) => now >= p.start && now < p.start + p.dur);
+    drawRoll(pass ? (now - pass.start) / pass.stepMs : null);
+    play.raf = requestAnimationFrame(animate);
+  }
+
+  function startPlayback() {
+    if (play.playing) return;
+    if (!ds.seq) { $("dsMidiStatus").textContent = "No sequence loaded."; return; }
+    play.port = currentPort();
+    if (outSel.value !== SYNTH && !play.port) {
+      $("dsMidiStatus").textContent = "The selected MIDI output is not available. Press 'Connect MIDI' or choose the browser synth.";
+      return;
+    }
+    if (!play.port) ensureAudio();
+    play.ch = parseInt(chSel.value, 10) || 0;
+    play.playing = true;
+    play.firstPass = true;
+    play.endAt = 0;
+    play.sentUntil = 0;
+    play.queue = [];
+    play.passes = [];
+    play.nextStart = performance.now() + 80;
+    $("dsPlayBtn").disabled = true;
+    $("dsStopBtn").disabled = false;
+    const label = play.port ? `${play.port.name}, channel ${play.ch + 1}` : "browser synth";
+    $("dsMidiStatus").textContent = `Playing on ${label}.`;
+    play.timer = setInterval(tick, 20);
+    tick();
+    play.raf = requestAnimationFrame(animate);
+  }
+
+  function stopPlayback() {
+    const wasPlaying = play.playing;
+    play.playing = false;
+    clearInterval(play.timer); play.timer = null;
+    if (play.raf) cancelAnimationFrame(play.raf);
+    play.raf = null;
+    play.queue = [];
+    if (play.port) {
+      try { if (typeof play.port.clear === "function") play.port.clear(); } catch (e) { /* not supported */ }
+      play.sounding.forEach((pitch) => { try { play.port.send([0x80 | play.ch, pitch, 0]); } catch (e) { /* ignore */ } });
+      try { play.port.send([0xB0 | play.ch, 123, 0]); } catch (e) { /* ignore */ }
+    }
+    play.sounding.clear();
+    play.passes = [];
+    $("dsPlayBtn").disabled = false;
+    $("dsStopBtn").disabled = true;
+    if (wasPlaying) $("dsMidiStatus").textContent = "Stopped.";
+    if (ds.active) drawRoll();
+  }
+  $("dsPlayBtn").addEventListener("click", startPlayback);
+  $("dsStopBtn").addEventListener("click", stopPlayback);
+  window.addEventListener("beforeunload", stopPlayback);
+
+  // ------------------------------------------------------------------ tab activation
+  window.__datasetTab = {
+    setActive(active) {
+      ds.active = !!active;
+      if (!active) { stopPlayback(); return; }
+      if (!ds.loaded) socket.emit("ds_get_state");
+      else if (!ds.selected && ds.datasets.length) selectDataset(ds.datasets[0].name);
+      setTimeout(() => { redrawCharts(); drawRoll(); }, 0);
+    },
+  };
+  socket.on("connect", () => { socket.emit("ds_get_state"); });
+  if (socket.connected) socket.emit("ds_get_state");
+  updateControls();
+  if (window.location.hash === "#dataset") window.__datasetTab.setActive(true);
+})();
 </script>
 </body>
 </html>

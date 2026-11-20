@@ -193,10 +193,14 @@ def _to_padded_array(sequences: List[List[int]], max_len: int) -> np.ndarray:
 	return arr
 
 
-def _normalize_metadata_entry(raw_meta, fallback_idx: int) -> Tuple[str, int]:
-	"""Return metadata as a flat (filename, bar_index) tuple."""
+def _normalize_metadata_entry(raw_meta, fallback_idx: int) -> Tuple:
+	"""Return metadata as a flat (filename, bar_index[, bpm, ...]) tuple.
+
+	Additional entries after the bar index (e.g. the BPM) are preserved.
+	"""
 	filename = str(fallback_idx)
 	bar_index = 0
+	extra: Tuple = ()
 
 	if raw_meta is None:
 		return filename, bar_index
@@ -212,23 +216,39 @@ def _normalize_metadata_entry(raw_meta, fallback_idx: int) -> Tuple[str, int]:
 				bar_index = int(raw_meta[1])
 			except (TypeError, ValueError):
 				bar_index = 0
+		if len(raw_meta) > 2:
+			extra = tuple(raw_meta[2:])
 	else:
 		filename = str(raw_meta)
 
-	return filename, bar_index
+	return (filename, bar_index) + extra
 
 
-def augment_dataset(
-	input_filename: str,
-	output_filename: str,
+class AugmentationCancelled(Exception):
+	"""Raised by build_augmented_dataset when should_stop() returns True."""
+
+
+def build_augmented_dataset(
+	data: np.ndarray,
+	metadata,
 	velocity_scales: Tuple[float, ...] = (0.5, 0.75, 1.25),
 	microshift_deltas: Tuple[int, ...] = (-2, 2),
 	keep_percentage: float = 100.0,
-) -> None:
+	progress_callback=None,
+	should_stop=None,
+	seed=None,
+):
+	"""Pure computation part of the augmentation (no file access).
+
+	Returns (padded_array, metadata_list, stats_dict).
+	progress_callback(done, total) is called once per source sequence.
+	should_stop() -> bool is polled per source sequence and raises AugmentationCancelled.
+	"""
 	if keep_percentage < 0 or keep_percentage > 100:
 		raise ValueError("keep_percentage must be between 0 and 100.")
+	if seed is not None:
+		random.seed(seed)
 
-	data, metadata = _load_npz_from_data(input_filename)
 	original_sequences: List[List[int]] = []
 	original_meta: List[object] = []
 	augmented_sequences: List[List[int]] = []
@@ -237,6 +257,10 @@ def augment_dataset(
 	last_progress_time = time.time()
 
 	for idx, seq in enumerate(data):
+		if should_stop is not None and should_stop():
+			raise AugmentationCancelled()
+		if progress_callback is not None:
+			progress_callback(idx, n_total)
 		now = time.time()
 		if now - last_progress_time >= 5:
 			print(f"Processed {idx}/{n_total} source files")
@@ -244,17 +268,18 @@ def augment_dataset(
 
 		base_seq = _trim_sequence(seq)
 		raw_meta = metadata[idx] if metadata is not None and idx < len(metadata) else None
-		filename, bar_index = _normalize_metadata_entry(raw_meta, idx)
+		meta_entry = _normalize_metadata_entry(raw_meta, idx)
+		filename, bar_index, meta_tail = meta_entry[0], meta_entry[1], tuple(meta_entry[2:])
 
 		original_sequences.append(base_seq)
-		original_meta.append((filename, bar_index))
+		original_meta.append((filename, bar_index) + meta_tail)
 
 		generated = _random_note_removals(base_seq)
 		generated.extend(_pitch_line_removals(base_seq))
 
 		for gen_seq in generated:
 			augmented_sequences.append(gen_seq)
-			augmented_meta.append((filename, bar_index))
+			augmented_meta.append((filename, bar_index) + meta_tail)
 
 			variation_specs = [(v_scale, t_delta) for v_scale in velocity_scales for t_delta in microshift_deltas]
 			n_keep = max(1, len(variation_specs) // 2)
@@ -263,7 +288,7 @@ def augment_dataset(
 			for v_scale, t_delta in kept_specs:
 				varied = _apply_global_velocity_and_microshift(gen_seq, v_scale, t_delta)
 				augmented_sequences.append(varied)
-				augmented_meta.append((f"{filename} | v{v_scale}_t{t_delta}", bar_index))
+				augmented_meta.append((f"{filename} | v{v_scale}_t{t_delta}", bar_index) + meta_tail)
 
 	if not augmented_sequences:
 		raise ValueError("No augmented sequences were generated.")
@@ -304,6 +329,30 @@ def augment_dataset(
 	final_meta = selected_aug_meta
 
 	padded = _to_padded_array(final_sequences, hparams.max_seq_len)
+	if progress_callback is not None:
+		progress_callback(n_total, n_total)
+	stats = {
+		"source_sequences": len(original_sequences),
+		"generated_unique": len(unique_aug_sequences),
+		"output_sequences": len(final_sequences),
+		"keep_percentage": keep_percentage,
+		"velocity_scales": list(velocity_scales),
+		"microshift_deltas": list(microshift_deltas),
+	}
+	return padded, final_meta, stats
+
+
+def augment_dataset(
+	input_filename: str,
+	output_filename: str,
+	velocity_scales: Tuple[float, ...] = (0.5, 0.75, 1.25),
+	microshift_deltas: Tuple[int, ...] = (-2, 2),
+	keep_percentage: float = 100.0,
+) -> None:
+	data, metadata = _load_npz_from_data(input_filename)
+	padded, final_meta, stats = build_augmented_dataset(
+		data, metadata, velocity_scales, microshift_deltas, keep_percentage,
+	)
 
 	if not output_filename.endswith(".npz"):
 		output_filename += ".npz"
@@ -315,9 +364,9 @@ def augment_dataset(
 		metadata=np.array(final_meta, dtype=object),
 	)
 	print(f"Saved augmented dataset to {output_path}")
-	print(f"Sequences: {len(final_sequences)}")
+	print(f"Sequences: {stats['output_sequences']}")
 	print("Saved only augmented sequences (originals are excluded).")
-	print(f"Original dataset size cap: {len(original_sequences)}")
+	print(f"Original dataset size cap: {stats['source_sequences']}")
 	if keep_percentage < 100:
 		print(f"Keep percentage: {keep_percentage}%")
 	print(f"Shape: {padded.shape}")

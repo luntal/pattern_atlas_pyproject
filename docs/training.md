@@ -182,3 +182,22 @@ Each latent dimension is individually clamped from below at `free_bits` before s
 Weight decay penalises large parameter magnitudes by adding $\lambda \|\theta\|^2$ to the effective loss. In AdamW this is decoupled from the gradient-based adaptive update, meaning it applies uniformly to all parameters regardless of their gradient history — unlike the original Adam with L2 regularisation, which under-regularises parameters with large gradient variance.
 
 **Why use weight decay?** It discourages the model from relying on a small number of very large weights, improving generalisation and reducing sensitivity to individual training examples. At `1e-4` the effect is mild and primarily acts as a stability mechanism rather than aggressive regularisation.
+
+---
+
+## Training from the Server App
+
+The settings above can also be set in the **Training** tab of `rbf_server_app` (see `docs/rbf_server_app.md`, section 13). `train.py` and the server share one implementation: `modules/training.run_training(config, on_event, should_stop)`. `train.py` is only a thin CLI wrapper that builds a config from `hparams.py` (`retrain` switch and overrides are still at the top of the script); the server starts `train_worker.py`, which calls the same function and reports JSON events.
+
+### Changes to the training loop
+
+- **Tensor batching:** the dataset (small int tensors) is moved to the device once and cut into batches by an index permutation (`TensorBatcher`). The DataLoader and its worker processes are gone, so there is no pickling, no per-batch host-to-device copy and no worker start-up time.
+- `optimizer.zero_grad(set_to_none=True)` and fused AdamW on CUDA.
+- No `.item()` sync per batch: metrics stay tensors and are read once per epoch (and once per event interval when a callback is used).
+- bf16 autocast on CUDA when supported (no GradScaler needed), otherwise fp16 with scaler as before. `torch.compile` is a switch (`torch_compile`); checkpoints always hold the uncompiled `state_dict`.
+- Checkpoints are written atomically (temporary file, then `os.replace`), so a stop never leaves a half-written file.
+- Fixes: scheduler works with `validation_split = 0`; `avg_tokens_per_sequence` is divided by the real training-set size instead of `n_samples`; `train_vae` no longer needs the DataLoader's `.dataset`.
+
+### Stop and resume
+
+`train_vae(..., should_stop=...)` polls the flag once per batch. On stop it saves the exact state as `model_last_*.pt` (epoch counter, `global_step`, optimizer, scheduler) and writes `model_*.pt`, then returns `stopped = True`. A later *Resume* with `last` continues from there. Tests: `tests/test_training_stop.py`, `tests/test_hparams_io.py`, `tests/test_train_server.py`.
