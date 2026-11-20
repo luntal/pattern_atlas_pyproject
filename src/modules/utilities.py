@@ -3,7 +3,7 @@ import mido
 import time
 import os
 from pathlib import Path
-from modules.branch_paths import latest_in_branch, safe_branch_name, get_current_branch
+from modules.branch_paths import latest_in_branch, safe_branch_name, get_current_branch, project_root
 from modules.model import TransformerVAE, reparameterize, ONNXWrapper
 from types import SimpleNamespace
 import torch
@@ -32,7 +32,8 @@ def load_model(previous=0, onnx=False, return_checkpoint=False, checkpoint_kind=
     """
     print()
     branch_name = safe_branch_name(branch if branch is not None else get_current_branch())
-    model_dir = Path('models') / branch_name
+    # Resolve relative to the project root so it works regardless of the current working directory.
+    model_dir = project_root() / 'models' / branch_name
 
     # Named checkpoint selection.
     _KIND_PREFIXES = {
@@ -91,7 +92,7 @@ def load_model(previous=0, onnx=False, return_checkpoint=False, checkpoint_kind=
         )
 
         if not model_files:
-            raise FileNotFoundError(f"No model files found in models/{branch_name}/")
+            raise FileNotFoundError(f"No model files found in {model_dir}")
 
         previous = max(int(previous), 0)
         selected_index = len(model_files) - 1 - previous
@@ -137,7 +138,8 @@ def load_model(previous=0, onnx=False, return_checkpoint=False, checkpoint_kind=
 def load_dataset(hparams, shuffle=True):
     # dataset_name = hparams.dataset_name
     branch_name = safe_branch_name(get_current_branch())
-    path = Path('data')
+    # Resolve relative to the project root so it works regardless of the current working directory.
+    path = project_root() / 'data'
     dataset_name = os.path.join(path, branch_name, hparams.dataset_name)
     print(f'Loading dataset: {dataset_name}')
     full_data = np.load(dataset_name, allow_pickle=True)

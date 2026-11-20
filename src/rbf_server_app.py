@@ -13,7 +13,7 @@ import torch
 from flask import Flask, render_template, request, send_from_directory
 from flask_socketio import SocketIO, emit
 
-from modules.branch_paths import get_current_branch, safe_branch_name
+from modules.branch_paths import get_current_branch, project_root, safe_branch_name
 from modules.radial_basis_function import compute_rbf_weights, rbf_interpolate_exact
 from modules.utilities import load_dataset, load_model, pick_reproducible_samples
 
@@ -448,7 +448,7 @@ class FullFieldRenderManager:
                     self._publish_update(job_id, "rendering", completed, total)
 
             timestamp = datetime.now(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d_%H-%M-%S")
-            output_dir = Path("outputs") / branch_name
+            output_dir = project_root() / "outputs" / branch_name
             output_dir.mkdir(parents=True, exist_ok=True)
             output_path = output_dir / f"field_render_{timestamp}.npz"
 
@@ -865,7 +865,7 @@ class RBFServerController:
 
     def _data_branch_dir(self) -> Path:
         branch_name = safe_branch_name(get_current_branch())
-        return Path("data") / branch_name
+        return project_root() / "data" / branch_name
 
     def _list_available_datasets(self) -> list[str]:
         data_dir = self._data_branch_dir()
@@ -981,7 +981,7 @@ class RBFServerController:
     @classmethod
     def _mode_files_static(cls, mode: str) -> list[Path]:
         branch_name = safe_branch_name(get_current_branch())
-        model_dir = Path("models") / branch_name
+        model_dir = project_root() / "models" / branch_name
         if not model_dir.exists():
             return []
 
@@ -1069,7 +1069,7 @@ class RBFServerController:
 
     def _branch_model_dir(self) -> Path:
         branch_name = safe_branch_name(get_current_branch())
-        return Path("models") / branch_name
+        return project_root() / "models" / branch_name
 
     def _mode_files(self, mode: str) -> list[Path]:
         return self._mode_files_static(mode)
