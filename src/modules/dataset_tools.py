@@ -778,6 +778,10 @@ def validate_extract(raw) -> tuple[dict, dict]:
         "clip": _flag(raw, "clip"), "drums_only": _flag(raw, "drums_only"),
         "filter_duplicates": _flag(raw, "filter_duplicates", True), "pitch_randomness": _flag(raw, "pitch_randomness"),
         "roland": _flag(raw, "roland", True), "remap": _flag(raw, "remap"),
+        "workers": _num(raw, "workers", errors, 0, 0, 64, integer=True),
+        # empty seed = random base seed (the seed that was used is stored in the dataset options)
+        "seed": (None if str(raw.get("seed", "")).strip() == ""
+                 else _num(raw, "seed", errors, 0, 0, 2 ** 32 - 1, integer=True)),
     }
     if mapping == "generic_midi_mapping" and params["drums_only"]:
         pass  # allowed, same as data.py
@@ -1052,6 +1056,7 @@ class DatasetJobManager:
             groove_to_specific=mapping == "groove_to_specific",
             generic_to_chromatic=mapping == "generic_to_chromatic",
             progress_callback=on_progress, should_stop=self._cancel.is_set,
+            workers=params.get("workers", 0), seed=params.get("seed"),
         )
         self._check_cancel()
         stats = processor.last_stats
@@ -1075,7 +1080,8 @@ class DatasetJobManager:
         info["source"] = {"folder": folder, "midi_files": scan["midi_files"]}
         info["options"] = {k: params[k] for k in (
             "mapping", "skip", "take", "jump", "clip", "drums_only", "filter_duplicates", "randomize_velocity",
-            "qnt_strength", "qnt_randomness", "pitch_randomness", "roland", "remap")}
+            "qnt_strength", "qnt_randomness", "pitch_randomness", "roland", "remap", "workers")}
+        info["options"]["seed"] = int(getattr(processor, "last_seed", 0))
         info["stats"] = dict(summary, extraction={
             "files_in_selection": stats.files_count, "skipped_invalid": stats.skipped_invalid,
             "skipped_time_signature": stats.skipped_time_signature, "skipped_no_drums": stats.skipped_no_drums,

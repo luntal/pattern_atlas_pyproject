@@ -2304,6 +2304,10 @@ render();
       tip: "How strongly note starts are pulled to the 16th grid (0 = keep the micro timing, 1 = fully quantized)." },
     { key: "qnt_randomness", label: "Quantize randomness", type: "number", min: "0", max: "1", step: "0.01", def: "0",
       tip: "Random variation of the quantize strength per file (0..1)." },
+    { key: "workers", label: "Workers (0 = auto)", type: "number", min: "0", max: "64", step: "1", def: "0",
+      tip: "Number of parallel processes for the extraction. 0 = automatic (CPU cores - 1, at most 8), 1 = single process. Folders with fewer than 8 files always run in one process. The result does not depend on this number." },
+    { key: "seed", label: "Seed (optional)", type: "number", min: "0", step: "1", ph: "random",
+      tip: "Base seed for the random parts (velocity noise, quantize randomness); every file derives its own seed from it, so the same seed always gives the same dataset. Empty = random (the seed that was used is stored in the dataset info)." },
     { key: "overwrite", label: "Overwrite existing", type: "checkbox", def: false,
       tip: "Allow replacing a dataset with the same name. Without it, existing datasets are protected." },
   ];

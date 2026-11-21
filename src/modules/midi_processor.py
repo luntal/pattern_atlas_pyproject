@@ -11,6 +11,13 @@ from matplotlib.widgets import Slider
 import mido
 import threading
 import time
+import io
+import zlib
+import contextlib
+import multiprocessing
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeout
+from concurrent.futures.process import BrokenProcessPool
 from types import SimpleNamespace
 import random
 from dataclasses import dataclass, field
@@ -62,6 +69,36 @@ class ExtractionStats:
 
 class ExtractionCancelled(Exception):
     """Raised by MidiProcessor.extract when should_stop() returns True."""
+
+
+# Below this number of files the extraction stays in one process (starting workers would cost more than it saves).
+PARALLEL_MIN_FILES = 8
+
+
+def _file_seed(base_seed, filename) -> int:
+    """Seed for the random parts of one file: stable for (base seed, file name), independent of the order."""
+    return zlib.crc32(f'{int(base_seed)}|{Path(filename).name}'.encode('utf-8')) & 0xFFFFFFFF
+
+
+def _merge_stats(total: 'ExtractionStats', part: 'ExtractionStats'):
+    """Add the statistics of one file to the running total."""
+    total.skipped_invalid += part.skipped_invalid
+    total.skipped_time_signature += part.skipped_time_signature
+    total.skipped_no_drums += part.skipped_no_drums
+    total.one_bar_patterns += part.one_bar_patterns
+    total.skipped_too_short += part.skipped_too_short
+    total.truncated_sequences += part.truncated_sequences
+    total.merged_duplicates += part.merged_duplicates
+    total.max_notes_per_window = max(total.max_notes_per_window, part.max_notes_per_window)
+    total.failed_files.extend(part.failed_files)
+
+
+def _extract_file_worker(args):
+    """Entry point of the process pool: one midi file -> (sequences, metadata, stats). Output is discarded."""
+    filename, hparams_dict, opts, seed = args
+    processor = MidiProcessor(SimpleNamespace(**hparams_dict))
+    with contextlib.redirect_stdout(io.StringIO()):
+        return processor._extract_file(filename, opts, seed)
 
 
 def get_randomness(value, strength=1, invert=False):
@@ -341,8 +378,7 @@ def note_checks(note, n_vel, clip=False, randomize_velocity=0, drums_only=False,
             return None
         pitch = remapped_pitch
         if pitch < 36 or pitch > 36 + 24:
-            print(f'Warning: MIDI pitch {pitch} out of expected range after remapping - skipping note')
-            exit()
+            raise ValueError(f'MIDI pitch {pitch} out of expected range after remapping')
     # wrap the pitches to 24 values with 36 as basis
     pitch = pitch - 12
     pitch = pitch % 24
@@ -491,7 +527,7 @@ class MidiProcessor:
             randomize_velocity=0, qnt_strength=1, qnt_randomness=0, pitch_randomness=False,
             roland=True, drums_only=False, filter_duplicates=True, remap=False, jump=1,
             generic_midi_mapping=False, groove_to_specific=False, generic_to_chromatic=False,
-            progress_callback=None, should_stop=None):
+            progress_callback=None, should_stop=None, workers=None, seed=None):
         """
         Extracts sequences from MIDI files and save as list of tokens
         currently sequences are 2 bars long, 16th notes per bar
@@ -500,6 +536,13 @@ class MidiProcessor:
           progress_callback(file_idx, n_files, filename, stats, n_sequences) is called before each file
           and once more after the last one (file_idx == n_files).
           should_stop() -> bool is polled before each file; True raises ExtractionCancelled.
+
+        Parallelism: the files are independent and are processed by a process pool.
+          workers: None/0 = automatic (cpu count - 1, max 8), 1 = sequential, n = n processes; jobs with fewer than
+                   PARALLEL_MIN_FILES files always run sequentially.
+          seed: base seed of the random parts (quantization randomness, velocity noise); every file derives its own
+                seed from it, so the result does not depend on the number of workers. None = random base seed
+                (stored in self.last_seed).
 
         !!no sos token!! sos token is added during training only for decoder input!!
 
@@ -554,287 +597,37 @@ class MidiProcessor:
         if take > limit: take = limit
         print(f'Extracting {take} files from {skip} to {skip + take}')
         selection = filenames[skip:skip + take]
-        metadata = []
-        allowed_time_signatures = {(4, 4), (2, 4), (2, 2)}
+        opts = dict(
+            clip=clip, randomize_velocity=randomize_velocity, qnt_strength=qnt_strength, roland=roland,
+            drums_only=drums_only, jump=jump, generic_midi_mapping=generic_midi_mapping,
+            groove_to_specific=groove_to_specific, generic_to_chromatic=generic_to_chromatic,
+        )
+        if seed is None:
+            seed = random.SystemRandom().randrange(2 ** 32)
+        self.last_seed = int(seed)
+        n_workers = self._resolve_workers(workers, len(selection))
+        print(f'Extraction: {n_workers} worker process(es), base seed {self.last_seed}')
 
         statistics = ExtractionStats()
         statistics.files_count = len(selection)
         self.last_stats = statistics
-        for file_idx, filename in enumerate(selection):
-            if should_stop is not None and should_stop():
-                raise ExtractionCancelled()
-            if progress_callback is not None:
-                progress_callback(file_idx, len(selection), filename, statistics, len(self.sequences))
-            file_variant_index = sum(ord(ch) for ch in Path(filename).name)
-            fanout_state = {
-                'merged_cursors': {},
-                'pitch_usage': {},
-            }
-            try:
-                midi_data = pretty_midi.PrettyMIDI(filename)
-            except Exception as e:
-                print('-------------------------------------')
-                print(f'FAILED: {filename}')
-                print(f'Error: {e}')
-                statistics.skipped_invalid += 1
-                statistics.failed_files.append((filename, str(e)))
-                continue
+        results = self._iter_file_results(selection, opts, self.last_seed, n_workers, should_stop)
+        try:
+            for file_idx, filename in enumerate(selection):
+                if should_stop is not None and should_stop():
+                    raise ExtractionCancelled()
+                if progress_callback is not None:
+                    progress_callback(file_idx, len(selection), filename, statistics, len(self.sequences))
+                file_sequences, file_metadata, file_stats = next(results)
+                self.sequences.extend(file_sequences)
+                self.metadata.extend(file_metadata)
+                _merge_stats(statistics, file_stats)
+                if n_workers > 1:
+                    print(f'[{file_idx + 1}/{len(selection)}] {filename}: {len(file_sequences)} sequences '
+                          f'(total {len(self.sequences)})')
+        finally:
+            results.close()
 
-            print('-------------------------------------')
-            print(file_idx, filename)
-
-            # Only accept files with allowed time signatures.
-            # If no explicit signature exists, MIDI convention implies 4/4.
-            time_signatures = midi_data.time_signature_changes
-            if len(time_signatures) == 0:
-                signatures_in_file = {(4, 4)}
-            else:
-                signatures_in_file = {(ts.numerator, ts.denominator) for ts in time_signatures}
-
-            if not signatures_in_file.issubset(allowed_time_signatures):
-                unsupported = sorted(signatures_in_file)
-                print(f'Unsupported time signature(s) {unsupported} - skipping file')
-                statistics.skipped_time_signature += 1
-                continue
-
-            tempo_times, tempo_changes = midi_data.get_tempo_changes()
-            # print(f"Tempo changes: {list(tempo_changes)} at times: {list(tempo_times)}")
-            if len(tempo_changes) == 0:
-                print('No tempo changes found!')
-                continue
-            elif len(tempo_changes) > 1:
-                print('Multiple tempo changes found!')
-                continue
-            # compute slightly random quantization strength for every file:
-            qnt_randomness = np.random.normal(0, 0.25)
-            qnt_randomness = max(min(qnt_randomness, 1), 0)
-            current_qnt_strength = qnt_strength * (1-qnt_randomness)
-            # print('c_qnt_strength', current_qnt_strength)
-
-            # Filter for drum tracks if drums_only is enabled
-            if drums_only:
-                drum_instruments = [inst for inst in midi_data.instruments if inst.is_drum]
-                if len(drum_instruments) == 0:
-                    print('No drum tracks found - skipping file')
-                    statistics.skipped_no_drums += 1
-                    continue
-                instruments_to_process = drum_instruments
-            else:
-                instruments_to_process = midi_data.instruments
-
-            # Guard against empty instrument list
-            if len(instruments_to_process) == 0:
-                print('No instruments to process - skipping file')
-                continue
-
-            # check bpm from filename if option enabled
-            bpm_from_name = None
-            # if bpm_from_filename:
-            filename_lower = Path(filename).stem.lower()
-            bpm_match = re.search(r'(\d{2,3})\s*bpm$', filename_lower)
-            # bpm_match = re.search(r'(\d{2,3})\s?bpm', filename_lower)
-            if bpm_match:
-                bpm_from_name = int(bpm_match.group(1))
-                print(f'BPM from filename: {bpm_from_name}')
-                # tempo_changes[0] = bpm_from_name
-                
-            # else:
-            #     print('No BPM found in filename, using MIDI tempo.')
-                
-
-            for instrument in instruments_to_process:
-                # print('instrument name: ', instrument.name)
-                width = self.hparams.width
-                height = self.hparams.height
-
-                bpm = tempo_changes[0]
-                seconds_per_beat = 60 / bpm
-                seconds_per_16th_note = seconds_per_beat / 4
-                # print(seconds_per_16th_note)
-                sorted_midi_notes = sorted(instrument.notes, key=lambda note: note.start)
-
-                # Guard against empty note list
-                if len(sorted_midi_notes) == 0:
-                    print('No notes in instrument - skipping')
-                    continue
-
-                last_note_16th_index = int(sorted_midi_notes[-1].start // seconds_per_16th_note)
-                len_in_bars = np.ceil(last_note_16th_index / 16)
-                offset = False
-                
-                if len_in_bars == 1:
-                    # Exactly 1 bar: duplicate it into bar 2 to form a valid 2-bar window.
-                    bar_offset_seconds = 16 * seconds_per_16th_note
-                    duplicated = [
-                        pretty_midi.Note(
-                            velocity=n.velocity,
-                            pitch=n.pitch,
-                            start=n.start + bar_offset_seconds,
-                            end=n.end + bar_offset_seconds,
-                        )
-                        for n in sorted_midi_notes
-                    ]
-                    sorted_midi_notes = sorted_midi_notes + duplicated
-                    last_note_16th_index = int(sorted_midi_notes[-1].start // seconds_per_16th_note)
-                    len_in_bars = np.ceil(last_note_16th_index / 16)
-                    print('1-bar pattern duplicated to 2 bars.')
-                    statistics.one_bar_patterns += 1
-                elif len_in_bars < 2:
-                    print('Too short sequence!')
-                    statistics.skipped_too_short += 1
-                    continue
-                print(
-                    f'bpm: {bpm:.2f}, seconds_per_beat: {seconds_per_beat:.2f}, seconds_per_16th_note: {seconds_per_16th_note:.2f}')
-                print(
-                    f"Number of notes: {len(sorted_midi_notes)}, last note at: {sorted_midi_notes[-1].start:.2f}s, 16th index: {last_note_16th_index}, len in bars: {len_in_bars:.2f}")
-                rhythm_len = 2  # bars
-                n_patterns = int(max(len_in_bars // rhythm_len, 1))
-
-                print(f"n_patterns_full: {n_patterns}")
-
-
-                # Compound frames store raw field values (pitch 0..n_pitch-1, velocity 0..n_vel-1,
-                # deviation 0..n_timing-1); the per-field offsets are added by modules.compound.
-                center_timing = compound.center_timing(self.hparams)
-                n_timing = int(self.hparams.n_timing)
-
-                # extract midi notes and store them in a list of notes.
-                # note = {'step_idx': int, 'deviation': int, 'pitch': int, 'vel': int}
-                note_list = []
-                notes_advanced = []
-                prev_note_start = 0
-                for note in sorted_midi_notes:
-                    
-                    result = note_checks(note, n_vel=self.hparams.n_vel, clip=clip, randomize_velocity=randomize_velocity, drums_only=drums_only, roland=roland)
-                    if result is None:
-                        continue
-                    pitch, vel = result
-
-                    if generic_midi_mapping or groove_to_specific:
-                        # Use raw MIDI pitch before the 0-23 wrapping performed by note_checks.
-                        merged_note = groove_midi_to_groove_midi_merged(note.pitch)
-                    else:
-                        merged_note = None
-
-                    # retrieve the notes
-                    window_size_in_16th = self.hparams.width
-                    current_time_idx_16th = round(note.start / seconds_per_16th_note)
-                    current_16th = note.start / seconds_per_16th_note
-                    current_window = current_time_idx_16th // (window_size_in_16th)
-                    current_step_in_window = current_time_idx_16th % (window_size_in_16th)
-                    
-                    
-                    qnt_time = current_time_idx_16th * seconds_per_16th_note
-                    dev = note.start - qnt_time
-                    dev_norm = current_16th - current_time_idx_16th
-                    # Normalize microshift to [-1, 1], where +/-1 equals half a sixteenth note.
-                    shift_norm = max(-1.0, min(1.0, dev_norm * 2.0))
-                    dev_idx = int(round((shift_norm * (n_timing // 2)) + center_timing))
-                    dev_idx = max(0, min(n_timing - 1, dev_idx))
-
-                    note_interval = note.start - prev_note_start
-                    note_interval_in_16th = note_interval / seconds_per_16th_note
-                    first_note_in_window = not any(
-                        n['c_window'] == current_window
-                        for n in notes_advanced
-                    )
-                    
-                    if first_note_in_window:
-                        current_previous_note_start = current_window * window_size_in_16th * seconds_per_16th_note
-                        window_note_interval = note.start - current_previous_note_start
-                        window_note_interval = max(0, window_note_interval)  # Ensure non-negative
-                        window_note_interval_in_16th = window_note_interval / seconds_per_16th_note
-                        window_dev_norm = shift_norm
-                    else:
-                        window_note_interval = None
-                        window_note_interval_in_16th = None
-                        window_dev_norm = None
-
-
-                    advanced_note = {
-                        'start': note.start,
-                        'pitch': note.pitch,
-                        'pitch_idx': pitch,
-                        'velocity': note.velocity,
-                        'velocity_idx': vel,
-                        'current_16th': current_16th,
-                        'current_time_idx_16th': current_time_idx_16th,
-                        'qnt_time': qnt_time,
-                        'deviation': dev,
-                        'dev_norm': dev_norm,
-                        'dev_idx': dev_idx,
-                        'c_window': current_window,
-                        'c_step_in_window': current_step_in_window,
-                        'note_interval': note_interval,
-                        'note_interval_in_16th': note_interval_in_16th,
-                        'filename': filename,
-                        'bpm': bpm,
-                        'bpm_from_name': bpm_from_name,
-                        'first_note_in_window': first_note_in_window,
-                        'window_note_interval': window_note_interval,
-                        'window_note_interval_in_16th': window_note_interval_in_16th,
-                        'merged_note': merged_note,
-                        'window_dev_norm': window_dev_norm
-                    }
-                    # print(f"Note: start={note.start:.2f}s, pitch={note.pitch}, vel={note.velocity}, current_16th={current_16th:.2f}, ")
-                    prev_note_start = note.start
-                    notes_advanced.append(advanced_note)
-
-                # Map generic input note IDs directly to chromatic before tokenization.
-                if generic_to_chromatic and notes_advanced:
-                    for i, n in enumerate(notes_advanced):
-                        chromatic_note = generic_to_chromatic_pitch(int(n['pitch']))
-                        notes_advanced[i]['pitch_idx'] = int(chromatic_note)
-
-
-                # Apply feature-based fan-out to assign final chromatic pitches (0-53).
-                if generic_midi_mapping and notes_advanced:
-                    window_groups: dict[int, dict[int, list[int]]] = {}
-                    for i, n in enumerate(notes_advanced):
-                        c_window = n['c_window']
-                        c_step = n['current_time_idx_16th']
-                        window_groups.setdefault(c_window, {}).setdefault(c_step, []).append(i)
-
-                    for c_window in sorted(window_groups.keys()):
-                        # Keep merged->chromatic mapping stable within each 2-bar window.
-                        window_fixed_map: dict[int, int] = {}
-                        step_groups = window_groups[c_window]
-                        for step_idx in sorted(step_groups.keys()):
-                            step_indices = step_groups[step_idx]
-                            step_events = [
-                                {'merged_note': notes_advanced[i]['merged_note'],
-                                 'velocity': notes_advanced[i]['velocity']}
-                                for i in step_indices
-                            ]
-                            fanned = fan_out_merged_step(
-                                step_events,
-                                variant_index=file_variant_index,
-                                state=fanout_state,
-                                fixed_map=window_fixed_map,
-                            )
-                            for list_idx, fanned_event in zip(step_indices, fanned):
-                                notes_advanced[list_idx]['pitch_idx'] = int(fanned_event['chromatic_note'])
-
-                # Deterministic merged->chromatic-specific mapping.
-                if groove_to_specific and notes_advanced:
-                    for i, n in enumerate(notes_advanced):
-                        chromatic_note = groove_merged_to_chromatic_specific(int(n['merged_note']))
-                        notes_advanced[i]['pitch_idx'] = int(chromatic_note)
-
-                # self.seq_advanced.append(notes_advanced)
-                token_list, metadata = self.notes_advanced_to_token_sequences_stream(
-                    notes_advanced,
-                    self.hparams.width,
-                    2,  # at least one note frame + EOS
-                    max_window_exclusive=n_patterns,
-                    jump=jump,
-                    stats=statistics,
-                )
-                self.metadata.extend(metadata)
-
-
-                self.sequences = self.sequences + token_list
-                print('\nTotal Number of Sequences: ', len(self.sequences))
 
         if progress_callback is not None:
             progress_callback(len(selection), len(selection), '', statistics, len(self.sequences))
@@ -847,6 +640,377 @@ class MidiProcessor:
         
         self.print_extraction_summary(statistics, drums_only, filter_duplicates)
 
+
+
+    def _extract_file(self, filename, opts, seed=None):
+        """Process ONE midi file -> (sequences, metadata, ExtractionStats).
+
+        Does not touch self.sequences / self.metadata, so it can run in a worker process. The random parts
+        (quantization randomness, velocity noise) use a RNG seeded with `seed` (restored afterwards), which makes
+        the result independent of the processing order and of the number of workers.
+        """
+        np_state = np.random.get_state()
+        py_state = random.getstate()
+        if seed is not None:
+            np.random.seed(int(seed) % (2 ** 32))
+            random.seed(int(seed))
+        try:
+            return self._extract_file_body(filename, opts)
+        finally:
+            np.random.set_state(np_state)
+            random.setstate(py_state)
+
+    def _extract_file_body(self, filename, opts):
+        clip = opts['clip']
+        randomize_velocity = opts['randomize_velocity']
+        qnt_strength = opts['qnt_strength']
+        roland = opts['roland']
+        drums_only = opts['drums_only']
+        jump = opts['jump']
+        generic_midi_mapping = opts['generic_midi_mapping']
+        groove_to_specific = opts['groove_to_specific']
+        generic_to_chromatic = opts['generic_to_chromatic']
+        allowed_time_signatures = {(4, 4), (2, 4), (2, 2)}
+
+        statistics = ExtractionStats()
+        sequences = []
+        metadata = []
+
+        file_variant_index = sum(ord(ch) for ch in Path(filename).name)
+        fanout_state = {
+            'merged_cursors': {},
+            'pitch_usage': {},
+        }
+        try:
+            midi_data = pretty_midi.PrettyMIDI(filename)
+        except Exception as e:
+            print('-------------------------------------')
+            print(f'FAILED: {filename}')
+            print(f'Error: {e}')
+            statistics.skipped_invalid += 1
+            statistics.failed_files.append((filename, str(e)))
+            return sequences, metadata, statistics
+
+        print('-------------------------------------')
+        print(filename)
+
+        # Only accept files with allowed time signatures.
+        # If no explicit signature exists, MIDI convention implies 4/4.
+        time_signatures = midi_data.time_signature_changes
+        if len(time_signatures) == 0:
+            signatures_in_file = {(4, 4)}
+        else:
+            signatures_in_file = {(ts.numerator, ts.denominator) for ts in time_signatures}
+
+        if not signatures_in_file.issubset(allowed_time_signatures):
+            unsupported = sorted(signatures_in_file)
+            print(f'Unsupported time signature(s) {unsupported} - skipping file')
+            statistics.skipped_time_signature += 1
+            return sequences, metadata, statistics
+
+        tempo_times, tempo_changes = midi_data.get_tempo_changes()
+        # print(f"Tempo changes: {list(tempo_changes)} at times: {list(tempo_times)}")
+        if len(tempo_changes) == 0:
+            print('No tempo changes found!')
+            return sequences, metadata, statistics
+        elif len(tempo_changes) > 1:
+            print('Multiple tempo changes found!')
+            return sequences, metadata, statistics
+        # compute slightly random quantization strength for every file:
+        qnt_randomness = np.random.normal(0, 0.25)
+        qnt_randomness = max(min(qnt_randomness, 1), 0)
+        current_qnt_strength = qnt_strength * (1-qnt_randomness)
+        # print('c_qnt_strength', current_qnt_strength)
+
+        # Filter for drum tracks if drums_only is enabled
+        if drums_only:
+            drum_instruments = [inst for inst in midi_data.instruments if inst.is_drum]
+            if len(drum_instruments) == 0:
+                print('No drum tracks found - skipping file')
+                statistics.skipped_no_drums += 1
+                return sequences, metadata, statistics
+            instruments_to_process = drum_instruments
+        else:
+            instruments_to_process = midi_data.instruments
+
+        # Guard against empty instrument list
+        if len(instruments_to_process) == 0:
+            print('No instruments to process - skipping file')
+            return sequences, metadata, statistics
+
+        # check bpm from filename if option enabled
+        bpm_from_name = None
+        # if bpm_from_filename:
+        filename_lower = Path(filename).stem.lower()
+        bpm_match = re.search(r'(\d{2,3})\s*bpm$', filename_lower)
+        # bpm_match = re.search(r'(\d{2,3})\s?bpm', filename_lower)
+        if bpm_match:
+            bpm_from_name = int(bpm_match.group(1))
+            print(f'BPM from filename: {bpm_from_name}')
+            # tempo_changes[0] = bpm_from_name
+            
+        # else:
+        #     print('No BPM found in filename, using MIDI tempo.')
+            
+
+        for instrument in instruments_to_process:
+            # print('instrument name: ', instrument.name)
+            width = self.hparams.width
+            height = self.hparams.height
+
+            bpm = tempo_changes[0]
+            seconds_per_beat = 60 / bpm
+            seconds_per_16th_note = seconds_per_beat / 4
+            # print(seconds_per_16th_note)
+            sorted_midi_notes = sorted(instrument.notes, key=lambda note: note.start)
+
+            # Guard against empty note list
+            if len(sorted_midi_notes) == 0:
+                print('No notes in instrument - skipping')
+                continue
+
+            last_note_16th_index = int(sorted_midi_notes[-1].start // seconds_per_16th_note)
+            len_in_bars = np.ceil(last_note_16th_index / 16)
+            offset = False
+            
+            if len_in_bars == 1:
+                # Exactly 1 bar: duplicate it into bar 2 to form a valid 2-bar window.
+                bar_offset_seconds = 16 * seconds_per_16th_note
+                duplicated = [
+                    pretty_midi.Note(
+                        velocity=n.velocity,
+                        pitch=n.pitch,
+                        start=n.start + bar_offset_seconds,
+                        end=n.end + bar_offset_seconds,
+                    )
+                    for n in sorted_midi_notes
+                ]
+                sorted_midi_notes = sorted_midi_notes + duplicated
+                last_note_16th_index = int(sorted_midi_notes[-1].start // seconds_per_16th_note)
+                len_in_bars = np.ceil(last_note_16th_index / 16)
+                print('1-bar pattern duplicated to 2 bars.')
+                statistics.one_bar_patterns += 1
+            elif len_in_bars < 2:
+                print('Too short sequence!')
+                statistics.skipped_too_short += 1
+                continue
+            print(
+                f'bpm: {bpm:.2f}, seconds_per_beat: {seconds_per_beat:.2f}, seconds_per_16th_note: {seconds_per_16th_note:.2f}')
+            print(
+                f"Number of notes: {len(sorted_midi_notes)}, last note at: {sorted_midi_notes[-1].start:.2f}s, 16th index: {last_note_16th_index}, len in bars: {len_in_bars:.2f}")
+            rhythm_len = 2  # bars
+            n_patterns = int(max(len_in_bars // rhythm_len, 1))
+
+            print(f"n_patterns_full: {n_patterns}")
+
+
+            # Compound frames store raw field values (pitch 0..n_pitch-1, velocity 0..n_vel-1,
+            # deviation 0..n_timing-1); the per-field offsets are added by modules.compound.
+            center_timing = compound.center_timing(self.hparams)
+            n_timing = int(self.hparams.n_timing)
+
+            # extract midi notes and store them in a list of notes.
+            # note = {'step_idx': int, 'deviation': int, 'pitch': int, 'vel': int}
+            note_list = []
+            notes_advanced = []
+            prev_note_start = 0
+            for note in sorted_midi_notes:
+                
+                result = note_checks(note, n_vel=self.hparams.n_vel, clip=clip, randomize_velocity=randomize_velocity, drums_only=drums_only, roland=roland)
+                if result is None:
+                    continue
+                pitch, vel = result
+
+                if generic_midi_mapping or groove_to_specific:
+                    # Use raw MIDI pitch before the 0-23 wrapping performed by note_checks.
+                    merged_note = groove_midi_to_groove_midi_merged(note.pitch)
+                else:
+                    merged_note = None
+
+                # retrieve the notes
+                window_size_in_16th = self.hparams.width
+                current_time_idx_16th = round(note.start / seconds_per_16th_note)
+                current_16th = note.start / seconds_per_16th_note
+                current_window = current_time_idx_16th // (window_size_in_16th)
+                current_step_in_window = current_time_idx_16th % (window_size_in_16th)
+                
+                
+                qnt_time = current_time_idx_16th * seconds_per_16th_note
+                dev = note.start - qnt_time
+                dev_norm = current_16th - current_time_idx_16th
+                # Normalize microshift to [-1, 1], where +/-1 equals half a sixteenth note.
+                shift_norm = max(-1.0, min(1.0, dev_norm * 2.0))
+                dev_idx = int(round((shift_norm * (n_timing // 2)) + center_timing))
+                dev_idx = max(0, min(n_timing - 1, dev_idx))
+
+                note_interval = note.start - prev_note_start
+                note_interval_in_16th = note_interval / seconds_per_16th_note
+                first_note_in_window = not any(
+                    n['c_window'] == current_window
+                    for n in notes_advanced
+                )
+                
+                if first_note_in_window:
+                    current_previous_note_start = current_window * window_size_in_16th * seconds_per_16th_note
+                    window_note_interval = note.start - current_previous_note_start
+                    window_note_interval = max(0, window_note_interval)  # Ensure non-negative
+                    window_note_interval_in_16th = window_note_interval / seconds_per_16th_note
+                    window_dev_norm = shift_norm
+                else:
+                    window_note_interval = None
+                    window_note_interval_in_16th = None
+                    window_dev_norm = None
+
+
+                advanced_note = {
+                    'start': note.start,
+                    'pitch': note.pitch,
+                    'pitch_idx': pitch,
+                    'velocity': note.velocity,
+                    'velocity_idx': vel,
+                    'current_16th': current_16th,
+                    'current_time_idx_16th': current_time_idx_16th,
+                    'qnt_time': qnt_time,
+                    'deviation': dev,
+                    'dev_norm': dev_norm,
+                    'dev_idx': dev_idx,
+                    'c_window': current_window,
+                    'c_step_in_window': current_step_in_window,
+                    'note_interval': note_interval,
+                    'note_interval_in_16th': note_interval_in_16th,
+                    'filename': filename,
+                    'bpm': bpm,
+                    'bpm_from_name': bpm_from_name,
+                    'first_note_in_window': first_note_in_window,
+                    'window_note_interval': window_note_interval,
+                    'window_note_interval_in_16th': window_note_interval_in_16th,
+                    'merged_note': merged_note,
+                    'window_dev_norm': window_dev_norm
+                }
+                # print(f"Note: start={note.start:.2f}s, pitch={note.pitch}, vel={note.velocity}, current_16th={current_16th:.2f}, ")
+                prev_note_start = note.start
+                notes_advanced.append(advanced_note)
+
+            # Map generic input note IDs directly to chromatic before tokenization.
+            if generic_to_chromatic and notes_advanced:
+                for i, n in enumerate(notes_advanced):
+                    chromatic_note = generic_to_chromatic_pitch(int(n['pitch']))
+                    notes_advanced[i]['pitch_idx'] = int(chromatic_note)
+
+
+            # Apply feature-based fan-out to assign final chromatic pitches (0-53).
+            if generic_midi_mapping and notes_advanced:
+                window_groups: dict[int, dict[int, list[int]]] = {}
+                for i, n in enumerate(notes_advanced):
+                    c_window = n['c_window']
+                    c_step = n['current_time_idx_16th']
+                    window_groups.setdefault(c_window, {}).setdefault(c_step, []).append(i)
+
+                for c_window in sorted(window_groups.keys()):
+                    # Keep merged->chromatic mapping stable within each 2-bar window.
+                    window_fixed_map: dict[int, int] = {}
+                    step_groups = window_groups[c_window]
+                    for step_idx in sorted(step_groups.keys()):
+                        step_indices = step_groups[step_idx]
+                        step_events = [
+                            {'merged_note': notes_advanced[i]['merged_note'],
+                             'velocity': notes_advanced[i]['velocity']}
+                            for i in step_indices
+                        ]
+                        fanned = fan_out_merged_step(
+                            step_events,
+                            variant_index=file_variant_index,
+                            state=fanout_state,
+                            fixed_map=window_fixed_map,
+                        )
+                        for list_idx, fanned_event in zip(step_indices, fanned):
+                            notes_advanced[list_idx]['pitch_idx'] = int(fanned_event['chromatic_note'])
+
+            # Deterministic merged->chromatic-specific mapping.
+            if groove_to_specific and notes_advanced:
+                for i, n in enumerate(notes_advanced):
+                    chromatic_note = groove_merged_to_chromatic_specific(int(n['merged_note']))
+                    notes_advanced[i]['pitch_idx'] = int(chromatic_note)
+
+            # self.seq_advanced.append(notes_advanced)
+            token_list, file_metadata = self.notes_advanced_to_token_sequences_stream(
+                notes_advanced,
+                self.hparams.width,
+                2,  # at least one note frame + EOS
+                max_window_exclusive=n_patterns,
+                jump=jump,
+                stats=statistics,
+            )
+            metadata.extend(file_metadata)
+
+
+            sequences.extend(token_list)
+
+        return sequences, metadata, statistics
+
+
+    @staticmethod
+    def _resolve_workers(workers, n_files):
+        """workers: None/0 = automatic, 1 = sequential, n = n processes. Small jobs stay sequential."""
+        if workers is None or int(workers) <= 0:
+            workers = min(max(1, (os.cpu_count() or 2) - 1), 8)
+        workers = max(1, min(int(workers), int(n_files)))
+        if n_files < PARALLEL_MIN_FILES:
+            workers = 1
+        return workers
+
+    def _iter_file_results(self, selection, opts, base_seed, n_workers, should_stop):
+        """Yield (sequences, metadata, stats) for every file of `selection` in file order.
+
+        With n_workers > 1 the files are processed by a spawn-based process pool (bounded look-ahead, results
+        are consumed in file order, so the dataset order does not depend on the scheduling). should_stop() is
+        polled while waiting; if the pool breaks down, the remaining files are processed sequentially.
+        """
+        n_files = len(selection)
+        done = 0
+        if n_workers > 1:
+            hparams_dict = dict(vars(self.hparams))
+            executor = None
+            try:
+                executor = ProcessPoolExecutor(max_workers=n_workers, mp_context=multiprocessing.get_context('spawn'))
+            except Exception as exc:
+                print(f'Could not start the process pool ({exc}); extracting sequentially.')
+            if executor is not None:
+                pending = deque()
+                submitted = 0
+                try:
+                    while done < n_files:
+                        while submitted < n_files and len(pending) < n_workers * 4:
+                            name = selection[submitted]
+                            pending.append(executor.submit(
+                                _extract_file_worker, (name, hparams_dict, opts, _file_seed(base_seed, name))))
+                            submitted += 1
+                        result = None
+                        while True:
+                            try:
+                                result = pending[0].result(timeout=0.2)
+                                break
+                            except FuturesTimeout:
+                                if should_stop is not None and should_stop():
+                                    raise ExtractionCancelled()
+                            except BrokenProcessPool:
+                                break
+                        if result is None:
+                            print('Process pool broke down; continuing sequentially.')
+                            break
+                        pending.popleft()
+                        done += 1
+                        yield result
+                    else:
+                        return
+                finally:
+                    for future in pending:
+                        future.cancel()
+                    executor.shutdown(wait=True, cancel_futures=True)
+        for index in range(done, n_files):
+            if should_stop is not None and should_stop():
+                raise ExtractionCancelled()
+            yield self._extract_file(selection[index], opts, _file_seed(base_seed, selection[index]))
 
 
     def convert_to_numpy(self):
