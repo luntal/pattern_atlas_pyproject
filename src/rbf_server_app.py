@@ -2465,6 +2465,11 @@ def _torch_compile_default() -> bool:
     return bool(torch.cuda.is_available() and (shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")))
 
 
+# Default ports: CUDA machines use a different port than MPS/CPU machines (RBF_SERVER_PORT overrides both).
+PORT_CUDA = 5006
+PORT_MPS_CPU = 5009
+
+
 def create_app(sample_count: int = 10, sample_seed: int = 42, hparams_path: str | os.PathLike | None = None):
     controller = RBFServerController(sample_count=sample_count, sample_seed=sample_seed)
     # A running worker must never outlive the server.
@@ -2794,14 +2799,11 @@ def main():
     RETOKENIZE = False
     AUTOMATIC_PORT_SELECTION = True
     if AUTOMATIC_PORT_SELECTION:
-        # Automatic mode: CUDA machines default to 5006, others to 5009.
-        if torch.cuda.is_available():
-            port = 5006
-        else:
-            port = 5009
+        # Automatic mode: CUDA machines default to PORT_CUDA, MPS and CPU machines to PORT_MPS_CPU.
+        port = PORT_CUDA if torch.cuda.is_available() else PORT_MPS_CPU
         user_input_string = str(port)
         user_input_int = port
-        print(f"Automatic port selection enabled. CUDA available: {torch.cuda.is_available()}. Base port: {port}")
+        print(f"Automatic port selection enabled. Device: {_training_device_label()}. Base port: {port}")
     else:
         user_input = input('Enter a port number between 1024 and 65535: ')
         user_input_string = user_input.strip()
