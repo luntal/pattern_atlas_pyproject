@@ -85,6 +85,7 @@
     .train-app legend, .ds-app legend { font-size: 12px; font-weight: 700; color: #405347; padding: 0 6px; }
     .trow { display: grid; grid-template-columns: 170px 1fr; gap: 2px 8px; align-items: center; margin: 5px 0; font-size: 13px; }
     .trow input[type=number], .trow input[type=text], .trow select { width: 100%; box-sizing: border-box; padding: 5px 6px; border: 1px solid #ced3cc; border-radius: 6px; background: #fff; }
+    .trow input[type=checkbox] { justify-self: start; width: auto; }
     .trow input:disabled, .trow select:disabled { background: #eceee8; color: #77807a; }
     .trow input.invalid, .trow select.invalid { border-color: #b3261e; background: #fff1f0; }
     .ferr { grid-column: 2; color: #b3261e; font-size: 11px; }
@@ -101,6 +102,9 @@
     .chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .chart-grid canvas { height: 150px; }
     .chart-title { font-size: 12px; font-weight: 700; margin: 4px 0 2px; }
+    .kl-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; margin: 0 0 2px; }
+    .kl-controls select { width: auto; font-size: 12px; padding: 1px 4px; }
+    .kl-controls label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
     .train-log { max-height: 220px; overflow: auto; }
     .train-ckpts { font-size: 12px; margin: 4px 0 0 18px; padding: 0; word-break: break-all; }
     .app-banner.err { border-color: #c94d44; background: #fde8e6; color: #6b1d17; }
@@ -123,6 +127,14 @@
     .ds-stack > button { align-self: flex-start; }
     .ds-stack > .ds-inline > button { flex: 0 0 auto; }
     .ds-app .ds-stack > textarea.ds-path, .ds-app .trow .ds-stack > textarea.ds-path { flex: none; width: 100%; }
+    .ds-folder-row { align-items: flex-start; }
+    .ds-folder-row > button.ds-iconbtn { flex: 0 0 auto; height: 30px; padding: 0 8px; line-height: 1; }
+    .gpu-list { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; min-width: 0; }
+    .gpu-chip { display: inline-flex; flex-direction: column; align-items: flex-start; gap: 1px; padding: 5px 10px; border: 1px solid #ced3cc; border-radius: 8px; background: #f6f7f4; color: #5c6660; cursor: pointer; font: inherit; text-align: left; line-height: 1.25; }
+    .gpu-chip .gpu-name { font-weight: 600; font-size: 12px; overflow-wrap: anywhere; }
+    .gpu-chip .gpu-mem { font-size: 11px; opacity: 0.8; }
+    .gpu-chip.on { background: #e1f2ea; border-color: #2f8f6b; color: #17503a; }
+    .gpu-chip:disabled { cursor: not-allowed; opacity: 0.6; }
     .ds-list td.ds-del { white-space: nowrap; width: 1%; text-align: right; }
     .ds-list td.ds-del button { white-space: nowrap; padding: 1px 7px; line-height: 1.2; }
     .ds-inline input { flex: 1; min-width: 0; box-sizing: border-box; padding: 5px 6px; border: 1px solid #ced3cc; border-radius: 6px; }
@@ -275,6 +287,8 @@
       <div id="tFormGroups"></div>
       <fieldset>
         <legend>Options</legend>
+        <div class="trow" id="tGpuRow" title="GPUs used for training. One GPU = normal training; several GPUs = DistributedDataParallel (one process per GPU, gradients are averaged). Default: only the first GPU."><label>GPUs</label><div id="tGpuList" class="gpu-list" title="Click a GPU to use it or to leave it out. At least one GPU stays selected."></div><div class="ferr" id="terr_gpus"></div></div>
+        <div class="hint" id="tGpuHint"></div>
         <div class="trow" title="Compile the model with torch.compile (CUDA only, needs a C compiler). Faster steps after a slow first batch."><label for="tTorchCompile">torch.compile</label><input id="tTorchCompile" type="checkbox" title="Compile the model with torch.compile (CUDA only, needs a C compiler). Faster steps after a slow first batch." /></div>
         <div class="trow" title="Send a live progress event every N batches. Smaller values update the live chart more often but synchronize with the device more often."><label for="tLogInterval">Event interval (batches)</label><input id="tLogInterval" type="number" min="1" max="1000" step="1" value="25" title="Send a live progress event every N batches. Smaller values update the live chart more often but synchronize with the device more often." /><div class="ferr" id="terr_log_interval"></div></div>
       </fieldset>
@@ -288,7 +302,14 @@
       <pre id="tStatus">idle</pre>
       <div class="chart-grid">
         <div><div class="chart-title">Loss (epoch: train / val)</div><canvas id="chLoss"></canvas></div>
-        <div><div class="chart-title">KL (epoch: train / val)</div><canvas id="chKl"></canvas></div>
+        <div>
+          <div class="chart-title" id="chKlTitle">KL (epoch: train / val)</div>
+          <div class="kl-controls">
+            <select id="klBeta" title="post-beta: KL as it enters the loss (beta * KL). pre-beta: KL before the beta weighting, so the curve is not distorted by the beta annealing."><option value="post">post beta (kl_beta)</option><option value="pre">pre beta (kl_raw)</option></select>
+            <label title="On: KL as used in the loss, every latent dimension counts at least free_bits. Off: the true KL divergence without the free-bits floor."><input id="klFreeBits" type="checkbox" checked /> show_free_bits</label>
+          </div>
+          <canvas id="chKl"></canvas>
+        </div>
         <div><div class="chart-title">Beta</div><canvas id="chBeta"></canvas></div>
         <div><div class="chart-title">Learning rate</div><canvas id="chLr"></canvas></div>
       </div>
@@ -320,7 +341,7 @@
       <fieldset>
         <legend>1 &middot; Extract MIDI folder &rarr; dataset</legend>
         <div class="trow" title="Folder with MIDI files on the server (sub folders are included). All computation and all paths live on the server; the browser only shows them."><label for="dsFolder">MIDI folder (server)</label>
-          <div class="ds-stack"><button id="dsBrowseBtn" type="button" title="Open the server folder browser.">Browse server&hellip;</button><textarea id="dsFolder" class="ds-path" rows="1" spellcheck="false" placeholder="/path/on/the/server" title="Absolute path of the MIDI folder on the server."></textarea></div>
+          <div class="ds-inline ds-folder-row"><textarea id="dsFolder" class="ds-path" rows="1" spellcheck="false" placeholder="/path/on/the/server" title="Absolute path of the MIDI folder on the server. It is remembered in this browser."></textarea><button id="dsBrowseBtn" class="ds-iconbtn" type="button" title="Browse server folders" aria-label="Browse server folders">&#128193;</button></div>
           <div class="ferr" id="dserr_extract_folder"></div></div>
         <div id="dsBrowser" class="ds-browser" style="display:none">
           <div class="ds-stack">
@@ -1559,6 +1580,7 @@ render();
     ["data", "Data"],
     ["optim", "Optimization"],
     ["beta", "Beta / annealing"],
+    ["stop", "Checkpoints & early stopping"],
     ["model", "Model"],
   ];
   const TRAIN_FIELDS = [
@@ -1582,12 +1604,26 @@ render();
       tip: "Learning rate at the last step of the run." },
     { group: "optim", key: "scheduler_exp_curve_factor", label: "LR curve factor", type: "number", step: "any",
       tip: "Shape of the LR decay: 0 = linear, larger values = faster decay early in the run (exponential curve), negative = slower at first." },
+    { group: "optim", key: "scheduler_warmup_ratio", label: "LR warm-up (fraction)", type: "number", step: "0.005", min: "0", max: "0.5",
+      tip: "Fraction of all steps used for a linear learning-rate warm-up from ~0 to the start LR (e.g. 0.03 = 3 %). The decay then runs over the rest. 0 = off. Not used when resuming (the optimizer is already warm)." },
     { group: "optim", key: "weight_decay", label: "Weight decay", type: "number", step: "any",
       tip: "L2-style regularization of the AdamW optimizer. Larger values keep the weights small and reduce overfitting." },
     { group: "beta", key: "free_bits", label: "Free bits", type: "number", step: "any", min: "0",
       tip: "Minimum KL (per latent dimension) that is not penalized. Prevents posterior collapse; 0 disables it." },
     { group: "beta", key: "annealing_slope", label: "Annealing slope", type: "number", step: "0.01", min: "0", max: "1",
       tip: "Smoothing between the points of the beta curve (0 = hard linear segments, 1 = very smooth transitions)." },
+    { group: "stop", key: "last_checkpoint_interval", label: "Save 'last' every N epochs", type: "number", step: "1", min: "1",
+      tip: "model_last_*.pt (the resume checkpoint) is written every N epochs, and always at the end, on stop and on early stopping. Larger values save disk I/O; a crash loses at most N-1 epochs." },
+    { group: "stop", key: "early_stopping", label: "Early stopping", type: "checkbox",
+      tip: "Stop the run when the validation loss (training loss if there is no validation split) stops improving. Only monitored once the beta annealing has finished, because the loss rises while beta grows." },
+    { group: "stop", key: "early_stopping_patience", label: "Patience (epochs)", type: "number", step: "1", min: "1",
+      tip: "Number of epochs without improvement after which the training stops (early stopping must be on)." },
+    { group: "stop", key: "early_stopping_min_delta", label: "Min. improvement", type: "number", step: "any", min: "0",
+      tip: "Smallest decrease of the monitored loss that counts as an improvement (early stopping must be on)." },
+    { group: "model", key: "max_seq_len", label: "max_seq_len (frames)", type: "number", step: "1", min: "2", arch: true,
+      tip: "Maximum number of frames (notes + EOS) per 2-bar window the model handles. A dataset with another length is padded or cut (EOS last) to this value when it is loaded. Smaller = faster (attention cost grows quadratically). Locked when resuming." },
+    { group: "model", key: "norm_first", label: "Pre-norm layers", type: "checkbox", arch: true,
+      tip: "Pre-norm transformer layers (LayerNorm before attention / feed-forward): more stable at high learning rates and needs little warm-up. Off = post-norm like older checkpoints. Locked when resuming." },
     { group: "model", key: "d_model", label: "d_model", type: "number", step: "1", min: "8", arch: true,
       tip: "Width of the transformer (embedding size). Must be divisible by Heads. Changes the architecture; locked when resuming." },
     { group: "model", key: "n_heads", label: "Heads", type: "number", step: "1", min: "1", arch: true,
@@ -1626,6 +1662,9 @@ render();
   const resumeEndFactorEl = $("tResumeEndFactor");
   const compileEl = $("tTorchCompile");
   const logIntervalEl = $("tLogInterval");
+  const gpuListEl = $("tGpuList");
+  const gpuHintEl = $("tGpuHint");
+  let gpuSel = null; // Set of selected CUDA device indices (null until the server config arrived)
   const startBtn = $("tStartBtn");
   const stopBtn = $("tStopBtn");
   const resetBtn = $("tResetBtn");
@@ -1699,6 +1738,8 @@ render();
         let input;
         if (f.type === "select") {
           input = el("select", { id });
+        } else if (f.type === "checkbox") {
+          input = el("input", { id, type: "checkbox" });
         } else {
           input = el("input", { id, type: "number", step: f.step || "any" });
           if (f.min !== undefined) input.min = f.min;
@@ -1765,6 +1806,8 @@ render();
         node.appendChild(el("option", { value, text: value }));
       }
       if (value && [...node.options].some((o) => o.value === value)) node.value = value;
+    } else if (node.type === "checkbox") {
+      node.checked = value === true || value === "true" || value === 1;
     } else {
       node.value = String(value);
     }
@@ -1803,7 +1846,7 @@ render();
       if (skipArchitecture && f.arch) return;
       const node = fieldEls[f.key];
       if (onlyDirty && node.dataset.dirty !== "1") return;
-      out[f.key] = f.type === "select" ? node.value : parseNumber(node);
+      out[f.key] = f.type === "select" ? node.value : (f.type === "checkbox" ? node.checked : parseNumber(node));
     });
     if (!onlyDirty || annealDirty) {
       out.annealing_list = annealRows.map((r) => [parseNumber({ value: String(r.pos) }), parseNumber({ value: String(r.beta) })]);
@@ -1811,12 +1854,74 @@ render();
     return out;
   }
 
+  // ------------------------------------------------------------------ GPU selection
+  function availableGpus() { return (cfg && Array.isArray(cfg.gpus)) ? cfg.gpus : []; }
+
+  function selectedGpuList() {
+    const avail = availableGpus().map((g) => g.index);
+    if (!avail.length || !gpuSel) return [];
+    return [...gpuSel].filter((i) => avail.includes(i)).sort((a, b) => a - b);
+  }
+
+  function updateGpuHint() {
+    const gpus = availableGpus();
+    const picked = selectedGpuList();
+    if (!gpus.length) {
+      gpuHintEl.textContent = "No CUDA GPU available: training runs on " + ((cfg && cfg.device) || "the CPU") + ".";
+      return;
+    }
+    if (picked.length <= 1) {
+      gpuHintEl.textContent = `${picked.length} of ${gpus.length} GPU(s) selected: single GPU training.`;
+      return;
+    }
+    const batch = Number(fieldEls.batch_size && fieldEls.batch_size.value);
+    const per = Number.isFinite(batch) && batch >= 1 ? Math.floor(batch / picked.length) : null;
+    gpuHintEl.textContent = `${picked.length} GPUs selected: DistributedDataParallel (one process per GPU). Batch size is global`
+      + (per ? `: ${batch} \u2192 ${per} per GPU.` : ".");
+  }
+
+  function renderGpus() {
+    const gpus = availableGpus();
+    gpuListEl.innerHTML = "";
+    if (!gpus.length) {
+      gpuListEl.appendChild(el("span", { class: "hint", text: "no CUDA GPU found" }));
+      updateGpuHint();
+      return;
+    }
+    if (gpuSel === null) {
+      const wanted = (cfg && cfg.options && Array.isArray(cfg.options.gpus) && cfg.options.gpus.length) ? cfg.options.gpus : [gpus[0].index];
+      gpuSel = new Set(wanted);
+    }
+    gpus.forEach((g) => {
+      const mem = g.memory_gb ? `${g.memory_gb} GB` : "";
+      const chip = el("button", { type: "button", class: "gpu-chip", title: `Use GPU ${g.index} (${g.name}) for training.` }, [
+        el("span", { class: "gpu-name", text: `GPU ${g.index} \u00b7 ${g.name}` }),
+        el("span", { class: "gpu-mem", text: mem }),
+      ]);
+      chip.dataset.gpu = String(g.index);
+      chip.classList.toggle("on", gpuSel.has(g.index));
+      chip.setAttribute("aria-pressed", gpuSel.has(g.index) ? "true" : "false");
+      chip.addEventListener("click", () => {
+        if (gpuSel.has(g.index)) {
+          if (gpuSel.size <= 1) return; // keep at least one GPU
+          gpuSel.delete(g.index);
+        } else {
+          gpuSel.add(g.index);
+        }
+        renderGpus();
+        updateControls();
+      });
+      gpuListEl.appendChild(chip);
+    });
+    updateGpuHint();
+  }
+
   function collectConfig() {
     const mode = modeEl.value;
     const config = {
       mode,
       overrides: collectFields(mode === "resume", mode === "resume"),
-      options: { torch_compile: compileEl.checked, log_interval: parseNumber(logIntervalEl) },
+      options: { torch_compile: compileEl.checked, log_interval: parseNumber(logIntervalEl), gpus: selectedGpuList() },
     };
     if (mode === "resume") {
       config.resume = {
@@ -1895,6 +2000,7 @@ render();
     });
     [modeEl, resumeModeEl, resumeStampEl, continueBetaEl, resumeStartLrEl, resumeEndFactorEl, compileEl, logIntervalEl, resetBtn, saveBtn]
       .forEach((n) => { n.disabled = active; });
+    gpuListEl.querySelectorAll("button").forEach((n) => { n.disabled = active; });
     const noDatasets = !cfg || !(cfg.datasets && cfg.datasets.length);
     startBtn.disabled = active || starting || noDatasets;
     stopBtn.disabled = !active;
@@ -2023,10 +2129,15 @@ render();
       { label: "train", color: "#2b7e7a", data: pick((e) => e.train.loss) },
       { label: "val", color: "#d06c3b", data: pick((e) => e.val && e.val.loss) },
     ]);
+    // KL variants: post/pre beta x with/without free bits (epoch event keys kl, kl_raw, kl_nofb, kl_raw_nofb).
+    const klPre = $("klBeta").value === "pre";
+    const klFb = $("klFreeBits").checked;
+    const klKey = klPre ? (klFb ? "kl_raw" : "kl_raw_nofb") : (klFb ? "kl" : "kl_nofb");
+    $("chKlTitle").textContent = `KL ${klPre ? "pre beta" : "post beta"}, ${klFb ? "with" : "without"} free bits (epoch: train / val)`;
     drawChart($("chKl"), [
-      { label: "train", color: "#2b7e7a", data: pick((e) => e.train.kl) },
-      { label: "val", color: "#d06c3b", data: pick((e) => e.val && e.val.kl) },
-    ]);
+      { label: "train", color: "#2b7e7a", data: pick((e) => e.train[klKey]) },
+      { label: "val", color: "#d06c3b", data: pick((e) => e.val && e.val[klKey]) },
+    ], "no values for this KL variant yet (older runs only have post beta with free bits)");
     drawChart($("chBeta"), [{ label: "beta", color: "#6a5acd", data: pick((e) => e.beta) }]);
     drawChart($("chLr"), [{ label: "lr", color: "#a34922", data: pick((e) => e.lr) }]);
     const fieldSeries = [];
@@ -2039,6 +2150,18 @@ render();
     drawChart($("chBatch"), [{ label: "loss", color: "#2d9d5b", data: batches.map((b) => Number(b.loss)) }]);
   }
   window.addEventListener("resize", redrawCharts);
+  try {
+    $("klBeta").value = localStorage.getItem("train.kl.beta") === "pre" ? "pre" : "post";
+    $("klFreeBits").checked = localStorage.getItem("train.kl.freeBits") !== "0";
+  } catch (e) { /* ignore */ }
+  $("klBeta").addEventListener("change", () => {
+    try { localStorage.setItem("train.kl.beta", $("klBeta").value); } catch (e) { /* ignore */ }
+    redrawCharts();
+  });
+  $("klFreeBits").addEventListener("change", () => {
+    try { localStorage.setItem("train.kl.freeBits", $("klFreeBits").checked ? "1" : "0"); } catch (e) { /* ignore */ }
+    redrawCharts();
+  });
 
   // ------------------------------------------------------------------ monitoring
   function fmtDuration(seconds) {
@@ -2134,6 +2257,10 @@ render();
       if (snap.config.options) {
         compileEl.checked = !!snap.config.options.torch_compile;
         if (snap.config.options.log_interval) logIntervalEl.value = String(snap.config.options.log_interval);
+        if (Array.isArray(snap.config.options.gpus) && snap.config.options.gpus.length) {
+          gpuSel = new Set(snap.config.options.gpus);
+          renderGpus();
+        }
       }
     }
     if (!active) shownRunConfig = false;
@@ -2163,6 +2290,7 @@ render();
     fillDefaults(cfg.defaults, false);
     if (currentDataset && [...select.options].some((o) => o.value === currentDataset) && select.dataset.dirty === "1") select.value = currentDataset;
     if (!shownRunConfig && !compileEl.dataset.touched) compileEl.checked = !!(cfg.options && cfg.options.torch_compile);
+    renderGpus();
     const legacyN = (cfg.legacy_datasets || []).length;
     envEl.textContent = `Branch: ${cfg.branch} \u00b7 device: ${cfg.device} \u00b7 data/${cfg.branch}/: ${(cfg.datasets || []).length} dataset(s)`
       + (legacyN ? ` \u00b7 ${legacyN} legacy (triplet) dataset(s) hidden, re-extract them in the Dataset tab` : "");
@@ -2171,6 +2299,7 @@ render();
     updateControls();
   }
   compileEl.addEventListener("change", () => { compileEl.dataset.touched = "1"; });
+  if (fieldEls.batch_size) fieldEls.batch_size.addEventListener("input", updateGpuHint);
 
   socket.on("connect", () => { socket.emit("train_get_config"); });
   if (socket.connected) socket.emit("train_get_config");
@@ -2286,7 +2415,7 @@ render();
       tip: "Remove identical token sequences (and their metadata) after the extraction." },
     { key: "clip", label: "Clip pitch range", type: "checkbox", def: false,
       tip: "Drop notes outside the 25 drum pitches 36..60 (hi-hat edge notes 22/26 are mapped to 42/46)." },
-    { key: "roland", label: "Roland mapping", type: "checkbox", def: true,
+    { key: "roland", label: "Roland mapping", type: "checkbox", def: false,
       tip: "Use the Roland drum layout when clipping or remapping drum pitches." },
     { key: "remap", label: "Remap pitches", type: "checkbox", def: false,
       tip: "Apply the predefined pitch remapping table before tokenizing." },
@@ -2296,8 +2425,10 @@ render();
       tip: "Number of MIDI files to skip at the start (files are sorted by path)." },
     { key: "take", label: "Take files (0 = all)", type: "number", min: "0", step: "1", def: "0",
       tip: "Number of MIDI files to use after skipping. 0 uses all remaining files." },
-    { key: "jump", label: "Window jump (bars)", type: "number", min: "1", step: "1", def: "1",
+    { key: "jump", label: "Window jump (bars)", type: "number", min: "1", step: "1", def: "2",
       tip: "Step between two extracted 2-bar windows of a file, in windows. 1 = every window, 2 = every second window, \u2026" },
+    { key: "max_seq_len", label: "max_seq_len (frames)", type: "number", min: "2", max: "4096", step: "1", def: "128",
+      tip: "Frames per sequence including the EOS frame (the second dimension of the dataset). A 2-bar window with more notes than max_seq_len - 1 is cut after time (the count is shown in the log and the statistics). A model with another max_seq_len pads or cuts the dataset when it is loaded. Default: max_seq_len from hparams.py." },
     { key: "randomize_velocity", label: "Velocity noise", type: "number", min: "0", max: "1", step: "0.01", def: "0",
       tip: "Random velocity deviation as a fraction of the full range (0 = exact velocities, 0.1 = \u00b110 %)." },
     { key: "qnt_strength", label: "Quantize strength", type: "number", min: "0", max: "1", step: "0.01", def: "0",
@@ -2378,6 +2509,7 @@ render();
   }
 
   const extractEls = buildFields($("dsExtractFields"), "extract", EXTRACT_FIELDS);
+  extractEls.max_seq_len.addEventListener("input", () => { extractEls.max_seq_len.dataset.touched = "1"; });
   const mergeEls = buildFields($("dsMergeFields"), "merge", MERGE_FIELDS);
   const augmentEls = buildFields($("dsAugmentFields"), "augment", AUGMENT_FIELDS);
 
@@ -2478,6 +2610,16 @@ render();
     scanFolder();
   });
   folderEl.addEventListener("change", scanFolder);
+
+  // The MIDI folder path is remembered in this browser, so it does not have to be searched again.
+  const FOLDER_KEY = "ds.extract.folder";
+  function saveFolder() { try { localStorage.setItem(FOLDER_KEY, folderEl.value.trim()); } catch (e) { /* ignore */ } }
+  folderEl.addEventListener("change", saveFolder);
+  folderEl.addEventListener("input", saveFolder);
+  try {
+    const savedFolder = localStorage.getItem(FOLDER_KEY);
+    if (savedFolder) { setPath(folderEl, savedFolder); scanFolder(); }
+  } catch (e) { /* ignore */ }
 
   function scanFolder() {
     const path = folderEl.value.trim();
@@ -2669,6 +2811,10 @@ render();
     ds.state = st;
     ds.datasets = st.datasets || [];
     ds.hparams = st.hparams;
+    // default of the extract field = max_seq_len of hparams.py (unless the user already typed a value)
+    if (st.hparams && st.hparams.max_seq_len && extractEls.max_seq_len && !extractEls.max_seq_len.dataset.touched) {
+      extractEls.max_seq_len.value = String(st.hparams.max_seq_len);
+    }
     // a job that finished before this page was loaded must not hijack the selection
     if (!ds.loaded && st.job && st.job.state === "finished") ds.lastFinishedId = st.job.started;
     ds.loaded = true;

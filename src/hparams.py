@@ -24,6 +24,7 @@ hyper_params = {
     'scheduler_start_lr': 4e-4,
     'scheduler_end_lr': 4e-5,
     'scheduler_exp_curve_factor': -8.0,
+    'scheduler_warmup_ratio': 0.03, # linear LR warm-up (0 -> scheduler_start_lr) over this fraction of all steps; 0 = off. Only used for new trainings.
     'weight_decay': 1e-4,
     
     'n_samples': 0,
@@ -40,6 +41,12 @@ hyper_params = {
     'annealing_slope': 0.05, # slope of exponential smoothing between annealing points. 0 means linear, higher values mean more step-like changes.
     'weighted_beta': 0.0, # current beta curing training.
 
+    # checkpoints / stopping
+    'last_checkpoint_interval': 3, # write model_last_*.pt every N epochs (and at the end / on stop)
+    'early_stopping': False, # stop when the validation loss (train loss without validation) no longer improves
+    'early_stopping_patience': 8, # epochs without improvement before stopping
+    'early_stopping_min_delta': 0.001, # minimal loss decrease that counts as improvement
+
     # model
     'latent_dim': d_base * 2,
     'n_memory_tokens': 32,
@@ -54,6 +61,7 @@ hyper_params = {
     'n_layers': 4,
     'ff_dim': d_base * 2,
     'dropout': 0.1,
+    'norm_first': True, # pre-norm transformer layers (stable at higher LR); False = post-norm like older checkpoints
     'max_seq_len': 128, # max number of frames (notes + EOS) per 2-bar window
 
     # compound tokens (frames):

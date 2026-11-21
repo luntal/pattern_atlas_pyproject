@@ -92,6 +92,10 @@ def test_full_run():
     assert set(fields) == {'step', 'pitch', 'velocity', 'deviation'} and all(v > 0 for v in fields.values()), fields
     assert set(epoch_events[-1]['val']['fields']) == set(fields)
     assert 'fields' in [e for e in events if e['type'] == 'batch'][0]
+    # KL variants (pre/post beta, with/without free bits) for train and val
+    for part in (epoch_events[-1]['train'], epoch_events[-1]['val']):
+        assert all(k in part and part[k] >= 0 for k in ('kl', 'kl_raw', 'kl_nofb', 'kl_raw_nofb')), part
+        assert part['kl_raw_nofb'] <= part['kl_raw'] + 1e-6, part  # free bits only raise the KL
     assert 5 < epoch_events[-1]['avg_frames_per_sequence'] <= 41, epoch_events[-1]['avg_frames_per_sequence']
     log_files = glob.glob(os.path.join(ROOT, 'docs', BRANCH, 'training_log_*.csv'))
     header = open(log_files[0]).readline().strip().split(',')

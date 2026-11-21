@@ -143,6 +143,7 @@ The scheduler is a custom `LambdaLR` that decays the learning rate smoothly from
 | `scheduler_start_lr` | `4e-4` | Learning rate at step 0. Should match the initial `learning_rate`. |
 | `scheduler_end_lr` | `4e-5` | Learning rate at the final step. |
 | `scheduler_exp_curve_factor` | `-8.0` | Exponent that shapes the decay curve. `0` → linear decay. Negative values produce a fast initial drop followed by a slow tail (concave-up). Positive values produce a slow start followed by a sharp drop at the end. |
+| `scheduler_warmup_ratio` | `0.03` | Fraction of all steps used for a linear warm-up from ~0 to `scheduler_start_lr` (3 % ≈ 2 of 60 epochs). The decay then runs over the remaining steps. `0` = no warm-up. Only used for new trainings; a resume always uses `0` (the Adam moments are already warm) unless the value is set explicitly. |
 
 **Why use a scheduler?** A high initial learning rate allows rapid progress in early epochs while a low final rate lets the optimizer settle into a precise minimum without overshooting. The exponential curve concentrates most of the decay early, which tends to work well for transformer-based models.
 
@@ -202,6 +203,31 @@ Weight decay penalises large parameter magnitudes by adding $\lambda \|\theta\|^
 
 ---
 
+## Speed, stability and stopping options
+
+| Parameter | Default | Description |
+|---|---|---|
+| `norm_first` | `True` | Pre-norm transformer layers (LayerNorm before attention / feed-forward, plus a final LayerNorm). More stable at higher learning rates; together with the warm-up it needs little tuning. `False` = post-norm like older checkpoints. Part of the architecture: it is taken from the checkpoint when resuming. |
+| `max_seq_len` | `128` | Frames (notes + EOS) per 2-bar window the model handles (size of the positional embeddings). Attention cost grows quadratically with it, so keep it close to the real maximum (the Dataset tab shows `max notes` per window). Part of the architecture. |
+| `last_checkpoint_interval` | `3` | `model_last_*.pt` is written every N epochs, and always at the last epoch, on a stop and on early stopping. A crash loses at most N-1 epochs of the resume checkpoint. |
+| `early_stopping` | `False` | Stop when the validation loss (training loss without validation split) stops improving. |
+| `early_stopping_patience` | `8` | Epochs without improvement before the run is stopped. |
+| `early_stopping_min_delta` | `0.001` | Smallest decrease of the monitored loss that counts as an improvement. |
+
+**Fused attention.** Encoder and decoder layers (`FusedEncoderLayer`, `FusedDecoderLayer` in `modules/model.py`) use `F.scaled_dot_product_attention` (flash / memory-efficient kernels) instead of `nn.Transformer*Layer`. Parameter names are identical to the torch layers, so existing checkpoints load unchanged and give the same outputs (checked in `tests/test_training_options.py`). The decoder is purely causal without a padding mask: PAD frames sit behind the last real frame, so no real position attends to one and no loss term changes. That allows `is_causal=True` (flash kernel). The encoder passes a boolean key-padding mask for the PAD frames.
+
+**One-pass loss.** `vae_loss` gathers the logits of the four fields into one padded tensor `[B, T, 4, V_max]` and computes a single `logsumexp` / gather instead of four cross entropies on slices. Values, per-field CE and gradients equal the former per-field loop.
+
+**Pre-norm and old checkpoints.** A checkpoint without `norm_first` is a post-norm model and is rebuilt as such. When resuming, `norm_first` and `max_seq_len` come from the checkpoint (the GUI locks them), and the next checkpoint keeps them.
+
+**Early stopping and beta annealing.** The total loss rises while beta is annealed up, so an improvement cannot be judged then. Monitoring therefore starts at the first epoch end after beta has settled, i.e. after the last point of `annealing_list` that still changes beta (with the default list at 40 % of the run). That epoch is the reference; every later epoch without an improvement of at least `early_stopping_min_delta` counts towards the patience. With a beta curve that rises until the very end, early stopping never fires. When it fires, `last` and `model_<timestamp>.pt` (best validation model) are written and the result has `early_stopped = True`; the stop is logged (`Early stopping after epoch N …`).
+
+**Dataset length vs. `max_seq_len`.** A dataset with another number of frames than the model's `max_seq_len` is padded with PAD frames or cut after time (EOS as last frame) when it is loaded (`compound.resize_frames_array`); the log names the number of cut sequences. In the Dataset tab the length of a new dataset is set with *max_seq_len (frames)* of the extraction (default: `hparams.py`).
+
+Test: `python tests/test_training_options.py`.
+
+---
+
 ## Training from the Server App
 
 The settings above can also be set in the **Training** tab of `rbf_server_app` (see `docs/rbf_server_app.md`, section 13). `train.py` and the server share one implementation: `modules/training.run_training(config, on_event, should_stop)`. `train.py` is only a thin CLI wrapper that builds a config from `hparams.py` (`retrain` switch and overrides are still at the top of the script); the server starts `train_worker.py`, which calls the same function and reports JSON events.
@@ -219,3 +245,27 @@ The settings above can also be set in the **Training** tab of `rbf_server_app` (
 ### Stop and resume
 
 `train_vae(..., should_stop=...)` polls the flag once per batch. On stop it saves the exact state as `model_last_*.pt` (epoch counter, `global_step`, optimizer, scheduler) and writes `model_*.pt`, then returns `stopped = True`. A later *Resume* with `last` continues from there. Tests: `tests/test_training_stop.py`, `tests/test_hparams_io.py`, `tests/test_train_server.py`.
+
+
+
+## Multi-GPU training (DistributedDataParallel)
+
+The Training tab lists the CUDA GPUs of the server (name, memory) in the *Options* box. Click a GPU to use it or to
+leave it out. Default: only GPU 0; at least one GPU always stays selected. Without CUDA the list says so and the
+training runs on MPS / CPU as before.
+
+- **One GPU:** unchanged single-process training.
+- **Several GPUs:** `train_worker.py` (rank 0) starts one extra process per further GPU (`RANK`, `WORLD_SIZE`,
+  `MASTER_ADDR`, `MASTER_PORT` in the environment, NCCL backend). `modules/distributed.py` holds the helpers.
+- **Batch size is global.** `batch_size = 512` on 2 GPUs means 256 per GPU, so the learning-rate and beta schedules
+  behave like on one GPU. The batch must be at least the number of GPUs. Per step at most `world_size - 1` samples are
+  left out (different ones every epoch) so that all ranks run equally sized steps.
+- **Metrics, validation and stop** are synchronised over the ranks. Only rank 0 writes checkpoints (without a `module.`
+  prefix, so they load like single-GPU checkpoints), the CSV log and the events. `epoch` events carry `world_size`.
+- **Failures:** if a rank dies, rank 0 reports an error and kills the others. If rank 0 is killed, the other ranks
+  exit by themselves.
+- `torch.compile` uses mode `default` under DDP (CUDA graphs and DDP hooks do not combine well).
+- With a small model the gradient synchronisation costs a part of the gain; a larger batch size usually helps more than
+  an additional GPU. NVLink needs no code change, NCCL uses it automatically.
+- Test without GPUs: `python tests/test_ddp.py` (CPU processes with the gloo backend, option `ddp_cpu_processes`).
+- Not tested on real GPUs / NCCL yet.

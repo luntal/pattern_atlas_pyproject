@@ -771,14 +771,16 @@ def validate_extract(raw) -> tuple[dict, dict]:
         "name": name, "overwrite": overwrite, "mapping": mapping,
         "skip": _num(raw, "skip", errors, 0, 0, integer=True),
         "take": _num(raw, "take", errors, 0, 0, integer=True),
-        "jump": _num(raw, "jump", errors, 1, 1, 64, integer=True),
+        "jump": _num(raw, "jump", errors, 2, 1, 64, integer=True),
         "randomize_velocity": _num(raw, "randomize_velocity", errors, 0.0, 0.0, 1.0),
         "qnt_strength": _num(raw, "qnt_strength", errors, 0.0, 0.0, 1.0),
         "qnt_randomness": _num(raw, "qnt_randomness", errors, 0.0, 0.0, 1.0),
         "clip": _flag(raw, "clip"), "drums_only": _flag(raw, "drums_only"),
         "filter_duplicates": _flag(raw, "filter_duplicates", True), "pitch_randomness": _flag(raw, "pitch_randomness"),
-        "roland": _flag(raw, "roland", True), "remap": _flag(raw, "remap"),
+        "roland": _flag(raw, "roland", False), "remap": _flag(raw, "remap"),
         "workers": _num(raw, "workers", errors, 0, 0, 64, integer=True),
+        # frames per sequence incl. EOS (windows with more notes are cut after time)
+        "max_seq_len": _num(raw, "max_seq_len", errors, int(HP.max_seq_len), 2, 4096, integer=True),
         # empty seed = random base seed (the seed that was used is stored in the dataset options)
         "seed": (None if str(raw.get("seed", "")).strip() == ""
                  else _num(raw, "seed", errors, 0, 0, 2 ** 32 - 1, integer=True)),
@@ -1044,7 +1046,11 @@ class DatasetJobManager:
                 }
                 self._bump()
 
-        processor = MidiProcessor(HP)
+        from types import SimpleNamespace
+        max_len = int(params.get("max_seq_len") or HP.max_seq_len)
+        hp = SimpleNamespace(**vars(HP))
+        hp.max_seq_len = max_len  # the global hparams stay untouched; the processor and its workers use this copy
+        processor = MidiProcessor(hp)
         mapping = params["mapping"]
         processor.extract(
             midi_folder_path=folder, skip=params["skip"], take=params["take"], clip=params["clip"],
@@ -1066,11 +1072,11 @@ class DatasetJobManager:
             raise ValueError("No sequences could be extracted (see the skipped-file counters).")
 
         self._set(phase="saving", progress=0.92, message="Writing dataset")
-        padded = pad_frames(processor.sequences)
+        padded = pad_frames(processor.sequences, max_len)
         metadata = [_normalize_meta_entry(m, i) for i, m in enumerate(processor.metadata)]
         if stats.truncated_sequences:
             self._log(
-                f"{stats.truncated_sequences} window(s) had more than {int(HP.max_seq_len) - 1} notes and were cut "
+                f"{stats.truncated_sequences} window(s) had more than {max_len - 1} notes and were cut "
                 f"(max {stats.max_notes_per_window} notes per window)"
             )
         if stats.merged_duplicates:
@@ -1080,7 +1086,7 @@ class DatasetJobManager:
         info["source"] = {"folder": folder, "midi_files": scan["midi_files"]}
         info["options"] = {k: params[k] for k in (
             "mapping", "skip", "take", "jump", "clip", "drums_only", "filter_duplicates", "randomize_velocity",
-            "qnt_strength", "qnt_randomness", "pitch_randomness", "roland", "remap", "workers")}
+            "qnt_strength", "qnt_randomness", "pitch_randomness", "roland", "remap", "workers", "max_seq_len")}
         info["options"]["seed"] = int(getattr(processor, "last_seed", 0))
         info["stats"] = dict(summary, extraction={
             "files_in_selection": stats.files_count, "skipped_invalid": stats.skipped_invalid,

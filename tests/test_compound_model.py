@@ -198,6 +198,13 @@ def check_loss_masks():
     mu = torch.ones(1, hp.latent_dim)
     kl = vae_loss(logits, targets, mu, logvar, beta=1.0, field_slices=slices)[2]
     assert torch.allclose(kl, torch.tensor(0.5 * hp.latent_dim / 3)), kl
+    # KL parts: pre beta (kl_raw) and the true KL without the free-bits floor (kl_raw_nofb)
+    out = vae_loss(logits, targets, mu, logvar, beta=2.0, free_bits=1.0, field_slices=slices, return_kl_parts=True)
+    assert len(out) == 7 and out[6].shape == (2,)
+    assert torch.allclose(out[2], torch.tensor(2.0 * 1.0 * hp.latent_dim / 3)), out[2]  # post beta, with free bits
+    assert torch.allclose(out[6][0], torch.tensor(1.0 * hp.latent_dim / 3)), out[6]  # pre beta, with free bits
+    assert torch.allclose(out[6][1], torch.tensor(0.5 * hp.latent_dim / 3)), out[6]  # pre beta, true KL
+    assert len(vae_loss(logits, targets, mu, logvar, beta=1.0, field_slices=slices)) == 6
     # field weights
     w_total = vae_loss(logits, targets, torch.zeros(1, hp.latent_dim), logvar, beta=0.0, field_slices=slices,
                        field_weights=[1, 0, 0, 0])[1]

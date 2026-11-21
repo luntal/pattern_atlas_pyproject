@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 # from torchtune.modules import RotaryPositionalEmbeddings
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 import time
 import numpy as np
@@ -69,6 +70,136 @@ class FieldEmbedding(nn.Module):
         return out * self.scale
 
 
+# ------------------------- Fused attention layers -------------------------
+# Drop-in replacements for nn.TransformerEncoderLayer / nn.TransformerDecoderLayer that call
+# F.scaled_dot_product_attention (flash / memory-efficient kernels). The parameter names are identical to the
+# torch layers (self_attn.in_proj_weight, linear1, norm1, ...), so older checkpoints load unchanged.
+class FusedMHA(nn.Module):
+    """Multi-head attention with the parameter layout of nn.MultiheadAttention, computed with SDPA."""
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f'd_model ({d_model}) must be divisible by n_heads ({n_heads})')
+        self.embed_dim = int(d_model)
+        self.num_heads = int(n_heads)
+        self.dropout = float(dropout)
+        self.in_proj_weight = nn.Parameter(torch.empty(3 * d_model, d_model))
+        self.in_proj_bias = nn.Parameter(torch.zeros(3 * d_model))
+        self.out_proj = nn.Linear(d_model, d_model)
+        nn.init.xavier_uniform_(self.in_proj_weight)
+        nn.init.constant_(self.out_proj.bias, 0.0)
+
+    def _heads(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        return x.view(B, T, self.num_heads, D // self.num_heads).transpose(1, 2)
+
+    def _attend(self, q, k, v, attn_mask=None, is_causal=False) -> torch.Tensor:
+        B, _, T, _ = q.shape
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask,
+                                           dropout_p=self.dropout if self.training else 0.0, is_causal=is_causal)
+        return self.out_proj(o.transpose(1, 2).reshape(B, T, self.embed_dim))
+
+    def self_attention(self, x, attn_mask=None, is_causal=False):
+        q, k, v = F.linear(x, self.in_proj_weight, self.in_proj_bias).chunk(3, dim=-1)
+        return self._attend(self._heads(q), self._heads(k), self._heads(v), attn_mask, is_causal)
+
+    def cross_attention(self, x, memory):
+        D = self.embed_dim
+        q = F.linear(x, self.in_proj_weight[:D], self.in_proj_bias[:D])
+        k, v = F.linear(memory, self.in_proj_weight[D:], self.in_proj_bias[D:]).chunk(2, dim=-1)
+        return self._attend(self._heads(q), self._heads(k), self._heads(v))
+
+
+class FusedEncoderLayer(nn.Module):
+    def __init__(self, d_model, n_heads, ff_dim, dropout=0.1, norm_first=False, activation=F.gelu):
+        super().__init__()
+        self.self_attn = FusedMHA(d_model, n_heads, dropout)
+        self.linear1 = nn.Linear(d_model, ff_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(ff_dim, d_model)
+        self.norm_first = bool(norm_first)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = activation
+
+    def _ff(self, x):
+        return self.linear2(self.dropout(self.activation(self.linear1(x))))
+
+    def forward(self, x, attn_mask=None):
+        if self.norm_first:
+            x = x + self.dropout1(self.self_attn.self_attention(self.norm1(x), attn_mask))
+            return x + self.dropout2(self._ff(self.norm2(x)))
+        x = self.norm1(x + self.dropout1(self.self_attn.self_attention(x, attn_mask)))
+        return self.norm2(x + self.dropout2(self._ff(x)))
+
+
+class FusedDecoderLayer(nn.Module):
+    def __init__(self, d_model, n_heads, ff_dim, dropout=0.1, norm_first=False, activation=F.relu):
+        super().__init__()
+        self.self_attn = FusedMHA(d_model, n_heads, dropout)
+        self.multihead_attn = FusedMHA(d_model, n_heads, dropout)
+        self.linear1 = nn.Linear(d_model, ff_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(ff_dim, d_model)
+        self.norm_first = bool(norm_first)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        self.activation = activation
+
+    def _ff(self, x):
+        return self.linear2(self.dropout(self.activation(self.linear1(x))))
+
+    def forward(self, x, memory):
+        # Causal self-attention only: PAD frames sit behind the last real frame, so no real position ever attends
+        # to one and a padding mask would not change any loss term (is_causal enables the flash kernel).
+        if self.norm_first:
+            x = x + self.dropout1(self.self_attn.self_attention(self.norm1(x), is_causal=True))
+            x = x + self.dropout2(self.multihead_attn.cross_attention(self.norm2(x), memory))
+            return x + self.dropout3(self._ff(self.norm3(x)))
+        x = self.norm1(x + self.dropout1(self.self_attn.self_attention(x, is_causal=True)))
+        x = self.norm2(x + self.dropout2(self.multihead_attn.cross_attention(x, memory)))
+        return self.norm3(x + self.dropout3(self._ff(x)))
+
+
+class FusedTransformerEncoder(nn.Module):
+    def __init__(self, n_layers, d_model, n_heads, ff_dim, dropout=0.1, norm_first=False):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            FusedEncoderLayer(d_model, n_heads, ff_dim, dropout, norm_first) for _ in range(int(n_layers)))
+        # pre-norm stacks need a final LayerNorm (post-norm layers end with a norm already)
+        self.norm = nn.LayerNorm(d_model) if norm_first else None
+
+    def forward(self, x, src_key_padding_mask=None):
+        """src_key_padding_mask: bool [B, T], True = PAD (ignored as key)."""
+        attn_mask = None if src_key_padding_mask is None else (~src_key_padding_mask)[:, None, None, :]
+        for layer in self.layers:
+            x = layer(x, attn_mask)
+        return self.norm(x) if self.norm is not None else x
+
+
+class FusedTransformerDecoder(nn.Module):
+    def __init__(self, n_layers, d_model, n_heads, ff_dim, dropout=0.1, norm_first=False):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            FusedDecoderLayer(d_model, n_heads, ff_dim, dropout, norm_first) for _ in range(int(n_layers)))
+        self.norm = nn.LayerNorm(d_model) if norm_first else None
+
+    def forward(self, tgt, memory, tgt_mask=None, tgt_key_padding_mask=None):
+        # tgt_mask / tgt_key_padding_mask are accepted for compatibility with the torch decoder call signature
+        # (offline scripts); the decoder is always causal and ignores padding as explained in FusedDecoderLayer.
+        x = tgt
+        for layer in self.layers:
+            x = layer(x, memory)
+        return self.norm(x) if self.norm is not None else x
+
+
 class Encoder(nn.Module):
     def __init__(self, _hparams: SimpleNamespace):
         super().__init__()
@@ -86,14 +217,11 @@ class Encoder(nn.Module):
         # self.positional_embedding = RotaryPositionalEmbeddings(self.h_dim)
         self.positional_embedding = nn.Embedding(self.max_seq_len, self.d_model)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.d_model,
-            nhead=self.n_heads,
-            batch_first=True,
-            dim_feedforward=_hparams.ff_dim,
-            activation='gelu'
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.n_layers, enable_nested_tensor=False)
+        # norm_first (pre-norm) is missing in checkpoints from before it was introduced: those are post-norm.
+        self.norm_first = bool(getattr(_hparams, 'norm_first', False))
+        self.encoder = FusedTransformerEncoder(
+            self.n_layers, self.d_model, self.n_heads, int(_hparams.ff_dim),
+            dropout=float(getattr(_hparams, 'dropout', 0.1)), norm_first=self.norm_first)
 
         # Learnable [CLS] token embedding
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.d_model))
@@ -141,8 +269,10 @@ class Decoder(nn.Module):
         self.token_embedding = FieldEmbedding(self.field_vocab_sizes, self.emb_size, self.pad_token)
         self.pos_embedding = nn.Embedding(_hparams.max_seq_len, self.emb_size)
 
-        decoder_layer = nn.TransformerDecoderLayer(d_model=self.emb_size, nhead=_hparams.n_heads, dim_feedforward=_hparams.ff_dim, batch_first=True)
-        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=_hparams.n_layers)
+        self.norm_first = bool(getattr(_hparams, 'norm_first', False))
+        self.transformer_decoder = FusedTransformerDecoder(
+            int(_hparams.n_layers), self.emb_size, int(_hparams.n_heads), int(_hparams.ff_dim),
+            dropout=float(getattr(_hparams, 'dropout', 0.1)), norm_first=self.norm_first)
 
         self.n_memory_tokens = getattr(_hparams, 'n_memory_tokens', 1)
         self.z_to_mem = nn.Linear(_hparams.latent_dim, self.emb_size * self.n_memory_tokens)
@@ -166,14 +296,12 @@ class Decoder(nn.Module):
         emb = emb + pos_emb
 
         memory = self.z_to_mem(z).view(B, self.n_memory_tokens, self.emb_size)
-        tgt_mask = nn.Transformer.generate_square_subsequent_mask(T).to(tgt_frames.device)
-        tgt_key_padding_mask = (tgt_frames[..., 0] == self.pad_token).float()
-        out = self.transformer_decoder(tgt=emb, memory=memory, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask)
+        out = self.transformer_decoder(emb, memory)
         logits = self.fc_out(out)
         return logits
 
     # ------------------------- KV-cache incremental decoding -------------------------
-    # The functions below mirror `forward` (post-norm / pre-norm nn.TransformerDecoderLayer) for one new frame
+    # The functions below mirror `forward` (post-norm / pre-norm FusedDecoderLayer) for one new frame
     # at a time. Self-attention keys/values of all previous positions and the cross-attention keys/values of
     # the latent memory are cached, so every step costs O(T) instead of re-running the whole sequence.
     # They are meant for inference (eval mode, no dropout).
@@ -198,7 +326,6 @@ class Decoder(nn.Module):
         return {
             'mem_kv': mem_kv,
             'self_kv': [None] * len(mem_kv),
-            'pad_bias': torch.zeros(B, 1, 1, 0, dtype=memory.dtype, device=memory.device),
             'pos': 0,
         }
 
@@ -217,11 +344,7 @@ class Decoder(nn.Module):
         x = self.token_embedding(frame)
         x = (x + self.pos_embedding.weight[pos]).unsqueeze(1)  # [B, 1, D]
 
-        # Same quirk as the training path: the float padding mask is added to the attention scores.
-        pad_now = (frame[:, 0] == self.pad_token).to(x.dtype).view(B, 1, 1, 1)
-        pad_bias = torch.cat((cache['pad_bias'], pad_now), dim=-1)
-        cache['pad_bias'] = pad_bias
-
+        # Like the training path: causal attention over all previous frames, no padding mask.
         for i, layer in enumerate(self.transformer_decoder.layers):
             sa, ca = layer.self_attn, layer.multihead_attn
             H = sa.num_heads
@@ -234,7 +357,7 @@ class Decoder(nn.Module):
                     k = torch.cat((prev[0], k), dim=2)
                     v = torch.cat((prev[1], v), dim=2)
                 cache['self_kv'][i] = (k, v)
-                o = F.scaled_dot_product_attention(q, k, v, attn_mask=pad_bias)
+                o = F.scaled_dot_product_attention(q, k, v)
                 return sa.out_proj(o.transpose(1, 2).reshape(B, 1, D))
 
             def cross_attn_block(h):
@@ -403,8 +526,28 @@ class EncoderWrapper(nn.Module):
 
 
 # ------------------------- Loss & Training helpers -------------------------
+_LOSS_TABLE_CACHE = {}
+
+
+def _loss_tables(field_slices, field_weights, device):
+    """(gather index [F, Vmax], valid columns [F, Vmax], weights [F]) for the one-pass loss, cached per device."""
+    key = (tuple((int(s), int(e)) for s, e in field_slices), tuple(float(w) for w in field_weights), str(device))
+    tables = _LOSS_TABLE_CACHE.get(key)
+    if tables is None:
+        n = len(field_slices)
+        vmax = max(int(e) - int(s) for s, e in field_slices)
+        idx = torch.zeros(n, vmax, dtype=torch.long)
+        valid = torch.zeros(n, vmax, dtype=torch.bool)
+        for f, (s, e) in enumerate(field_slices):
+            idx[f, :e - s] = torch.arange(s, e)
+            valid[f, :e - s] = True
+        tables = (idx.to(device), valid.to(device), torch.tensor(key[1], dtype=torch.float32, device=device))
+        _LOSS_TABLE_CACHE[key] = tables
+    return tables
+
+
 def vae_loss(logits, targets, mu, logvar, beta=1.0, free_bits=0.0, field_slices=None, field_weights=None,
-             pad_token=0, eos_token=2):
+             pad_token=0, eos_token=2, return_kl_parts=False):
     """Compound loss.
 
     logits: [B, T, sum(field_vocab_sizes)], targets: [B, T, 4].
@@ -412,6 +555,8 @@ def vae_loss(logits, targets, mu, logvar, beta=1.0, free_bits=0.0, field_slices=
     trained (the other fields are ignored). KL is normalised per frame of each sequence.
     Returns (total, recon, kl, perplexity, n_frames, field_ce[4]); field_ce is the mean CE per field over its
     valid targets (detached) and perplexity = exp(mean(field_ce)).
+    With return_kl_parts=True a 7th value is returned: detached tensor [kl_raw, kl_raw_nofb] with the per-frame KL
+    before the beta weighting, with free bits (what the loss uses) and without free bits (the true KL).
     """
     n_fields = targets.size(-1)
     if field_slices is None:
@@ -425,34 +570,40 @@ def vae_loss(logits, targets, mu, logvar, beta=1.0, free_bits=0.0, field_slices=
     n_frames_f = n_frames.to(logits.device, dtype=torch.float32)
     is_eos = step_targets == eos_token
 
-    recon = logits.new_zeros((), dtype=torch.float32)
-    field_ce = []
-    for f, (start, end) in enumerate(field_slices):
-        target_f = targets[..., f]
-        if f > 0:
-            target_f = target_f.masked_fill(is_eos, pad_token)
-        logits_f = logits[..., start:end].reshape(-1, end - start)
-        ce_sum = F.cross_entropy(logits_f.float(), target_f.reshape(-1), ignore_index=pad_token, reduction='sum')
-        count = (target_f != pad_token).sum().clamp(min=1).to(torch.float32)
-        recon = recon + float(field_weights[f]) * ce_sum / n_frames_f
-        field_ce.append((ce_sum / count).detach())
-    field_ce = torch.stack(field_ce)
+    # All fields in one pass: the per field logit slices are gathered into one padded tensor [B, T, 4, Vmax]
+    # (unused columns -inf), so a single logsumexp / gather replaces four separate cross entropies.
+    gather_idx, col_valid, weights = _loss_tables(field_slices, field_weights, logits.device)
+    non_step_field = torch.arange(n_fields, device=logits.device) > 0
+    field_valid = (targets != pad_token) & ~(is_eos.unsqueeze(-1) & non_step_field)  # [B, T, 4]
+    safe_targets = targets.masked_fill(~field_valid, 0)
+
+    padded = logits[..., gather_idx].float().masked_fill(~col_valid, float('-inf'))  # [B, T, 4, Vmax]
+    nll = torch.logsumexp(padded, dim=-1) - padded.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1)  # [B, T, 4]
+    ce_sum = (nll * field_valid).sum(dim=(0, 1))  # [4]
+    count = field_valid.sum(dim=(0, 1)).clamp(min=1).to(torch.float32)
+    recon = (weights * ce_sum).sum() / n_frames_f
+    field_ce = (ce_sum / count).detach()
 
     # Dimension-wise KL with per-dimension free bits
     kl_per_dim = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())  # [B, latent_dim]
+    kl_per_dim_true = kl_per_dim
     if free_bits > 0:
         kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)  # free bits per dimension
     kl_per_sample = kl_per_dim.float().sum(dim=1)  # [B]
 
     # normalize KL per frame of every sequence
     frames_per_sample = frame_mask.sum(dim=1).clamp(min=1).to(torch.float32)  # [B]
-    kl = (kl_per_sample / frames_per_sample).mean()
-    kl = beta * kl
+    kl_raw = (kl_per_sample / frames_per_sample).mean()
+    kl = beta * kl_raw
     total_loss = recon + kl
 
     # Kept as a tensor so the training loop does not need a host sync per batch.
     perplexity = torch.exp(torch.clamp(field_ce.mean(), max=20))
 
+    if return_kl_parts:
+        kl_raw_nofb = (kl_per_dim_true.float().sum(dim=1) / frames_per_sample).mean()
+        kl_parts = torch.stack([kl_raw.detach(), kl_raw_nofb.detach()])
+        return total_loss, recon, kl, perplexity, n_frames.float(), field_ce, kl_parts
     return total_loss, recon, kl, perplexity, n_frames.float(), field_ce
 
 
@@ -466,25 +617,47 @@ def _atomic_torch_save(obj, path):
 def train_vae(
         model: TransformerVAE, dataloader: DataLoader, _hparams: SimpleNamespace,
     optimizer, device=None, annealing_style='sigmoid', scheduler=None, val_loader=None, resume_state=None,
-    on_event=None, should_stop=None, log_interval=25, torch_compile=True):
+    on_event=None, should_stop=None, log_interval=25, torch_compile=True, dist_ctx=None):
     """Train the VAE.
 
     dataloader / val_loader: any iterable of [B, T] token tensors with __len__ (DataLoader or TensorBatcher).
     on_event(dict): optional callback receiving progress events (batch, epoch, checkpoint, log).
     should_stop() -> bool: optional, polled once per batch. When it returns True the current state is saved
         as model_last_*.pt and model_*.pt and the function returns a result dict with stopped=True.
+    dist_ctx (modules.distributed.DistContext): device and DDP membership of this process. With world_size > 1
+        the model is wrapped in DistributedDataParallel, metrics are averaged over the ranks, the stop decision is
+        synchronised and only rank 0 emits events and writes checkpoints / the CSV log. dataloader / val_loader
+        must then yield this rank's share of every batch (TensorBatcher with rank / world_size).
     Returns a dict with timestamp, checkpoint paths, log file and the stopped flag.
     """
+    world_size = int(dist_ctx.world_size) if dist_ctx is not None else 1
+    ddp = world_size > 1
+    is_main = dist_ctx is None or dist_ctx.is_main
+    stop_sync = {'calls': 0, 'every': 1}
 
     def _emit(event):
-        if on_event is not None:
+        if on_event is not None and is_main:
             on_event(event)
 
     def _stop_requested():
-        return bool(should_stop()) if should_stop is not None else False
+        local = bool(should_stop()) if should_stop is not None else False
+        if not ddp:
+            return local
+        # All ranks call this once per batch (equal batch counts), so the collective stays in lockstep.
+        stop_sync['calls'] += 1
+        if stop_sync['calls'] % stop_sync['every'] != 0:
+            return False
+        flag = torch.tensor([1.0 if local else 0.0], device=device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        return bool(flag.item() > 0.5)
 
-    # Device selection with priority: CUDA > MPS > CPU
-    if torch.cuda.is_available():
+    # Device selection with priority: CUDA > MPS > CPU (or the device chosen by the DDP context)
+    if dist_ctx is not None:
+        device = dist_ctx.device
+        if is_main:
+            print(f'Using device {device}' + (f' ({torch.cuda.get_device_name(device)})' if device.type == 'cuda' else '')
+                  + (f' | DDP with {world_size} processes ({dist_ctx.backend})' if ddp else ''))
+    elif torch.cuda.is_available():
         device = torch.device('cuda')
         print(f'Using CUDA device: {torch.cuda.get_device_name(0)}')
     elif torch.backends.mps.is_available():
@@ -567,6 +740,8 @@ def train_vae(
     branch_name = safe_branch_name(get_current_branch())
     log_dir = branch_dir('docs')
     log_file = os.path.join(str(log_dir), f'training_log_{timestamp}.csv')
+    if not is_main:
+        log_file = os.devnull  # only rank 0 writes the CSV log
 
     # Generate model name with timestamp
     model_dir = branch_dir('models')
@@ -580,6 +755,11 @@ def train_vae(
     autocast_ctx = None
     # Keep a handle on the uncompiled module: checkpoints must not carry the '_orig_mod.' key prefix.
     raw_model = model
+    if ddp:
+        raw_model.to(device)
+        # Gradients are averaged over the ranks by DDP; the model has no buffers that need broadcasting.
+        model = nn.parallel.DistributedDataParallel(
+            raw_model, device_ids=[device.index] if device.type == 'cuda' else None, broadcast_buffers=False)
 
     if device.type == 'cuda':
         # Check for H100/A100 (compute capability 8.0+) for TF32 and other optimizations
@@ -629,7 +809,8 @@ def train_vae(
                 print("torch.compile disabled: no system C compiler found (cc/gcc/clang)")
             else:
                 try:
-                    model = torch.compile(model, mode='reduce-overhead')
+                    # CUDA graphs ('reduce-overhead') do not combine well with DDP's gradient hooks.
+                    model = torch.compile(model, mode='default' if ddp else 'reduce-overhead')
                     use_compile = True
                     # If a compiled backend fails at runtime, fall back to eager instead of crashing.
                     from torch import _dynamo
@@ -655,11 +836,17 @@ def train_vae(
 
     def _loss(logits, frames, mu, logvar, beta):
         return vae_loss(logits, frames, mu, logvar, beta=beta, free_bits=free_bits, field_slices=field_slices,
-                        field_weights=field_weights, pad_token=pad_token, eos_token=eos_token)
+                        field_weights=field_weights, pad_token=pad_token, eos_token=eos_token, return_kl_parts=True)
 
     def _fields_dict(values):
         values = [float(v) for v in values]
         return {name: values[i] for i, name in enumerate(field_names)}
+
+    def _kl_parts_dict(values):
+        """[raw (free bits), raw (true KL), beta * raw (true KL)] -> epoch event keys (the beta * raw value with
+        free bits is the existing 'kl')."""
+        raw_fb, raw_true, beta_true = (float(v) for v in values)
+        return {'kl_raw': raw_fb, 'kl_raw_nofb': raw_true, 'kl_nofb': beta_true}
 
     with open(log_file, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -669,10 +856,12 @@ def train_vae(
             'annealing_factor', 'val_total_loss', 'val_reconstruction_loss', 'val_kl_loss',
             'val_perplexity', 'epoch_time_seconds', 'elapsed_time_seconds',
             'remaining_time_seconds', 'saved_cache'
-        ] + [f'ce_{name}' for name in field_names] + [f'val_ce_{name}' for name in field_names])
+        ] + [f'ce_{name}' for name in field_names] + [f'val_ce_{name}' for name in field_names]
+          + ['kl_raw', 'kl_nofb', 'kl_raw_nofb', 'val_kl_raw', 'val_kl_nofb', 'val_kl_raw_nofb'])
 
     def _log(text):
-        print(text, flush=True)
+        if is_main:
+            print(text, flush=True)
         _emit({'type': 'log', 'text': str(text)})
 
     prev_loss = None
@@ -702,6 +891,8 @@ def train_vae(
         return hparams_dict
 
     def _build_checkpoint(epoch, global_step_value, best_val_loss_value, best_train_loss_value, train_loss_value, val_loss_value):
+        if not is_main:
+            return None  # only rank 0 writes checkpoints
         return {
             'model_state_dict': raw_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict() if optimizer is not None else None,
@@ -719,6 +910,8 @@ def train_vae(
         }
 
     def _save_checkpoint(checkpoint, path, kind):
+        if not is_main:
+            return
         _atomic_torch_save(checkpoint, path)
         _emit({'type': 'checkpoint', 'kind': kind, 'path': str(path)})
 
@@ -730,9 +923,32 @@ def train_vae(
     except (AttributeError, TypeError):
         n_train_samples = int(getattr(_hparams, 'n_samples', 0) or 0)
     n_train_samples = max(int(n_train_samples), 1)
+    # Few batches per epoch: synchronise the stop decision every batch, otherwise every 4th batch.
+    stop_sync['every'] = 4 if n_batches >= 16 else 1
 
     stopped = False
+    early_stopped = False
     lr = optimizer.param_groups[0]['lr']
+
+    # model_last_*.pt is written every N epochs (and at the end / on stop / on early stop).
+    last_interval = max(int(getattr(_hparams, 'last_checkpoint_interval', 1) or 1), 1)
+
+    # Early stopping on the validation loss (train loss without validation). The total loss rises while beta is
+    # annealed up, so it is only monitored once beta has settled (the last annealing point that changes beta).
+    early_stopping = bool(getattr(_hparams, 'early_stopping', False))
+    es_patience = max(int(getattr(_hparams, 'early_stopping_patience', 8) or 1), 1)
+    es_min_delta = max(float(getattr(_hparams, 'early_stopping_min_delta', 0.0) or 0.0), 0.0)
+    es_settle = 0.0
+    for idx in range(len(annealing_points) - 1, -1, -1):
+        if not math.isclose(annealing_points[idx][1], annealing_points[-1][1], rel_tol=1e-9, abs_tol=1e-12):
+            es_settle = annealing_points[min(idx + 1, len(annealing_points) - 1)][0]
+            break
+    es_armed = False
+    es_best = float('inf')
+    es_bad_epochs = 0
+    if early_stopping:
+        _log(f"Early stopping on: patience {es_patience} epoch(s), min delta {es_min_delta:g}, "
+             f"monitoring starts when beta has settled (at {es_settle * 100:.0f}% of the training)")
     weighted_beta = _annealed_beta_at_progress(0.0, annealing_points, annealing_slope)
     train_loss_epoch = float('inf')
     val_loss_epoch = None
@@ -751,6 +967,7 @@ def train_vae(
             'kl': torch.zeros((), device=device),
             'n_tokens': torch.zeros((), device=device),
             'fields': torch.zeros(len(field_slices), device=device),
+            'klp': torch.zeros(3, device=device),  # raw (free bits), raw (no free bits), beta * raw (no free bits)
         }
         batch_iteration = 0
         prev_time = time.time()
@@ -773,7 +990,7 @@ def train_vae(
             if use_amp:
                 with autocast_ctx():
                     logits, mu, logvar = model(batch)
-                    loss, rec, kl, perplexity, token_count, field_ce = _loss(logits, batch, mu, logvar, weighted_beta)
+                    loss, rec, kl, perplexity, token_count, field_ce, kl_parts = _loss(logits, batch, mu, logvar, weighted_beta)
 
                 if scaler is not None:
                     # fp16: scaled backward pass
@@ -790,7 +1007,7 @@ def train_vae(
             else:
                 # Standard FP32 training
                 logits, mu, logvar = model(batch)
-                loss, rec, kl, perplexity, token_count, field_ce = _loss(logits, batch, mu, logvar, weighted_beta)
+                loss, rec, kl, perplexity, token_count, field_ce, kl_parts = _loss(logits, batch, mu, logvar, weighted_beta)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -802,6 +1019,7 @@ def train_vae(
             running['kl'] += kl.detach()
             running['n_tokens'] += token_count.detach()
             running['fields'] += field_ce.detach()
+            running['klp'] += torch.stack([kl_parts[0], kl_parts[1], kl_parts[1] * weighted_beta]).to(running['klp'].dtype)
 
             if on_event is None:
                 print(f'\rEpoch {epoch:03d}/{epochs} | Step {batch_iteration:2d}/{n_batches} | step_time: {time_elapsed:.2f}s', end='')
@@ -829,6 +1047,19 @@ def train_vae(
         if stopped:
             break
 
+        if ddp:
+            # Average the epoch metrics over the ranks (equal batch counts per rank).
+            ppl_local = perplexity.detach().to(device=device, dtype=torch.float32).view(1)
+            stats = torch.cat([running['loss'].view(1), running['rec'].view(1), running['kl'].view(1),
+                               ppl_local, running['klp'], running['fields']])
+            dist.all_reduce(stats)
+            stats = stats / world_size
+            running['loss'], running['rec'], running['kl'] = stats[0], stats[1], stats[2]
+            perplexity = stats[3]
+            running['klp'] = stats[4:7]
+            running['fields'] = stats[7:]
+            dist.all_reduce(running['n_tokens'])  # frames of the whole epoch over all ranks
+
         # Validation evaluation
         val_metrics = None
         if val_loader is not None:
@@ -839,6 +1070,7 @@ def train_vae(
                 'kl': torch.zeros((), device=device),
                 'perplexity': torch.zeros((), device=device),
                 'fields': torch.zeros(len(field_slices), device=device),
+                'klp': torch.zeros(3, device=device),
             }
             with torch.no_grad():
                 for val_batch in val_loader:
@@ -848,11 +1080,11 @@ def train_vae(
                     if use_amp:
                         with autocast_ctx():
                             logits, mu, logvar = model(val_batch)
-                            val_loss, val_rec, val_kl, val_perplexity, _, val_field_ce = _loss(
+                            val_loss, val_rec, val_kl, val_perplexity, _, val_field_ce, val_kl_parts = _loss(
                                 logits, val_batch, mu, logvar, weighted_beta)
                     else:
                         logits, mu, logvar = model(val_batch)
-                        val_loss, val_rec, val_kl, val_perplexity, _, val_field_ce = _loss(
+                        val_loss, val_rec, val_kl, val_perplexity, _, val_field_ce, val_kl_parts = _loss(
                             logits, val_batch, mu, logvar, weighted_beta)
 
                     val_sums['loss'] += val_loss.detach()
@@ -860,11 +1092,23 @@ def train_vae(
                     val_sums['kl'] += val_kl.detach()
                     val_sums['perplexity'] += val_perplexity.detach()
                     val_sums['fields'] += val_field_ce.detach()
+                    val_sums['klp'] += torch.stack(
+                        [val_kl_parts[0], val_kl_parts[1], val_kl_parts[1] * weighted_beta]).to(val_sums['klp'].dtype)
 
-            n_val_batches = max(len(val_loader), 1)
-            val_fields = (val_sums.pop('fields') / n_val_batches).cpu().tolist()
-            val_metrics = {k: float(v) / n_val_batches for k, v in val_sums.items()}
+            val_scalar_keys = ('loss', 'rec', 'kl', 'perplexity')
+            n_fld = len(field_slices)
+            val_vec = torch.cat([val_sums[k].view(1) for k in val_scalar_keys]
+                                + [val_sums['fields'], val_sums['klp'],
+                                   torch.tensor([float(len(val_loader))], device=device)])
+            if ddp:
+                dist.all_reduce(val_vec)  # every rank evaluated its own share of the validation set
+            n_val_batches = max(float(val_vec[-1]), 1.0)
+            n_sc = len(val_scalar_keys)
+            val_fields = (val_vec[n_sc:n_sc + n_fld] / n_val_batches).cpu().tolist()
+            val_klp = (val_vec[n_sc + n_fld:n_sc + n_fld + 3] / n_val_batches).cpu().tolist()
+            val_metrics = {k: float(val_vec[i]) / n_val_batches for i, k in enumerate(val_scalar_keys)}
             val_metrics['fields'] = _fields_dict(val_fields)
+            val_metrics.update(_kl_parts_dict(val_klp))
 
         now = time.time()
         epoch_time = now - prev_epoch_time
@@ -883,6 +1127,7 @@ def train_vae(
             'ppl': float(perplexity),
             'n_tokens': float(running['n_tokens']),
             'fields': _fields_dict((running['fields'] / n_batches).cpu().tolist()),
+            **_kl_parts_dict((running['klp'] / n_batches).cpu().tolist()),
         }
         loss_history.append(train_epoch['loss'])
 
@@ -891,16 +1136,31 @@ def train_vae(
         completed_epochs = epoch
         save_cache = False
 
-        # Always save the latest full resume checkpoint.
-        last_checkpoint = _build_checkpoint(
-            epoch=epoch,
-            global_step_value=global_step,
-            best_val_loss_value=best_val_loss,
-            best_train_loss_value=best_train_loss,
-            train_loss_value=train_loss_epoch,
-            val_loss_value=val_loss_epoch,
-        )
-        _save_checkpoint(last_checkpoint, last_path, 'last')
+        # Early stopping decision (identical on all ranks: the monitored losses are already averaged).
+        if early_stopping:
+            monitored = val_loss_epoch if val_loss_epoch is not None else train_loss_epoch
+            if train_step / max(total_train_steps, 1) + 1e-9 >= es_settle:
+                if not es_armed:
+                    es_armed, es_best, es_bad_epochs = True, monitored, 0
+                    _log(f"Early stopping armed (reference loss {monitored:.4f})")
+                elif monitored < es_best - es_min_delta:
+                    es_best, es_bad_epochs = monitored, 0
+                else:
+                    es_bad_epochs += 1
+                    if es_bad_epochs >= es_patience:
+                        early_stopped = True
+
+        # The latest full resume checkpoint is written every `last_interval` epochs and at the end.
+        if epoch % last_interval == 0 or epoch == epochs or early_stopped:
+            last_checkpoint = _build_checkpoint(
+                epoch=epoch,
+                global_step_value=global_step,
+                best_val_loss_value=best_val_loss,
+                best_train_loss_value=best_train_loss,
+                train_loss_value=train_loss_epoch,
+                val_loss_value=val_loss_epoch,
+            )
+            _save_checkpoint(last_checkpoint, last_path, 'last')
 
         # Track and save best train checkpoint.
         if train_loss_epoch < best_train_loss:
@@ -966,7 +1226,7 @@ def train_vae(
             'type': 'epoch',
             'epoch': epoch,
             'epochs': epochs,
-            'train': {k: train_epoch[k] for k in ('loss', 'rec', 'kl', 'ppl', 'fields')},
+            'train': {k: train_epoch[k] for k in ('loss', 'rec', 'kl', 'ppl', 'fields', 'kl_raw', 'kl_nofb', 'kl_raw_nofb')},
             'avg_frames_per_sequence': avg_frames,
             'val': dict(val_metrics, ppl=val_metrics['perplexity']) if val_metrics is not None else None,
             'beta': float(weighted_beta),
@@ -975,6 +1235,7 @@ def train_vae(
             'elapsed': elapsed_time,
             'remaining': remaining_time,
             'global_step': global_step,
+            'world_size': world_size,
         })
 
         # Log metrics to CSV
@@ -1000,7 +1261,14 @@ def train_vae(
                 f"{remaining_time:.2f}",
                 save_cache
             ] + [f"{v:.6f}" for v in train_epoch['fields'].values()]
-              + ([f"{v:.6f}" for v in val_metrics['fields'].values()] if val_metrics is not None else [''] * len(field_names)))
+              + ([f"{v:.6f}" for v in val_metrics['fields'].values()] if val_metrics is not None else [''] * len(field_names))
+              + [f"{train_epoch[k]:.6f}" for k in ('kl_raw', 'kl_nofb', 'kl_raw_nofb')]
+              + ([f"{val_metrics[k]:.6f}" for k in ('kl_raw', 'kl_nofb', 'kl_raw_nofb')] if val_metrics is not None else [''] * 3))
+
+        if early_stopped:
+            _log(f"Early stopping after epoch {epoch}: no improvement over {es_best:.4f} (min delta {es_min_delta:g}) "
+                 f"for {es_bad_epochs} epoch(s).")
+            break
 
     if stopped:
         # Persist the exact stop state (mid-epoch) as resume checkpoint.
@@ -1051,6 +1319,7 @@ def train_vae(
     return {
         'timestamp': timestamp,
         'stopped': bool(stopped),
+        'early_stopped': bool(early_stopped),
         'epochs_completed': int(completed_epochs),
         'global_step': int(global_step),
         'model_path': model_name,

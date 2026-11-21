@@ -9,7 +9,11 @@ TrainConfig:
     resume: {mode: best_val|best_train|last|none, previous: int, name: str|None,
              continue_beta: bool, end_lr_factor: float|None}      (only for mode == "resume")
     overrides: {key: value}   (only keys from modules.train_params.ALLOWED_KEYS)
-    options: {torch_compile: bool, log_interval: int}
+    options: {torch_compile: bool, log_interval: int, gpus: [int, ...]}
+
+Multi-GPU: with more than one entry in options.gpus the worker (train_worker.py) starts one process per GPU
+(DistributedDataParallel, see modules/distributed.py). hparams.batch_size is the GLOBAL batch size: every step
+the batch is split evenly over the GPUs, so learning-rate and beta schedules behave like on a single GPU.
 """
 import copy
 import math
@@ -18,6 +22,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+from modules.distributed import DistContext, build_context
 from modules.model import TransformerVAE, train_vae
 from modules.train_params import ALLOWED_KEYS, ARCHITECTURE_KEYS, coerce_param
 from modules.utilities import load_dataset, load_model, load_scheduler
@@ -37,12 +42,20 @@ class TensorBatcher:
 
     Replaces DataLoader + worker processes for small integer datasets: no pickling, no host-to-device
     copies per batch, no worker start-up time. Behaves like a DataLoader with drop_last=False.
+
+    Multi-GPU (world_size > 1): every rank holds the full tensor and uses the same seed, so all ranks draw the same
+    permutation. batch_size is the global batch; each rank takes its strided share of it. A global batch is cut to a
+    multiple of world_size (at most world_size - 1 samples per step, different ones every epoch), so all ranks run exactly the
+    same number of equally sized steps, which DDP requires.
     """
 
-    def __init__(self, data: torch.Tensor, batch_size: int, shuffle: bool, seed: int = 0):
+    def __init__(self, data: torch.Tensor, batch_size: int, shuffle: bool, seed: int = 0,
+                 rank: int = 0, world_size: int = 1):
         self.data = data
         self.batch_size = max(int(batch_size), 1)
         self.shuffle = bool(shuffle)
+        self.rank = int(rank)
+        self.world_size = max(int(world_size), 1)
         self._generator = torch.Generator()
         self._generator.manual_seed(int(seed))
 
@@ -51,7 +64,11 @@ class TensorBatcher:
         return self.data
 
     def __len__(self):
-        return (self.data.shape[0] + self.batch_size - 1) // self.batch_size
+        n = int(self.data.shape[0])
+        full, rest = divmod(n, self.batch_size)
+        if self.world_size == 1:
+            return full + (1 if rest else 0)
+        return full + (1 if rest >= self.world_size else 0)
 
     def __iter__(self):
         n = self.data.shape[0]
@@ -61,9 +78,19 @@ class TensorBatcher:
             order = None
         for start in range(0, n, self.batch_size):
             if order is None:
+                idx = torch.arange(start, min(start + self.batch_size, n), device=self.data.device)
+            else:
+                idx = order[start:start + self.batch_size]
+            if self.world_size > 1:
+                usable = (int(idx.shape[0]) // self.world_size) * self.world_size
+                if usable == 0:
+                    continue
+                idx = idx[:usable][self.rank::self.world_size]
+                yield self.data[idx]
+            elif order is None:
                 yield self.data[start:start + self.batch_size]
             else:
-                yield self.data[order[start:start + self.batch_size]]
+                yield self.data[idx]
 
 
 def default_hparams() -> SimpleNamespace:
@@ -78,6 +105,8 @@ def validate_hparams(hp):
         raise ValueError('validation_split must be in [0, 1)')
     if int(hp.batch_size) < 1 or int(hp.n_epochs) < 1:
         raise ValueError('batch_size and n_epochs must be >= 1')
+    if int(getattr(hp, 'max_seq_len', 2)) < 2:
+        raise ValueError('max_seq_len must be >= 2 (at least one note frame and EOS)')
 
 
 def _apply_overrides(hp, overrides, skip_keys=()):
@@ -93,7 +122,19 @@ def _apply_overrides(hp, overrides, skip_keys=()):
 
 
 def run_training(config, on_event=None, should_stop=None):
-    """Run one training. Returns the result dict of train_vae. Raises on invalid configuration."""
+    """Run one training. Returns the result dict of train_vae. Raises on invalid configuration.
+
+    Joins the DDP process group first when this process was started as one rank of a multi-GPU run
+    (environment set by train_worker.py); only rank 0 should pass on_event.
+    """
+    ctx = build_context((config or {}).get('options'))
+    try:
+        return _run_training(config, on_event, should_stop, ctx)
+    finally:
+        ctx.shutdown()
+
+
+def _run_training(config, on_event, should_stop, ctx: DistContext):
     config = dict(config or {})
     mode = config.get('mode', 'new')
     overrides = dict(config.get('overrides') or {})
@@ -111,7 +152,7 @@ def run_training(config, on_event=None, should_stop=None):
     if mode not in ('new', 'resume'):
         raise ValueError(f"Unknown mode '{mode}'")
 
-    device = pick_device()
+    device = ctx.device
     resume_checkpoint = None
     vae = None
 
@@ -127,6 +168,10 @@ def run_training(config, on_event=None, should_stop=None):
             name=resume_cfg.get('name') or None,
         )
         hp = SimpleNamespace(**copy.deepcopy(vars(hp)))
+        # Checkpoints from before pre-norm existed are post-norm models (the architecture flag must not fall
+        # back to the new default, or the next checkpoint would be rebuilt with the wrong layer type).
+        if not hasattr(hp, 'norm_first'):
+            hp.norm_first = False
         # Keys that the checkpoint does not carry (older checkpoints) fall back to the defaults.
         for key, value in vars(default_hparams()).items():
             if not hasattr(hp, key):
@@ -137,6 +182,8 @@ def run_training(config, on_event=None, should_stop=None):
         if resume_cfg.get('continue_beta') and 'annealing_list' not in overrides:
             w_beta = float(getattr(hp, 'weighted_beta', 0.0) or 0.0)
             hp.annealing_list = [[0.0, w_beta], [0.5, w_beta], [1.0, w_beta]]
+        if 'scheduler_warmup_ratio' not in overrides:
+            hp.scheduler_warmup_ratio = 0.0  # the optimizer moments are already warm when resuming
         if 'scheduler_start_lr' not in overrides and resume_cfg.get('start_lr') is not None:
             hp.scheduler_start_lr = float(resume_cfg['start_lr'])
         if 'scheduler_end_lr' not in overrides and resume_cfg.get('end_lr_factor') is not None:
@@ -154,9 +201,13 @@ def run_training(config, on_event=None, should_stop=None):
     if vae is None:
         vae = TransformerVAE(hp)
     vae.to(device)
+    if ctx.distributed:
+        # Same initial weights everywhere (DDP also broadcasts rank 0), but different dropout noise per rank.
+        torch.manual_seed(int(hp.seed) + ctx.rank)
 
     total_params = sum(p.numel() for p in vae.parameters() if p.requires_grad)
-    _status(f'Model parameters: {total_params:,} | device: {device}')
+    gpu_text = f' | DDP rank {ctx.rank + 1}/{ctx.world_size} ({ctx.backend})' if ctx.distributed else ''
+    _status(f'Model parameters: {total_params:,} | device: {device}{gpu_text}')
 
     _status(f'Loading dataset {hp.dataset_name} ...')
     data, _metadata = load_dataset(hp)
@@ -169,8 +220,19 @@ def run_training(config, on_event=None, should_stop=None):
     val_tensor = torch.from_numpy(np.ascontiguousarray(data[train_size:])).long().to(device) if val_size > 0 else None
     _status(f'Train samples: {train_size} | validation samples: {val_size}')
 
-    loader = TensorBatcher(train_tensor, hp.batch_size, shuffle=True, seed=int(hp.seed))
-    val_loader = TensorBatcher(val_tensor, hp.batch_size, shuffle=False) if val_tensor is not None else None
+    world = ctx.world_size
+    if train_size < world:
+        raise ValueError(f'Only {train_size} training sample(s) for {world} GPUs')
+    if ctx.distributed:
+        _status(f'Global batch size {hp.batch_size} -> {max(int(hp.batch_size) // world, 1)} per GPU on {world} GPUs')
+    loader = TensorBatcher(train_tensor, hp.batch_size, shuffle=True, seed=int(hp.seed),
+                           rank=ctx.rank, world_size=world)
+    if len(loader) == 0:
+        raise ValueError(f'batch_size {hp.batch_size} is smaller than the number of GPUs ({world})')
+    # Validation: every rank evaluates its own strided share of the samples; train_vae sums the results.
+    val_loader = (TensorBatcher(val_tensor[ctx.rank::world], max((int(hp.batch_size) + world - 1) // world, 1),
+                                shuffle=False)
+                  if val_tensor is not None else None)
 
     optim = torch.optim.AdamW(
         vae.parameters(),
@@ -207,4 +269,5 @@ def run_training(config, on_event=None, should_stop=None):
         should_stop=should_stop,
         log_interval=int(options.get('log_interval', 25) or 25),
         torch_compile=bool(options.get('torch_compile', True)),
+        dist_ctx=ctx,
     )

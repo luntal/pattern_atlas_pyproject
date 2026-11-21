@@ -29,6 +29,7 @@ from flask_socketio import SocketIO, emit
 from hparams import hparams as _DEFAULT_HPARAMS
 from modules.branch_paths import get_current_branch, project_root, safe_branch_name
 from modules import compound, dataset_tools
+from modules.distributed import cuda_device_list
 from modules.hparams_io import HparamsSaveError, read_hparams, save_hparams
 from modules.radial_basis_function import compute_rbf_weights, rbf_interpolate_exact
 from modules.train_params import ALLOWED_KEYS, ARCHITECTURE_KEYS, MODEL_KEYS, TRAIN_KEYS, coerce_param
@@ -839,6 +840,11 @@ _TRAIN_RANGES = {
     "scheduler_start_lr": (0.0, 1.0, False, True),
     "scheduler_end_lr": (0.0, 1.0, True, True),
     "scheduler_exp_curve_factor": (-50.0, 50.0, True, True),
+    "scheduler_warmup_ratio": (0.0, 0.5, True, True),
+    "last_checkpoint_interval": (1, 100000, True, True),
+    "early_stopping_patience": (1, 100000, True, True),
+    "early_stopping_min_delta": (0.0, 100.0, True, True),
+    "max_seq_len": (2, 4096, True, True),
     "weight_decay": (0.0, 10.0, True, True),
     "n_samples": (0, 10 ** 9, True, True),
     "free_bits": (0.0, 100.0, True, True),
@@ -854,8 +860,12 @@ _TRAIN_RANGES = {
 }
 
 
-def validate_train_config(raw, available_datasets, checkpoint_count, defaults, legacy_datasets=()) -> tuple[dict, dict]:
+def validate_train_config(raw, available_datasets, checkpoint_count, defaults, legacy_datasets=(),
+                          gpu_count=None) -> tuple[dict, dict]:
     """Validate a TrainConfig coming from the browser.
+
+    gpu_count: number of CUDA devices (None = ask torch). options.gpus must be a non-empty list of valid device
+    indices (default: [0]); with more than one GPU the training runs with DistributedDataParallel.
 
     available_datasets are the compound datasets of the branch; legacy_datasets (old triplet format) are rejected
     with a field error.
@@ -967,6 +977,33 @@ def validate_train_config(raw, available_datasets, checkpoint_count, defaults, l
     options_raw = raw.get("options") or {}
     options_raw = options_raw if isinstance(options_raw, dict) else {}
     clean["options"]["torch_compile"] = bool(options_raw.get("torch_compile", True))
+    if gpu_count is None:
+        gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    gpus: list[int] = []
+    if int(gpu_count) > 0:
+        raw_gpus = options_raw.get("gpus")
+        if raw_gpus is None:
+            gpus = [0]
+        elif not isinstance(raw_gpus, (list, tuple)) or len(raw_gpus) == 0:
+            errors["gpus"] = "select at least one GPU"
+        else:
+            for value in raw_gpus:
+                try:
+                    index = coerce_param_number(value, integer=True)
+                except ValueError:
+                    errors["gpus"] = "GPU indices must be integers"
+                    break
+                if not (0 <= index < int(gpu_count)):
+                    errors["gpus"] = f"GPU {index} does not exist (available: 0..{int(gpu_count) - 1})"
+                    break
+                if index not in gpus:
+                    gpus.append(index)
+            gpus = sorted(gpus)
+    clean["options"]["gpus"] = gpus
+    if len(gpus) > 1 and "gpus" not in errors:
+        batch = overrides.get("batch_size", defaults.get("batch_size"))
+        if batch is not None and "batch_size" not in errors and int(batch) < len(gpus):
+            errors["batch_size"] = f"must be at least the number of selected GPUs ({len(gpus)}); it is split over them"
     try:
         log_interval = coerce_param_number(options_raw.get("log_interval", 25), integer=True)
         if not (1 <= log_interval <= 1000):
@@ -2680,7 +2717,9 @@ def create_app(sample_count: int = 10, sample_seed: int = 42, hparams_path: str 
             "datasets": controller._list_available_datasets(),
             "legacy_datasets": controller._list_legacy_datasets(),
             "model_options": controller._build_model_catalog(),
-            "options": {"torch_compile": _torch_compile_default(), "log_interval": 25},
+            "options": {"torch_compile": _torch_compile_default(), "log_interval": 25,
+                        "gpus": [0] if torch.cuda.is_available() else []},
+            "gpus": cuda_device_list(),
             "branch": safe_branch_name(get_current_branch()),
             "device": _training_device_label(),
             "keys": {"train": TRAIN_KEYS, "model": MODEL_KEYS, "architecture": ARCHITECTURE_KEYS},

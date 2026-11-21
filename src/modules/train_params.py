@@ -6,10 +6,12 @@ import math
 
 TRAIN_KEYS = [
     'dataset_name', 'validation_split', 'batch_size', 'n_epochs', 'learning_rate',
-    'scheduler_start_lr', 'scheduler_end_lr', 'scheduler_exp_curve_factor', 'weight_decay',
+    'scheduler_start_lr', 'scheduler_end_lr', 'scheduler_exp_curve_factor', 'scheduler_warmup_ratio', 'weight_decay',
     'n_samples', 'free_bits', 'annealing_list', 'annealing_slope', 'seed',
+    'last_checkpoint_interval', 'early_stopping', 'early_stopping_patience', 'early_stopping_min_delta',
 ]
-MODEL_KEYS = ['d_model', 'n_heads', 'n_layers', 'ff_dim', 'dropout', 'latent_dim', 'n_memory_tokens']
+MODEL_KEYS = ['d_model', 'n_heads', 'n_layers', 'ff_dim', 'dropout', 'norm_first', 'max_seq_len', 'latent_dim',
+              'n_memory_tokens']
 ALLOWED_KEYS = TRAIN_KEYS + MODEL_KEYS
 
 # Architecture keys are taken from the checkpoint when resuming.
@@ -24,12 +26,19 @@ PARAM_TYPES = {
     'scheduler_start_lr': float,
     'scheduler_end_lr': float,
     'scheduler_exp_curve_factor': float,
+    'scheduler_warmup_ratio': float,
     'weight_decay': float,
     'n_samples': int,
     'free_bits': float,
     'annealing_list': list,
     'annealing_slope': float,
     'seed': int,
+    'last_checkpoint_interval': int,
+    'early_stopping': bool,
+    'early_stopping_patience': int,
+    'early_stopping_min_delta': float,
+    'norm_first': bool,
+    'max_seq_len': int,
     'd_model': int,
     'n_heads': int,
     'n_layers': int,
@@ -50,6 +59,14 @@ def coerce_param(key, value):
         if not text:
             raise ValueError('must not be empty')
         return text
+    if kind is bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str) and value.strip().lower() in ('true', 'false', '1', '0', 'on', 'off'):
+            return value.strip().lower() in ('true', '1', 'on')
+        raise ValueError('must be true or false')
     if kind is list:
         if not isinstance(value, (list, tuple)):
             raise ValueError('must be a list of [position, beta] pairs')

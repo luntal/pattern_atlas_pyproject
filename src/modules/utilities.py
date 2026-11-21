@@ -183,11 +183,13 @@ def load_dataset(hparams, shuffle=True):
             declared = None
         if declared not in (None, compound.TOKEN_FORMAT):
             raise ValueError(f"Dataset '{requested_name}' has token format '{declared}', expected '{compound.TOKEN_FORMAT}'.")
-    if int(data.shape[1]) > int(getattr(hparams, 'max_seq_len', data.shape[1])):
-        raise ValueError(
-            f"Dataset '{requested_name}' has {data.shape[1]} frames per sequence, "
-            f"but the model allows max_seq_len={hparams.max_seq_len}."
-        )
+    model_len = int(getattr(hparams, 'max_seq_len', data.shape[1]))
+    if int(data.shape[1]) != model_len:
+        # The model's max_seq_len decides: shorter datasets are padded, longer ones are cut after time (EOS last).
+        source_len = int(data.shape[1])
+        data, n_cut = compound.resize_frames_array(data, model_len)
+        print(f"Dataset '{requested_name}': {source_len} -> {model_len} frames per sequence (max_seq_len of the model)"
+              + (f", {n_cut} sequence(s) cut" if n_cut else ''))
 
     print('Total amount of samples: ', data.shape)
 
@@ -231,15 +233,23 @@ def load_scheduler(optim, loader, hparams):
         end_lr = getattr(hparams, 'scheduler_end_lr', hparams.learning_rate * 0.1)
         exp_curve_factor = getattr(hparams, 'scheduler_exp_curve_factor', 1.0)
         total_scheduler_steps = max(len(loader) * hparams.n_epochs, 1)
+        # Linear warm-up from ~0 to start_lr over the first fraction of all steps; the decay then runs over the rest.
+        warmup_ratio = min(max(float(getattr(hparams, 'scheduler_warmup_ratio', 0.0) or 0.0), 0.0), 0.5)
+        warmup_steps = int(round(total_scheduler_steps * warmup_ratio))
+        decay_steps = max(total_scheduler_steps - warmup_steps, 1)
 
+        # LambdaLR uses the optimizer's lr as base and applies lr_lambda(0) itself (warm-up factor included).
         for param_group in optim.param_groups:
             param_group['lr'] = start_lr
 
         def lr_lambda(current_step):
-            if total_scheduler_steps <= 1:
+            if warmup_steps > 0 and current_step < warmup_steps:
+                return (current_step + 1) / warmup_steps
+            current_step = current_step - warmup_steps
+            if decay_steps <= 1:
                 return end_lr / start_lr
 
-            progress = min(max(current_step / (total_scheduler_steps - 1), 0.0), 1.0)
+            progress = min(max(current_step / (decay_steps - 1), 0.0), 1.0)
 
             if math.isclose(exp_curve_factor, 0.0, abs_tol=1e-12):
                 curved_progress = progress

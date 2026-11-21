@@ -307,6 +307,25 @@ def pad_frames(seqs, max_len: int) -> np.ndarray:
     return out
 
 
+def resize_frames_array(data, max_len: int):
+    """Frame array [N, T, 4] -> [N, max_len, 4]: PAD frames are appended, or too long sequences are cut after
+    time (the last frame becomes EOS when no EOS is left). Returns (array, n_cut_sequences)."""
+    data = np.asarray(data)
+    max_len = int(max_len)
+    n, t, _ = data.shape
+    if t == max_len:
+        return data, 0
+    if t < max_len:
+        out = np.zeros((n, max_len, N_FIELDS), dtype=data.dtype)
+        out[:, :t] = data
+        return out, 0
+    out = data[:, :max_len].copy()
+    lost = (data[:, max_len:, FIELD_STEP] != PAD).any(axis=1)  # real frames (incl. EOS) behind the cut
+    needs_eos = lost & ~(out[:, :, FIELD_STEP] == EOS).any(axis=1)
+    out[needs_eos, max_len - 1] = EOS
+    return out, int(lost.sum())
+
+
 def sequence_length(frames) -> int:
     """Number of frames up to and including the first EOS (or all non-PAD frames)."""
     f = np.asarray(frames).reshape(-1, N_FIELDS)
