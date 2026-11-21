@@ -7,6 +7,7 @@ worker choice. Uses the files in midifiles/.
 Run from the project root:  python tests/test_extract_parallel.py
 """
 import importlib.util
+import inspect
 import os
 import shutil
 import subprocess
@@ -76,7 +77,9 @@ def main():
     assert len(seq.sequences) > 0
     try:
         old = load_old_module()
-        old_proc = run(processor_cls=old.MidiProcessor, jump=1)
+        # git HEAD may already contain the pool: run the reference sequentially (a pool cannot import this module)
+        old_kwargs = {'workers': 1} if 'workers' in inspect.signature(old.MidiProcessor.extract).parameters else {}
+        old_proc = run(processor_cls=old.MidiProcessor, jump=1, **old_kwargs)
         same(seq, old_proc)
         print(f'OK identical to old sequential code ({len(seq.sequences)} sequences)')
     except subprocess.CalledProcessError:

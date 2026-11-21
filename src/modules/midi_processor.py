@@ -13,6 +13,7 @@ import threading
 import time
 import io
 import zlib
+import hashlib
 import contextlib
 import multiprocessing
 from collections import deque
@@ -91,6 +92,125 @@ def _merge_stats(total: 'ExtractionStats', part: 'ExtractionStats'):
     total.merged_duplicates += part.merged_duplicates
     total.max_notes_per_window = max(total.max_notes_per_window, part.max_notes_per_window)
     total.failed_files.extend(part.failed_files)
+
+
+def _map_values(values, func):
+    """Apply func to every distinct integer once (lookup table) and map the whole array."""
+    values = np.asarray(values, dtype=np.int64)
+    table = {int(v): int(func(int(v))) for v in np.unique(values)}
+    return np.array([table[int(v)] for v in values], dtype=np.int64)
+
+
+# --- parse cache -------------------------------------------------------------------------------------------
+# Parsing a midi file (pretty_midi / mido, pure python) is independent of all extraction options. The parsed
+# content (time signatures, tempo, notes per instrument) is therefore cached per file as a small .npz, keyed by
+# path, size and modification time. RBF_MIDI_CACHE=0 disables it, RBF_MIDI_CACHE_DIR moves it.
+PARSE_CACHE_VERSION = 1
+
+
+def _parse_cache_dir() -> Path:
+    env = os.environ.get('RBF_MIDI_CACHE_DIR')
+    return Path(env) if env else Path(__file__).resolve().parents[2] / '.cache' / 'midi_parse'
+
+
+def _parse_cache_enabled(flag=True) -> bool:
+    return bool(flag) and os.environ.get('RBF_MIDI_CACHE', '1').strip().lower() not in {'0', 'false', 'no', 'off'}
+
+
+class _ParsedInstrument:
+    """Notes of one midi instrument as float64 array [N, 4] = (start, end, pitch, velocity), file order."""
+
+    def __init__(self, is_drum, name, array):
+        self.is_drum = bool(is_drum)
+        self.name = str(name)
+        self.array = np.asarray(array, dtype=np.float64).reshape(-1, 4)
+
+    @property
+    def notes(self):
+        return [pretty_midi.Note(velocity=int(v), pitch=int(p), start=float(s), end=float(e))
+                for s, e, p, v in self.array.tolist()]
+
+
+class _ParsedMidi:
+    """What the extraction needs from a midi file: time signatures, tempo values and the instruments' notes."""
+
+    def __init__(self, time_signatures, tempo_changes, instruments):
+        self.time_signatures = [(int(n), int(d)) for n, d in time_signatures]
+        self.tempo_changes = np.asarray(tempo_changes, dtype=np.float64)
+        self.instruments = list(instruments)
+
+    @classmethod
+    def from_pretty_midi(cls, midi):
+        _, tempi = midi.get_tempo_changes()
+        return cls(
+            [(ts.numerator, ts.denominator) for ts in midi.time_signature_changes],
+            tempi,
+            [_ParsedInstrument(inst.is_drum, inst.name,
+                               np.array([[n.start, n.end, n.pitch, n.velocity] for n in inst.notes], dtype=np.float64))
+             for inst in midi.instruments],
+        )
+
+    def save(self, handle):
+        arrays = [inst.array for inst in self.instruments]
+        np.savez(
+            handle,
+            version=np.int64(PARSE_CACHE_VERSION),
+            time_signatures=np.array(self.time_signatures, dtype=np.int64).reshape(-1, 2),
+            tempo_changes=self.tempo_changes,
+            is_drum=np.array([inst.is_drum for inst in self.instruments], dtype=bool),
+            names=np.array([inst.name for inst in self.instruments], dtype=str),
+            counts=np.array([len(a) for a in arrays], dtype=np.int64),
+            notes=np.concatenate(arrays) if arrays else np.zeros((0, 4), dtype=np.float64),
+        )
+
+    @classmethod
+    def load(cls, path):
+        with np.load(path, allow_pickle=False) as data:
+            if int(data['version']) != PARSE_CACHE_VERSION:
+                raise ValueError('outdated parse cache entry')
+            counts = data['counts'].tolist()
+            notes = data['notes']
+            bounds = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+            instruments = [
+                _ParsedInstrument(is_drum, name, notes[bounds[i]:bounds[i + 1]])
+                for i, (is_drum, name) in enumerate(zip(data['is_drum'].tolist(), data['names'].tolist()))
+            ]
+            return cls(data['time_signatures'].tolist(), data['tempo_changes'], instruments)
+
+
+def _parse_cache_path(filename) -> Path:
+    st = os.stat(filename)
+    ident = f'{PARSE_CACHE_VERSION}|{pretty_midi.__version__}|{os.path.abspath(filename)}|{st.st_size}|{st.st_mtime_ns}'
+    key = hashlib.sha1(ident.encode('utf-8')).hexdigest()
+    return _parse_cache_dir() / key[:2] / f'{key}.npz'
+
+
+def _load_parsed_midi(filename, use_cache=True) -> _ParsedMidi:
+    """Parse one midi file (raises like pretty_midi.PrettyMIDI on invalid files), using the parse cache."""
+    cache_path = None
+    if _parse_cache_enabled(use_cache):
+        try:
+            cache_path = _parse_cache_path(filename)
+            if cache_path.is_file():
+                return _ParsedMidi.load(cache_path)
+        except Exception:
+            pass  # missing / unreadable / outdated entry: parse again and rewrite it
+
+    parsed = _ParsedMidi.from_pretty_midi(pretty_midi.PrettyMIDI(filename))
+
+    if cache_path is not None:
+        tmp_path = cache_path.with_name(f'{cache_path.stem}.{os.getpid()}.{threading.get_ident()}.tmp')
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp_path, 'wb') as handle:
+                parsed.save(handle)
+            os.replace(tmp_path, cache_path)
+        except Exception:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+    return parsed
 
 
 def _extract_file_worker(args):
@@ -527,7 +647,7 @@ class MidiProcessor:
             randomize_velocity=0, qnt_strength=1, qnt_randomness=0, pitch_randomness=False,
             roland=True, drums_only=False, filter_duplicates=True, remap=False, jump=1,
             generic_midi_mapping=False, groove_to_specific=False, generic_to_chromatic=False,
-            progress_callback=None, should_stop=None, workers=None, seed=None):
+            progress_callback=None, should_stop=None, workers=None, seed=None, parse_cache=True):
         """
         Extracts sequences from MIDI files and save as list of tokens
         currently sequences are 2 bars long, 16th notes per bar
@@ -543,6 +663,8 @@ class MidiProcessor:
           seed: base seed of the random parts (quantization randomness, velocity noise); every file derives its own
                 seed from it, so the result does not depend on the number of workers. None = random base seed
                 (stored in self.last_seed).
+          parse_cache: cache the parsed midi content per file (.cache/midi_parse, keyed by path, size and mtime), so
+                       repeated extractions with other options skip the slow midi parsing. RBF_MIDI_CACHE=0 disables it.
 
         !!no sos token!! sos token is added during training only for decoder input!!
 
@@ -601,6 +723,7 @@ class MidiProcessor:
             clip=clip, randomize_velocity=randomize_velocity, qnt_strength=qnt_strength, roland=roland,
             drums_only=drums_only, jump=jump, generic_midi_mapping=generic_midi_mapping,
             groove_to_specific=groove_to_specific, generic_to_chromatic=generic_to_chromatic,
+            parse_cache=bool(parse_cache),
         )
         if seed is None:
             seed = random.SystemRandom().randrange(2 ** 32)
@@ -682,7 +805,7 @@ class MidiProcessor:
             'pitch_usage': {},
         }
         try:
-            midi_data = pretty_midi.PrettyMIDI(filename)
+            midi_data = _load_parsed_midi(filename, opts.get('parse_cache', True))
         except Exception as e:
             print('-------------------------------------')
             print(f'FAILED: {filename}')
@@ -696,11 +819,11 @@ class MidiProcessor:
 
         # Only accept files with allowed time signatures.
         # If no explicit signature exists, MIDI convention implies 4/4.
-        time_signatures = midi_data.time_signature_changes
+        time_signatures = midi_data.time_signatures
         if len(time_signatures) == 0:
             signatures_in_file = {(4, 4)}
         else:
-            signatures_in_file = {(ts.numerator, ts.denominator) for ts in time_signatures}
+            signatures_in_file = set(time_signatures)
 
         if not signatures_in_file.issubset(allowed_time_signatures):
             unsupported = sorted(signatures_in_file)
@@ -708,7 +831,7 @@ class MidiProcessor:
             statistics.skipped_time_signature += 1
             return sequences, metadata, statistics
 
-        tempo_times, tempo_changes = midi_data.get_tempo_changes()
+        tempo_changes = midi_data.tempo_changes
         # print(f"Tempo changes: {list(tempo_changes)} at times: {list(tempo_times)}")
         if len(tempo_changes) == 0:
             print('No tempo changes found!')
@@ -808,113 +931,61 @@ class MidiProcessor:
             # deviation 0..n_timing-1); the per-field offsets are added by modules.compound.
             center_timing = compound.center_timing(self.hparams)
             n_timing = int(self.hparams.n_timing)
+            window_size_in_16th = int(self.hparams.width)
 
-            # extract midi notes and store them in a list of notes.
-            # note = {'step_idx': int, 'deviation': int, 'pitch': int, 'vel': int}
-            note_list = []
-            notes_advanced = []
-            prev_note_start = 0
+            # Per-note checks / mappings stay a loop (they draw random numbers in note order); everything that is
+            # pure arithmetic (step, window, microtiming) is computed for all notes of the instrument at once.
+            kept_notes = []
+            pitch_idx_list = []
+            vel_idx_list = []
+            merged_list = []
             for note in sorted_midi_notes:
-                
                 result = note_checks(note, n_vel=self.hparams.n_vel, clip=clip, randomize_velocity=randomize_velocity, drums_only=drums_only, roland=roland)
                 if result is None:
                     continue
                 pitch, vel = result
-
+                kept_notes.append(note)
+                pitch_idx_list.append(pitch)
+                vel_idx_list.append(vel)
                 if generic_midi_mapping or groove_to_specific:
                     # Use raw MIDI pitch before the 0-23 wrapping performed by note_checks.
-                    merged_note = groove_midi_to_groove_midi_merged(note.pitch)
+                    merged_list.append(groove_midi_to_groove_midi_merged(note.pitch))
                 else:
-                    merged_note = None
+                    merged_list.append(None)
 
-                # retrieve the notes
-                window_size_in_16th = self.hparams.width
-                current_time_idx_16th = round(note.start / seconds_per_16th_note)
-                current_16th = note.start / seconds_per_16th_note
-                current_window = current_time_idx_16th // (window_size_in_16th)
-                current_step_in_window = current_time_idx_16th % (window_size_in_16th)
-                
-                
-                qnt_time = current_time_idx_16th * seconds_per_16th_note
-                dev = note.start - qnt_time
-                dev_norm = current_16th - current_time_idx_16th
-                # Normalize microshift to [-1, 1], where +/-1 equals half a sixteenth note.
-                shift_norm = max(-1.0, min(1.0, dev_norm * 2.0))
-                dev_idx = int(round((shift_norm * (n_timing // 2)) + center_timing))
-                dev_idx = max(0, min(n_timing - 1, dev_idx))
+            if not kept_notes:
+                continue
 
-                note_interval = note.start - prev_note_start
-                note_interval_in_16th = note_interval / seconds_per_16th_note
-                first_note_in_window = not any(
-                    n['c_window'] == current_window
-                    for n in notes_advanced
-                )
-                
-                if first_note_in_window:
-                    current_previous_note_start = current_window * window_size_in_16th * seconds_per_16th_note
-                    window_note_interval = note.start - current_previous_note_start
-                    window_note_interval = max(0, window_note_interval)  # Ensure non-negative
-                    window_note_interval_in_16th = window_note_interval / seconds_per_16th_note
-                    window_dev_norm = shift_norm
-                else:
-                    window_note_interval = None
-                    window_note_interval_in_16th = None
-                    window_dev_norm = None
-
-
-                advanced_note = {
-                    'start': note.start,
-                    'pitch': note.pitch,
-                    'pitch_idx': pitch,
-                    'velocity': note.velocity,
-                    'velocity_idx': vel,
-                    'current_16th': current_16th,
-                    'current_time_idx_16th': current_time_idx_16th,
-                    'qnt_time': qnt_time,
-                    'deviation': dev,
-                    'dev_norm': dev_norm,
-                    'dev_idx': dev_idx,
-                    'c_window': current_window,
-                    'c_step_in_window': current_step_in_window,
-                    'note_interval': note_interval,
-                    'note_interval_in_16th': note_interval_in_16th,
-                    'filename': filename,
-                    'bpm': bpm,
-                    'bpm_from_name': bpm_from_name,
-                    'first_note_in_window': first_note_in_window,
-                    'window_note_interval': window_note_interval,
-                    'window_note_interval_in_16th': window_note_interval_in_16th,
-                    'merged_note': merged_note,
-                    'window_dev_norm': window_dev_norm
-                }
-                # print(f"Note: start={note.start:.2f}s, pitch={note.pitch}, vel={note.velocity}, current_16th={current_16th:.2f}, ")
-                prev_note_start = note.start
-                notes_advanced.append(advanced_note)
+            starts = np.array([n.start for n in kept_notes], dtype=np.float64)
+            current_16th = starts / seconds_per_16th_note
+            time_idx = np.rint(current_16th).astype(np.int64)  # round half to even, like round()
+            c_window = time_idx // window_size_in_16th
+            step_in_window = time_idx % window_size_in_16th
+            # Normalize microshift to [-1, 1], where +/-1 equals half a sixteenth note.
+            shift_norm = np.clip((current_16th - time_idx) * 2.0, -1.0, 1.0)
+            dev_idx = np.clip(np.rint(shift_norm * (n_timing // 2) + center_timing), 0, n_timing - 1).astype(np.int64)
+            pitch_idx = np.asarray(pitch_idx_list, dtype=np.int64)
+            vel_idx = np.asarray(vel_idx_list, dtype=np.int64)
 
             # Map generic input note IDs directly to chromatic before tokenization.
-            if generic_to_chromatic and notes_advanced:
-                for i, n in enumerate(notes_advanced):
-                    chromatic_note = generic_to_chromatic_pitch(int(n['pitch']))
-                    notes_advanced[i]['pitch_idx'] = int(chromatic_note)
-
+            if generic_to_chromatic:
+                raw_pitches = np.array([int(n.pitch) for n in kept_notes], dtype=np.int64)
+                pitch_idx = _map_values(raw_pitches, generic_to_chromatic_pitch)
 
             # Apply feature-based fan-out to assign final chromatic pitches (0-53).
-            if generic_midi_mapping and notes_advanced:
+            if generic_midi_mapping:
                 window_groups: dict[int, dict[int, list[int]]] = {}
-                for i, n in enumerate(notes_advanced):
-                    c_window = n['c_window']
-                    c_step = n['current_time_idx_16th']
-                    window_groups.setdefault(c_window, {}).setdefault(c_step, []).append(i)
+                for i in range(len(kept_notes)):
+                    window_groups.setdefault(int(c_window[i]), {}).setdefault(int(time_idx[i]), []).append(i)
 
-                for c_window in sorted(window_groups.keys()):
+                for window_key in sorted(window_groups.keys()):
                     # Keep merged->chromatic mapping stable within each 2-bar window.
                     window_fixed_map: dict[int, int] = {}
-                    step_groups = window_groups[c_window]
+                    step_groups = window_groups[window_key]
                     for step_idx in sorted(step_groups.keys()):
                         step_indices = step_groups[step_idx]
                         step_events = [
-                            {'merged_note': notes_advanced[i]['merged_note'],
-                             'velocity': notes_advanced[i]['velocity']}
+                            {'merged_note': merged_list[i], 'velocity': kept_notes[i].velocity}
                             for i in step_indices
                         ]
                         fanned = fan_out_merged_step(
@@ -924,19 +995,24 @@ class MidiProcessor:
                             fixed_map=window_fixed_map,
                         )
                         for list_idx, fanned_event in zip(step_indices, fanned):
-                            notes_advanced[list_idx]['pitch_idx'] = int(fanned_event['chromatic_note'])
+                            pitch_idx[list_idx] = int(fanned_event['chromatic_note'])
 
             # Deterministic merged->chromatic-specific mapping.
-            if groove_to_specific and notes_advanced:
-                for i, n in enumerate(notes_advanced):
-                    chromatic_note = groove_merged_to_chromatic_specific(int(n['merged_note']))
-                    notes_advanced[i]['pitch_idx'] = int(chromatic_note)
+            if groove_to_specific:
+                merged_values = np.array([int(m) for m in merged_list], dtype=np.int64)
+                pitch_idx = _map_values(merged_values, groove_merged_to_chromatic_specific)
 
-            # self.seq_advanced.append(notes_advanced)
-            token_list, file_metadata = self.notes_advanced_to_token_sequences_stream(
-                notes_advanced,
-                self.hparams.width,
-                2,  # at least one note frame + EOS
+            file_bpm = bpm_from_name if bpm_from_name is not None else bpm
+            token_list, file_metadata = self._frames_from_note_arrays(
+                filename,
+                file_bpm,
+                c_window,
+                step_in_window,
+                pitch_idx,
+                vel_idx,
+                dev_idx,
+                steps_per_window=self.hparams.width,
+                min_seq_len=2,  # at least one note frame + EOS
                 max_window_exclusive=n_patterns,
                 jump=jump,
                 stats=statistics,
@@ -1338,29 +1414,69 @@ class MidiProcessor:
         (step, pitch), duplicates merged, EOS, PAD up to max_seq_len, too long windows cut after time).
         min_seq_len counts frames including EOS.
         """
+        if not notes_advanced:
+            return [], []
+
+        first = notes_advanced[0]
+        bpm = first["bpm"] if first["bpm_from_name"] is None else first["bpm_from_name"]
+
+        def column(key):
+            return np.array([n[key] for n in notes_advanced], dtype=np.int64)
+
+        return self._frames_from_note_arrays(
+            first["filename"], bpm, column("c_window"), column("c_step_in_window"), column("pitch_idx"),
+            column("velocity_idx"), column("dev_idx"), steps_per_window=steps_per_window,
+            min_seq_len=min_seq_len, max_window_exclusive=max_window_exclusive, jump=jump, stats=stats,
+        )
+
+    def _frames_from_note_arrays(
+        self,
+        filename,
+        bpm,
+        c_window,
+        step_in_window,
+        pitch_idx,
+        vel_idx,
+        dev_idx,
+        steps_per_window=32,
+        min_seq_len=0,
+        max_window_exclusive=None,
+        jump=1,
+        stats=None,
+    ):
+        """Array core of notes_advanced_to_token_sequences_stream (one entry per note, in note order).
+
+        Notes are grouped by window with a stable sort, so the note order inside a window is the input order.
+        """
         sequences = []
         metadata = []
-        if not notes_advanced:
+        n_notes_total = len(c_window)
+        if n_notes_total == 0:
             return sequences, metadata
 
         max_len = int(self.hparams.max_seq_len)
-        bpm = notes_advanced[0]["bpm"] if notes_advanced[0]["bpm_from_name"] is None else notes_advanced[0]["bpm_from_name"]
+        c_window = np.asarray(c_window, dtype=np.int64)
+        keep = np.ones(n_notes_total, dtype=bool)
+        # Keep only full 2-bar windows when requested.
+        if max_window_exclusive is not None:
+            keep &= c_window < max_window_exclusive
+        # Skip windows that are not multiples of jump.
+        keep &= (c_window % jump) == 0
+        selected = np.flatnonzero(keep)
+        if selected.size == 0:
+            return sequences, metadata
 
-        windows: dict[int, list] = {}
-        for n in notes_advanced:
-            w = n["c_window"]
-            # Keep only full 2-bar windows when requested.
-            if max_window_exclusive is not None and w >= max_window_exclusive:
-                continue
-            # Skip windows that are not multiples of jump.
-            if w % jump != 0:
-                continue
-            windows.setdefault(w, []).append(
-                (int(n["c_step_in_window"]) % int(steps_per_window), int(n["pitch_idx"]), int(n["velocity_idx"]), int(n["dev_idx"]))
-            )
+        order = selected[np.argsort(c_window[selected], kind='stable')]
+        boundaries = np.flatnonzero(np.diff(c_window[order])) + 1
+        steps = np.asarray(step_in_window, dtype=np.int64) % int(steps_per_window)
+        pitches = np.asarray(pitch_idx, dtype=np.int64)
+        velocities = np.asarray(vel_idx, dtype=np.int64)
+        deviations = np.asarray(dev_idx, dtype=np.int64)
 
-        for w in sorted(windows):
-            notes = windows[w]
+        for group in np.split(order, boundaries):
+            w = int(c_window[group[0]])
+            notes = list(zip(steps[group].tolist(), pitches[group].tolist(),
+                             velocities[group].tolist(), deviations[group].tolist()))
             frames, n_notes, truncated = compound.notes_to_frames(notes, self.hparams, max_len=max_len, return_info=True)
             if stats is not None:
                 unique = len({(s, p) for s, p, _, _ in notes})
@@ -1370,5 +1486,5 @@ class MidiProcessor:
             if n_notes + 1 < min_seq_len:
                 continue
             sequences.append(frames)
-            metadata.append((notes_advanced[0]["filename"], w, bpm))
+            metadata.append((filename, w, bpm))
         return sequences, metadata

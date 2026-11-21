@@ -87,3 +87,5 @@ data/*.npz
 data/**/*.npz
 midifiles/
 static/
+# MIDI parse cache (generated)
+.cache/
