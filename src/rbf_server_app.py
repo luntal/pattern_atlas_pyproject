@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import gc
 import json
 import math
@@ -129,6 +130,13 @@ RETOKENIZE = False
 # Number of grid cells decoded together (batched greedy decoding with KV-cache) in the full-field render.
 # Can be overridden via the RBF_DECODE_BATCH_SIZE environment variable.
 DECODE_BATCH_SIZE = max(1, int(os.environ.get("RBF_DECODE_BATCH_SIZE", "64")))
+# Real-time decoding (cursor movement): number of parallel decode workers. Running jobs are never cancelled by a newer
+# request; at most one (the newest) request waits, and a result is only shown when no newer result is shown already.
+DECODE_WORKERS = max(1, int(os.environ.get("RBF_DECODE_WORKERS", "3")))
+# 1 = additionally publish partial results while a job runs (live note by note, but a newer job then supersedes older ones).
+DECODE_STREAM = str(os.environ.get("RBF_DECODE_STREAM", "0")).strip().lower() in {"1", "true", "yes", "on"}
+# The GPU -> CPU 'all finished' test of the generation loop only runs every N steps (saves syncs).
+DECODE_CHECK_EVERY = max(1, int(os.environ.get("RBF_DECODE_CHECK_EVERY", "8")))
 DEBUG_CONTROL_POINTS = str(os.environ.get("RBF_DEBUG_CONTROL_POINTS", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -578,11 +586,27 @@ class FullFieldRenderManager:
 
 
 class RealtimeDecoderManager:
-    def __init__(self, decoder: torch.nn.Module, hparams):
+    """Real-time decoder for the cursor position (small worker pool, newest finished result wins).
+
+    request_decode() never cancels a running job. Up to `max_workers` jobs run in parallel; while all workers are
+    busy only the newest request is kept (older waiting requests are dropped, they were never started). A finished
+    job publishes its matrix only if no job with a higher id has published yet, so the displayed reconstruction
+    never jumps back to an older latent and is replaced atomically once a newer sequence is complete.
+    """
+
+    def __init__(self, decoder: torch.nn.Module, hparams, max_workers: int | None = None, stream_partial: bool | None = None):
         self.decoder = decoder
         self.hparams = hparams
         self.device = next(decoder.parameters()).device
         self.max_len = int(hparams.max_seq_len)
+        self.max_workers = max(1, int(DECODE_WORKERS if max_workers is None else max_workers))
+        self.stream_partial = bool(DECODE_STREAM if stream_partial is None else stream_partial)
+        self._pending: tuple[int, np.ndarray] | None = None
+        self._active_workers = 0
+        self._published_id = 0
+        self._closed = False
+        self._latest_decode_ms = 0.0
+        self._tls = threading.local()
 
         self._lock = threading.RLock()
         self._threads: list[threading.Thread] = []
@@ -596,33 +620,37 @@ class RealtimeDecoderManager:
         self._latest_progress_step = -1
         self._latest_status = "idle"
 
-    def request_decode(self, latent_vector: np.ndarray, seed_matrix: np.ndarray):
-        latent_vector = np.asarray(latent_vector, dtype=np.float32)
-        seed_matrix = np.asarray(seed_matrix, dtype=np.float32)
-
+    def request_decode(self, latent_vector: np.ndarray, seed_matrix: np.ndarray | None = None):
+        """Queue a decode of this latent (seed_matrix is unused, kept for API compatibility)."""
+        latent_vector = np.asarray(latent_vector, dtype=np.float32).copy()
+        spawn = False
         with self._lock:
+            if self._closed:
+                return
             self._current_job_id += 1
-            job_id = self._current_job_id
-            if self._cancel_event is not None:
-                self._cancel_event.set()
-            cancel_event = threading.Event()
-            self._cancel_event = cancel_event
+            self._pending = (self._current_job_id, latent_vector)  # replaces an older request that never started
             self._latest_status = "decoding"
+            if self._active_workers < self.max_workers:
+                self._active_workers += 1
+                spawn = True
+        if spawn:
+            thread = threading.Thread(target=self._worker_loop, daemon=True)
+            with self._lock:
+                self._threads = [t for t in self._threads if t.is_alive()] + [thread]
+            thread.start()
 
-        thread = threading.Thread(
-            target=self._decode_job,
-            args=(job_id, latent_vector, seed_matrix.copy(), cancel_event),
-            daemon=True,
-        )
+    def discard(self):
+        """Forget the waiting request and drop the results of all jobs that are still running (decode switched off)."""
         with self._lock:
-            self._threads = [t for t in self._threads if t.is_alive()] + [thread]
-        thread.start()
+            self._pending = None
+            # +1: jobs with an id up to the current one are dropped; the next request gets id current + 1 and may publish.
+            self._published_id = max(self._published_id, self._current_job_id + 1)
 
     def shutdown(self, timeout: float = 30.0):
-        """Cancel the running decode and wait until its worker threads are gone (so the model can be released)."""
+        """Stop accepting work and wait until the worker threads are gone (so the model can be released)."""
         with self._lock:
-            if self._cancel_event is not None:
-                self._cancel_event.set()
+            self._closed = True
+            self._pending = None
             threads = list(self._threads)
         deadline = time.time() + float(timeout)
         for thread in threads:
@@ -638,16 +666,51 @@ class RealtimeDecoderManager:
                 "matrix": self._latest_matrix.copy(),
                 "progress_step": int(self._latest_progress_step),
                 "status": self._latest_status,
+                "decode_ms": float(self._latest_decode_ms),
             }
 
-    def _publish_update(self, job_id: int, matrix: np.ndarray, progress_step: int, status: str):
+    def _publish_update(self, job_id: int, matrix: np.ndarray | None, progress_step: int, status: str,
+                        decode_ms: float | None = None) -> bool:
         with self._lock:
-            if job_id != self._current_job_id:
-                return
-            self._latest_matrix = matrix.astype(np.float32, copy=True)
+            if job_id < self._published_id:
+                return False  # a newer result is already shown
+            self._published_id = job_id
+            if matrix is not None:
+                self._latest_matrix = matrix.astype(np.float32, copy=True)
             self._latest_progress_step = int(progress_step)
             self._latest_status = status
+            if decode_ms is not None:
+                self._latest_decode_ms = float(decode_ms)
             self._latest_generation += 1
+            return True
+
+    def _stream_context(self):
+        """One CUDA stream per worker thread, so the parallel decodes do not wait for each other's syncs."""
+        if self.device.type != "cuda":
+            return contextlib.nullcontext()
+        stream = getattr(self._tls, "stream", None)
+        if stream is None:
+            stream = torch.cuda.Stream(device=self.device)
+            self._tls.stream = stream
+        return torch.cuda.stream(stream)
+
+    def _worker_loop(self):
+        while True:
+            with self._lock:
+                if self._closed or self._pending is None:
+                    self._active_workers -= 1
+                    return
+                job_id, latent = self._pending
+                self._pending = None
+            try:
+                with self._stream_context():
+                    if self.stream_partial:
+                        self._decode_job_streaming(job_id, latent)
+                    else:
+                        self._decode_job(job_id, latent)
+            except Exception:
+                traceback.print_exc()
+                self._publish_update(job_id, None, -1, "error")
 
     def _write_wrapped_segment(self, matrix: np.ndarray, row: int, start: int, length: int, value: float):
         cols = matrix.shape[1]
@@ -663,11 +726,33 @@ class RealtimeDecoderManager:
             matrix[row, s:s + first] = value
             matrix[row, 0:length - first] = value
 
-    def _decode_job(self, job_id: int, latent_vector: np.ndarray, seed_matrix: np.ndarray, cancel_event: threading.Event):
-        """Greedy constrained decoding with KV-cache; every generated frame is a finished note (live update)."""
+    def _decode_job(self, job_id: int, latent_vector: np.ndarray):
+        """Greedy constrained decoding of one sequence (KV-cache, a sync only every few steps); the finished matrix
+        replaces the displayed one in one piece (same result as the batched full-field render)."""
+        h = self.hparams
+        eos_token = int(h.eos_token)
+        t0 = time.perf_counter()
+        z = torch.from_numpy(latent_vector).to(self.device, dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            generated = self.decoder.generate(z, max_len=self.max_len, sample=False, constrained=True,
+                                              pad_after_eos=True, check_every=DECODE_CHECK_EVERY)
+        row = generated[0].detach().cpu().numpy().astype(np.int64)  # the only full sync of the job
+        eos_pos = np.flatnonzero(row[:, compound.FIELD_STEP] == eos_token)
+        seq = row[: int(eos_pos[0]) + 1] if eos_pos.size else row
+        matrix = compound.frames_to_matrix(seq, h)
+        notes = seq[seq[:, compound.FIELD_STEP] >= compound.N_SPECIALS]
+        progress = int(notes[-1, compound.FIELD_STEP]) - compound.N_SPECIALS if len(notes) else 0
+        self._publish_update(job_id, matrix, progress, "done", decode_ms=(time.perf_counter() - t0) * 1000.0)
+
+    def _decode_job_streaming(self, job_id: int, latent_vector: np.ndarray):
+        """Like _decode_job, but publishes after every generated note (live update). A job stops as soon as a newer
+        request exists, because its partial updates would otherwise fight with the newer job's."""
         h = self.hparams
         eos_token = int(h.eos_token)
         sos_token = int(h.sos_token)
+        t0 = time.perf_counter()
+        with self._lock:
+            seed_matrix = self._latest_matrix.copy()
 
         partial_matrix = np.zeros_like(seed_matrix, dtype=np.float32)
         display_matrix = seed_matrix.copy()
@@ -679,9 +764,9 @@ class RealtimeDecoderManager:
 
         step_idx = 0
         for _ in range(self.max_len):
-            if cancel_event.is_set():
-                self._publish_update(job_id, display_matrix, step_idx, "cancelled")
-                return
+            with self._lock:
+                if job_id < self._current_job_id or job_id < self._published_id:
+                    return  # superseded
 
             if cache['pos'] >= self.decoder.max_seq_len:
                 break
@@ -698,10 +783,11 @@ class RealtimeDecoderManager:
                 continue
             step_idx = int(frame[compound.FIELD_STEP]) - compound.N_SPECIALS
             display_matrix[:, :frontier] = partial_matrix[:, :frontier]
-            self._publish_update(job_id, display_matrix, step_idx, "decoding")
+            if not self._publish_update(job_id, display_matrix, step_idx, "decoding"):
+                return
 
         display_matrix[:, :] = partial_matrix
-        self._publish_update(job_id, display_matrix, step_idx, "done")
+        self._publish_update(job_id, display_matrix, step_idx, "done", decode_ms=(time.perf_counter() - t0) * 1000.0)
 
 
 class CudaRBFRuntime:
@@ -763,7 +849,8 @@ class CudaRBFRuntime:
         with torch.no_grad():
             for start in range(0, latents.shape[0], batch_size):
                 z = torch.from_numpy(latents[start:start + batch_size]).to(self.device)
-                generated = self.decoder.generate(z, max_len=max_len, sample=False, constrained=True, pad_after_eos=True)
+                generated = self.decoder.generate(z, max_len=max_len, sample=False, constrained=True, pad_after_eos=True,
+                                                  check_every=DECODE_CHECK_EVERY)
                 generated = generated.detach().cpu().numpy().astype(np.int64)  # [B, L, 4]
                 for row in generated:
                     eos_pos = np.flatnonzero(row[:, compound.FIELD_STEP] == eos_token)
@@ -1632,6 +1719,40 @@ class RBFServerController:
     def _is_idle(self) -> bool:
         return not self._app_status()["ready"]
 
+    def _model_info(self) -> dict:
+        """Most important parameters of the active model for the GUI (empty without a model)."""
+        runtime = self.runtime
+        if runtime is None:
+            return {}
+        cached = getattr(self, "_model_info_cache", None)
+        if cached is not None and cached[0] is runtime:
+            return cached[1]
+        hp = runtime.hparams
+        try:
+            n_params = sum(p.numel() for p in runtime.model.parameters())
+        except Exception:
+            n_params = 0
+        info = {
+            "parameters": f"{n_params / 1e6:.2f} M" if n_params else "?",
+            "d_model": getattr(hp, "d_model", "?"),
+            "layers": getattr(hp, "n_layers", "?"),
+            "heads": getattr(hp, "n_heads", "?"),
+            "ff_dim": getattr(hp, "ff_dim", "?"),
+            "latent_dim": getattr(hp, "latent_dim", "?"),
+            "memory_tokens": getattr(hp, "n_memory_tokens", "?"),
+            "max_seq_len": getattr(hp, "max_seq_len", "?"),
+            "norm": "pre-norm" if bool(getattr(hp, "norm_first", False)) else "post-norm",
+            "dropout": getattr(hp, "dropout", "?"),
+            "format": getattr(hp, "token_format", "?"),
+            "trained_on": getattr(hp, "dataset_name", "") or "?",
+            "device": str(runtime.device),
+        }
+        epochs = getattr(hp, "n_epochs", None)
+        if epochs:
+            info["epochs"] = epochs
+        self._model_info_cache = (runtime, info)
+        return info
+
     def recheck_resources(self):
         """Retry loading model/dataset (e.g. after files were added while the server is running)."""
         if self.training.is_active():
@@ -1769,6 +1890,9 @@ class RBFServerController:
     def _rebuild_pool_dependent_state(self, reset_modes: bool = False):
         if self.render_manager is not None:
             self.render_manager.cancel_render()
+        if self.decoder_manager is not None:
+            self.decoder_manager.discard()  # results of the old pool must not show up in the new one
+        self.decode_ms = 0.0
         control_points = self._make_initial_control_points(len(self.latent_vectors), field_half_extent=self.field_half_extent)
         self.state.control_points = control_points
         self.state.cursor = np.zeros(2, dtype=np.float32)
@@ -2079,6 +2203,7 @@ class RBFServerController:
             return False
         self.reconstruction_matrix = decode_update["matrix"]
         self.decode_status = decode_update["status"]
+        self.decode_ms = float(decode_update.get("decode_ms", 0.0) or 0.0)
         self.decode_progress_step = int(decode_update["progress_step"])
         return True
 
@@ -2160,6 +2285,8 @@ class RBFServerController:
             **_pitch_info(int(self.hparams.height)),
             "decode_status": self.decode_status,
             "decode_progress_step": int(self.decode_progress_step),
+            "decode_ms": float(getattr(self, "decode_ms", 0.0)),
+            "model_info": self._model_info(),
             "render_status": self.render_status,
             "render_completed": int(self.render_completed),
             "render_total": int(self.render_total),
@@ -2469,6 +2596,8 @@ class RBFServerController:
                     self._last_triggered_latent_signature = _decode_sig
                 self._refresh_decoder_update()
             else:
+                if self.decoder_manager is not None:
+                    self.decoder_manager.discard()  # decode is off: drop queued / still running results
                 self.reconstruction_matrix.fill(0.0)
                 self.decode_status = "idle"
                 self.decode_progress_step = -1

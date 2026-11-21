@@ -702,3 +702,13 @@ The *Reconstruction* view is a piano roll in the style of *Dataset > Sequence vi
 - The settings are stored in the browser (`localStorage`, keys `rc.*`).
 
 Manual check: turn on *Decode*, move the cursor, change *Pitch range* (e.g. 12 to see the warning), start playback and move the quantize slider. Then set *Show* to `Original anchor only`, pick other anchors, switch to `Anchor + reconstruction` and start playback.
+
+### 16.1 Real-time decoding, inference time, hold button, model info
+
+- **Worker pool.** The real-time decoder (`RealtimeDecoderManager`) no longer cancels a running decode when the cursor enters a new cell. Up to `RBF_DECODE_WORKERS` (default 3) decodes run in parallel, each with its own CUDA stream. While all workers are busy only the newest request waits (older waiting requests are dropped, they were never started). A finished decode replaces the displayed reconstruction as a whole, and only if no newer result is shown already, so the display never jumps back to an older latent. Switching *Decode* off or changing the anchor pool discards queued and running results (`discard()`).
+- **Settings (environment variables).** `RBF_DECODE_WORKERS` (parallel decodes, default 3), `RBF_DECODE_STREAM=1` (old live mode: the reconstruction grows note by note; a newer request then supersedes the older decode again), `RBF_DECODE_CHECK_EVERY` (default 8: the GPU -> CPU "all finished" test of the generation loop only runs every N steps; also used by the full-field render).
+- **Inference time.** The server measures the time of every decode (without waiting time) and sends it as `decode_ms`. The info line of the reconstruction shows it next to the status, e.g. `decode: done (6.2 ms)`; while a new decode runs it shows `last ... ms`.
+- **Hold: nearest anchor.** Next to the info line there is a button (only visible when *Show* is `Reconstruction only`). While it is held, the original notes of the anchor nearest to the cursor are laid over the reconstruction (orange outline) and played with it. Releasing it (or leaving the button / window) goes back to the reconstruction only.
+- **Model parameters.** The *Model Checkpoint* section shows the most important parameters of the active model (`model_info`: parameter count, d_model, layers, heads, ff_dim, latent_dim, memory tokens, max_seq_len, pre/post-norm, dropout, format, dataset, device).
+
+Manual check: turn on *Decode* and move the cursor quickly across cells (the reconstruction should keep updating smoothly instead of staying empty), hold *Hold: nearest anchor*, check the model parameters and the decode time. Test script: `tests/test_realtime_decoder.py`.

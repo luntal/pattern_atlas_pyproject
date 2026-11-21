@@ -8,7 +8,10 @@
     body { margin: 0; font-family: Helvetica, Arial, sans-serif; background: #f5f6ef; color: #182225; }
     .app { max-width: 1180px; margin: 0 auto; padding: 12px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; align-items: start; }
     .app > .panel { min-width: 0; }
-    .app pre, .app .render-progress-text, .app .app-banner, .app #modelStatus, .app #hoveredAnchorName { overflow-wrap: anywhere; word-break: break-word; }
+    .app pre, .app .render-progress-text, .app .app-banner, .app #modelStatus, .app #modelInfo, .app #hoveredAnchorName { overflow-wrap: anywhere; word-break: break-word; }
+    #modelInfo { font-size: 12px; color: #405347; line-height: 1.5; }
+    #modelInfo span { display: inline-block; background: #eef3ec; border: 1px solid #d8dfd5; border-radius: 5px; padding: 0 5px; margin: 1px 3px 1px 0; white-space: nowrap; }
+    #modelInfo span b { font-weight: 600; color: #2d4a38; }
     .panel { background: #fffdf7; border: 1px solid #d8d7cf; border-radius: 12px; padding: 10px; }
     canvas { width: 100%; border: 1px solid #d8d7cf; border-radius: 10px; background: #fff; display: block; }
     .field-wrap { position: relative; width: 100%; aspect-ratio: 1 / 1; margin-bottom: 10px; }
@@ -49,7 +52,11 @@
     #reconPanel .rc-inline { display: flex; gap: 6px; align-items: center; min-width: 0; }
     #reconPanel .rc-inline select { flex: 1; min-width: 0; }
     #reconPanel .hint { overflow-wrap: anywhere; }
-    #reconInfo { font-size: 12px; color: #405347; margin: 2px 0 4px; overflow-wrap: anywhere; }
+    #reconInfo { font-size: 12px; color: #405347; margin: 2px 0 4px; overflow-wrap: anywhere; flex: 1; min-width: 0; }
+    .rc-info-row { display: flex; align-items: flex-start; gap: 8px; }
+    #rcHoldBtn { flex: 0 0 auto; font-size: 11px; padding: 2px 8px; margin: 2px 0 4px; user-select: none; touch-action: none; display: none; }
+    #rcHoldBtn.visible { display: inline-block; }
+    #rcHoldBtn.held { background: #f4a340; border-color: #b8681a; color: #3a2000; }
     #reconWarn { display: none; font-size: 12px; font-weight: 600; color: #7a4a00; background: #fff4d6; border: 1px solid #d9a441; border-radius: 6px; padding: 3px 8px; margin: 2px 0 4px; overflow-wrap: anywhere; }
     #reconWarn.visible { display: block; }
     #latent { height: 30px; ; margin-bottom: 10px; }
@@ -183,7 +190,10 @@
       <canvas id="latent"></canvas>
       <h4>Reconstruction</h4>
       <div id="reconPanel">
-        <div id="reconInfo">Turn on <b>Decode</b> to see the reconstruction of the current latent vector.</div>
+        <div class="rc-info-row">
+          <div id="reconInfo">Turn on <b>Decode</b> to see the reconstruction of the current latent vector.</div>
+          <button id="rcHoldBtn" type="button" title="Hold pressed: the original MIDI notes of the anchor point nearest to the cursor are laid over the reconstruction (and played with it). Release to go back to the reconstruction only.">Hold: nearest anchor</button>
+        </div>
         <div id="reconWarn"></div>
         <canvas id="recon"></canvas>
         <fieldset>
@@ -252,6 +262,7 @@
       <div class="select-row"><label for="checkpointMode">Mode</label><select id="checkpointMode"></select></div>
       <div class="select-row"><label for="checkpointStamp">Timestamp</label><select id="checkpointStamp"></select></div>
       <div class="select-row"><label>Loaded</label><div id="modelStatus">(unknown)</div></div>
+      <div class="select-row"><label title="Most important parameters of the active model">Parameters</label><div id="modelInfo" title="Most important parameters of the active model">-</div></div>
       <h4>Status</h4>
       <div class="status-indicator"><span id="statusLed" class="status-led"></span><span id="statusText">Disconnected</span></div>
       <pre id="status">connecting...</pre>
@@ -1004,6 +1015,16 @@ function updateModelStatus() {
   const mode = prettyModeLabel(modelSelection.mode || "none");
   const stamp = modelSelection.timestamp || "(no timestamp)";
   modelStatusEl.textContent = `${mode} @ ${stamp}`;
+  renderModelInfo();
+}
+
+function renderModelInfo() {
+  const el = document.getElementById("modelInfo");
+  if (!el) return;
+  const info = S.modelInfo;
+  const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  if (!info || typeof info !== "object" || !Object.keys(info).length) { el.textContent = "-"; return; }
+  el.innerHTML = Object.entries(info).map(([k, v]) => `<span><b>${esc(k)}</b> ${esc(v)}</span>`).join("");
 }
 
 function renderModelSelectors() {
@@ -1382,6 +1403,8 @@ socket.on("bootstrap", (data) => {
   if (Number.isFinite(data.n_vel)) S.nVel = data.n_vel;
   if (Array.isArray(data.anchor_notes)) { S.anchorNotes = data.anchor_notes; S.anchorVersion = Number(data.pool_version); }
   S.decodeStatus = data.decode_status || "idle";
+  S.decodeMs = Number.isFinite(data.decode_ms) ? data.decode_ms : 0;
+  if (data.model_info) { S.modelInfo = data.model_info; renderModelInfo(); }
   S.decodeStep = Number.isFinite(data.decode_progress_step) ? data.decode_progress_step : -1;
   S.renderStatus = data.render_status || "idle";
   S.renderCompleted = Number.isFinite(data.render_completed) ? data.render_completed : 0;
@@ -1452,6 +1475,8 @@ socket.on("frame", (data) => {
   if (Number.isFinite(data.slider_values.refinedBlendHigh)) S.refinedBlendHigh = data.slider_values.refinedBlendHigh;
   S.halfExtent = data.field_half_extent;
   S.decodeStatus = data.decode_status || S.decodeStatus;
+  S.decodeMs = Number.isFinite(data.decode_ms) ? data.decode_ms : 0;
+  if (data.model_info && JSON.stringify(data.model_info) !== JSON.stringify(S.modelInfo)) { S.modelInfo = data.model_info; renderModelInfo(); }
   S.decodeStep = Number.isFinite(data.decode_progress_step) ? data.decode_progress_step : S.decodeStep;
   S.renderStatus = data.render_status || S.renderStatus;
   S.renderCompleted = Number.isFinite(data.render_completed) ? data.render_completed : S.renderCompleted;
@@ -3503,7 +3528,8 @@ render();
   };
   const rangeEl = $("rcRange"), foldEl = $("rcFold"), outSel = $("rcMidiOut"), chSel = $("rcMidiCh"), mapSel = $("rcMidiMap");
   const bpmEl = $("rcMidiBpm"), loopEl = $("rcMidiLoop"), quantEl = $("rcQuant");
-  const showEl = $("rcShow"), anchorEl = $("rcAnchor");
+  const showEl = $("rcShow"), anchorEl = $("rcAnchor"), holdBtn = $("rcHoldBtn");
+  let holding = false;
   const midi = { access: null };
   const play = { playing: false, queue: [], sounding: new Map(), nextStart: 0, timer: null, raf: null, passes: [], port: null, ch: 9, endAt: 0, sentUntil: 0, firstPass: false };
   const view = { notes: [], steps: 32, src: null, sig: "", hidden: 0, hiddenMax: -1, rows: [], anchorNotes: [], anchorKey: "", anchorSig: "" };
@@ -3638,7 +3664,39 @@ render();
     const mode = showEl.value;
     if (mode === "anchor") return anchorNotesFor(selectedAnchor());
     if (mode === "both") return anchorNotesFor(selectedAnchor()).concat(view.notes);
+    if (holding) return anchorNotesFor(nearestAnchor()).concat(view.notes);
     return view.notes;
+  }
+  // Pool index of the anchor point nearest to the cursor (the field only lists visible anchors: offset in hidden-anchor-0 modes).
+  function nearestAnchor() {
+    const pts = Array.isArray(S.points) ? S.points : [];
+    const c = (S.quantized && S.snappedCursor) ? S.snappedCursor : S.cursor;
+    if (!pts.length || !Array.isArray(c)) return -1;
+    let best = -1, bestD = Infinity;
+    pts.forEach((p, i) => {
+      const d = (p[0] - c[0]) * (p[0] - c[0]) + (p[1] - c[1]) * (p[1] - c[1]);
+      if (d < bestD) { bestD = d; best = i; }
+    });
+    return best < 0 ? -1 : best + anchorOffset();
+  }
+  function nearestAnchorLabel() {
+    const idx = nearestAnchor();
+    const labels = Array.isArray(anchorLabels) ? anchorLabels : [];
+    const lab = labels[idx - anchorOffset()];
+    return idx < 0 ? "-" : `${idx}: ${anchorBaseName(lab, idx)}`;
+  }
+  function setHold(on) {
+    on = !!on && showEl.value === "recon";
+    if (on === holding) return;
+    holding = on;
+    holdBtn.classList.toggle("held", holding);
+    draw();
+    if (play.playing) rescheduleFromNow();
+  }
+  function updateHoldVisibility() {
+    const vis = showEl.value === "recon";
+    holdBtn.classList.toggle("visible", vis);
+    if (!vis) setHold(false);
   }
   function anchorName() {
     const o = anchorEl.options[anchorEl.selectedIndex];
@@ -3679,7 +3737,8 @@ render();
         : "Turn on <b>Decode</b> to see the reconstruction of the current latent vector.";
     } else {
       const bpm = Number.isFinite(S.currentBpm) ? `${S.currentBpm.toFixed(1)} BPM` : "no BPM";
-      const parts = [`${view.notes.length} notes`, `${view.steps} steps`, bpm, `decode: ${S.decodeStatus}`];
+      const parts = [`${view.notes.length} notes`, `${view.steps} steps`, bpm, `decode: ${S.decodeStatus}${(Number.isFinite(S.decodeMs) && S.decodeMs > 0) ? ` (${S.decodeStatus === "done" ? "" : "last "}${S.decodeMs < 100 ? S.decodeMs.toFixed(1) : Math.round(S.decodeMs)} ms)` : ""}`];
+      if (holding && mode === "recon") parts.unshift(`holding anchor ${nearestAnchorLabel()} (${anchorNotesFor(nearestAnchor()).length} notes, orange outline)`);
       if (mode === "both") parts.unshift(`anchor ${anchorName()} (${anchorNotesFor(selectedAnchor()).length} notes, orange outline) + reconstruction (teal)`);
       info.textContent = parts.join(" \u00b7 ");
     }
@@ -3749,7 +3808,7 @@ render();
     });
     const index = new Map(pitches.map((pt, r) => [pt, r]));
     const shown = shownNotes();
-    const overlay = showEl.value === "both";
+    const overlay = showEl.value === "both" || holding;
     shown.forEach((n) => {
       const r = index.get(n.pitch);
       if (r === undefined) return;  // outside the pitch range (or folded away)
@@ -3820,8 +3879,12 @@ render();
   // ------------------------------------------------------------------ settings
   rangeEl.addEventListener("input", () => { store.set("rc.range", rangeEl.value); draw(); });
   foldEl.addEventListener("change", () => { store.set("rc.fold", foldEl.checked ? "1" : "0"); draw(); });
+  holdBtn.addEventListener("pointerdown", (e) => { e.preventDefault(); try { holdBtn.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ } setHold(true); });
+  ["pointerup", "pointercancel", "lostpointercapture", "pointerleave"].forEach((ev) => holdBtn.addEventListener(ev, () => setHold(false)));
+  window.addEventListener("blur", () => setHold(false));
   showEl.addEventListener("change", () => {
     store.set("rc.show", showEl.value);
+    updateHoldVisibility();
     draw();
     if (play.playing) rescheduleFromNow();  // playback follows what is shown
   });
@@ -3843,6 +3906,7 @@ render();
   });
   bpmEl.addEventListener("input", () => { if (play.playing) rescheduleFromNow(); });
   updateQuantLabel();
+  updateHoldVisibility();
 
   // ------------------------------------------------------------------ Web MIDI
   function refreshOutputs() {

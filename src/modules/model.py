@@ -438,10 +438,13 @@ class Decoder(nn.Module):
         return torch.where(is_eos, torch.full_like(frame, eos), frame)
 
     @torch.no_grad()
-    def generate(self, z, max_len=None, temperature=1.0, sample=False, constrained=True, pad_after_eos=True):
+    def generate(self, z, max_len=None, temperature=1.0, sample=False, constrained=True, pad_after_eos=True,
+                 check_every=1):
         """Batched autoregressive generation with KV-cache. Returns frames [B, L, 4] (without SOS).
 
         With `pad_after_eos=True` finished sequences are filled with PAD frames after their EOS frame.
+        `check_every`: the "all sequences finished" test needs a GPU -> CPU sync; with N > 1 it only runs every N
+        steps (up to N-1 extra PAD frames are generated, the content up to EOS is unchanged; needs pad_after_eos).
         """
         device = z.device
         B = z.size(0)
@@ -451,8 +454,11 @@ class Decoder(nn.Module):
         finished = torch.zeros(B, dtype=torch.bool, device=device)
         pad = self.special_frame(self.pad_token, B, device)
         out = []
-        for _ in range(max_len):
-            if cache['pos'] >= self.max_seq_len or finished.all():
+        check_every = max(1, int(check_every)) if pad_after_eos else 1
+        for i in range(max_len):
+            if cache['pos'] >= self.max_seq_len:
+                break
+            if (check_every == 1 or (i and i % check_every == 0)) and bool(finished.all()):
                 break
             logits = self.decode_step(cur, cache)
             nxt = self.pick_frame(logits, cur, sample=sample, temperature=temperature, constrained=constrained)
