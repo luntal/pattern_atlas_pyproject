@@ -1,6 +1,8 @@
 """Shared training core used by train.py (CLI) and train_worker.py (server subprocess).
 
 run_training(config, on_event, should_stop) builds model, data and optimizer from a TrainConfig dict and calls train_vae.
+Data are compound frames [N, T, 4] (modules.compound); legacy triplet datasets and checkpoints are rejected
+(load_dataset / load_model raise with a clear message).
 
 TrainConfig:
     mode: "new" | "resume"
@@ -31,7 +33,7 @@ def pick_device() -> torch.device:
 
 
 class TensorBatcher:
-    """Batches a token tensor that already lives on the target device.
+    """Batches a frame tensor [N, T, 4] (any tensor batched over axis 0) that already lives on the target device.
 
     Replaces DataLoader + worker processes for small integer datasets: no pickling, no host-to-device
     copies per batch, no worker start-up time. Behaves like a DataLoader with drop_last=False.

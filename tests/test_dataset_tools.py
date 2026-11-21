@@ -32,6 +32,11 @@ def make_midi(path: Path, bpm: float, bars: int = 4, pitches=(36, 38, 42)):
     midi.write(str(path))
 
 
+def json_info(npz):
+    import json
+    return json.loads(str(npz["info"][()]))
+
+
 def wait_job(mgr: dt.DatasetJobManager, timeout=120):
     start = time.time()
     while mgr.is_active():
@@ -93,7 +98,15 @@ def main():
         assert path.is_file() and not list(folder.glob("*.tmp"))
         npz = np.load(path, allow_pickle=True)
         assert {"data", "metadata", "info"} <= set(npz.files)
-        assert npz["data"].shape[1] == dt.HP.max_seq_len
+        data = npz["data"]
+        assert data.ndim == 3 and data.shape[1:] == (dt.HP.max_seq_len, 4) and data.dtype == np.int16, (data.shape, data.dtype)
+        assert json_info(npz)["token_format"] == "compound_v1"
+        notes = dt.compound.valid_note_mask(data, dt.HP)
+        raw = data[notes].astype(int) - 3
+        sizes = dt.compound.field_sizes(dt.HP)
+        assert raw.size and all(0 <= raw[:, f].min() and raw[:, f].max() < sizes[f] for f in range(4)), "field ranges"
+        assert all((row[notes[i]][:, :2].tolist() == sorted(row[notes[i]][:, :2].tolist())) for i, row in enumerate(data[:50])), "sorted"
+        assert (data[:, :, 0] == 2).sum() == len(data), "exactly one EOS frame per sequence"
         assert len(npz["metadata"]) == len(npz["data"])
         assert float(npz["metadata"][0][2]) > 0, npz["metadata"][0]
 
@@ -114,14 +127,20 @@ def main():
         assert info["info"]["kind"] == "extract" and info["info"]["source"]["folder"] == str(tmp.resolve()) or True
         assert info["info"]["kind"] == "extract"
         assert stats["notes"]["total"] == sum(stats["pitch_hist"]) > 0
-        assert len(stats["pitch_hist"]) == dt.HP.max_pitch_token - dt.HP.min_pitch_token
+        assert len(stats["pitch_hist"]) == dt.HP.n_pitch
         assert len(stats["velocity_hist"]) == dt.HP.n_vel and len(stats["timing_hist"]) == dt.HP.n_timing
         assert stats["bpm"]["min"] and stats["bpm"]["max"] >= stats["bpm"]["min"]
-        assert stats["without_eos"] == 0
+        assert stats["without_eos"] == 0 and stats["truncated_sequences"] == 0 and stats["max_notes"] > 0
+        assert stats["tokens"]["max"] == stats["max_notes"] + 1, "frames = notes + EOS"
+        assert info["token_format"] == "compound_v1" and info["compatible"] is True
+        listed = {d["name"]: d for d in dt.list_datasets()}
+        assert listed["ex-a.npz"]["compatible"] and listed["ex-a.npz"]["max_len"] == dt.HP.max_seq_len
 
         # --- sequence view
         view = dt.sequence_view("ex-a.npz", 0)
         assert view["count"] == stats["n_sequences"] and view["notes"], view
+        assert not view["legacy"] and view["n_tokens"] == len(view["notes"]) + 1 and view["tokens"][-1] == [2, 2, 2, 2]
+        assert all({"step", "pos", "shift", "pitch", "midi", "generic", "vel", "vel_norm"} <= set(n) for n in view["notes"])
         assert all(0 <= n["step"] < view["steps"] and 0 <= n["vel"] <= 127 for n in view["notes"])
         assert dt.sequence_view("ex-a.npz", 10**6)["index"] == view["count"] - 1  # clamped
         assert view["bpm"] and view["filename"]
@@ -143,29 +162,54 @@ def main():
         except FileNotFoundError:
             pass
 
-        # --- legacy dataset without info key
-        legacy = folder / "legacy.npz"
-        np.savez(legacy, data=before, metadata=np.array([("f.mid", 0)] * len(before), dtype=object))
-        linfo = dt.dataset_info("legacy.npz")
-        assert linfo["info"]["kind"] == "legacy" and linfo["info"]["has_info"] is False
-        assert dt.sequence_view("legacy.npz", 0)["bpm"] is None
-        dt.update_dataset_info("legacy.npz", {"description": "added later"})
-        assert dt.dataset_info("legacy.npz")["info"]["description"] == "added later"
+        # --- compound dataset without info key (older tool version)
+        noinfo = folder / "noinfo.npz"
+        np.savez(noinfo, data=before, metadata=np.array([("f.mid", 0)] * len(before), dtype=object))
+        linfo = dt.dataset_info("noinfo.npz")
+        assert linfo["info"]["kind"] == "legacy" and linfo["info"]["has_info"] is False and linfo["compatible"]
+        assert dt.sequence_view("noinfo.npz", 0)["bpm"] is None
+        dt.update_dataset_info("noinfo.npz", {"description": "added later"})
+        assert dt.dataset_info("noinfo.npz")["info"]["description"] == "added later"
 
-        # --- merge (incl. legacy metadata without bpm) + dedupe
-        ok, errors = mgr.start("merge", {"sources": ["ex-a.npz", "legacy.npz"], "name": "merged", "dedupe": True})
+        # --- legacy 2D triplet dataset: listed and viewable, but blocked
+        triplet = np.zeros((5, 256), dtype=int)
+        triplet[:, :4] = [10, 70, 106, 2]
+        np.savez(folder / "triplet.npz", data=triplet, metadata=np.array([("t.mid", 0, 120.0)] * 5, dtype=object))
+        listed = {d["name"]: d for d in dt.list_datasets()}
+        assert listed["triplet.npz"]["compatible"] is False and listed["triplet.npz"]["token_format"] == "triplet"
+        assert listed["triplet.npz"]["kind"] == "legacy (triplet)"
+        tinfo = dt.dataset_info("triplet.npz")
+        assert tinfo["compatible"] is False and tinfo["stats"]["legacy"] and "re-extract" in tinfo["legacy_message"]
+        tview = dt.sequence_view("triplet.npz", 0)
+        assert tview["legacy"] and tview["notes"] == []
+        ok, errors = mgr.start("merge", {"sources": ["ex-a.npz", "triplet.npz"], "name": "mixed"})
+        assert not ok and "legacy" in errors["sources"], errors
+        ok, errors = mgr.start("augment", {"source": "triplet.npz", "name": "taug"})
+        assert not ok and "legacy" in errors["source"], errors
+        try:
+            dt.save_dataset("bad.npz", triplet, [], {})
+            raise AssertionError("2D data saved")
+        except ValueError:
+            pass
+
+        # --- merge (incl. metadata without bpm) + dedupe
+        ok, errors = mgr.start("merge", {"sources": ["ex-a.npz", "noinfo.npz"], "name": "merged", "dedupe": True})
         assert ok, errors
         snap = wait_job(mgr)
         assert snap["state"] == "finished", snap
         merged = dt.dataset_info("merged.npz")
         assert merged["info"]["kind"] == "merge" and len(merged["info"]["source"]["datasets"]) == 2
-        assert merged["stats"]["n_sequences"] == len(before)  # legacy is an exact copy -> fully deduplicated
-        ok, errors = mgr.start("merge", {"sources": ["ex-a.npz", "legacy.npz"], "name": "merged2"})
+        assert merged["stats"]["n_sequences"] == len(before)  # noinfo is an exact copy -> fully deduplicated
+        assert merged["shape"] == [len(before), dt.HP.max_seq_len, 4] and merged["info"]["token_format"] == "compound_v1"
+        ok, errors = mgr.start("merge", {"sources": ["ex-a.npz", "noinfo.npz"], "name": "merged2"})
         assert ok, errors
         assert wait_job(mgr)["state"] == "finished"
         assert dt.dataset_info("merged2.npz")["stats"]["n_sequences"] == 2 * len(before)
-        ok, errors = mgr.start("merge", {"sources": ["ex-a.npz", "legacy.npz"], "name": "ex-a"})
+        ok, errors = mgr.start("merge", {"sources": ["ex-a.npz", "noinfo.npz"], "name": "ex-a"})
         assert not ok and "name" in errors
+        np.savez(folder / "short.npz", data=before[:, :64], metadata=np.array([("s.mid", 0)] * len(before), dtype=object))
+        ok, errors = mgr.start("merge", {"sources": ["ex-a.npz", "short.npz"], "name": "m3"})
+        assert not ok and "max_seq_len" in errors["sources"], errors
 
         # --- augmentation keeps bpm, only augmented sequences
         ok, errors = mgr.start("augment", {"source": "ex-a.npz", "name": "aug", "keep_percentage": 50, "seed": 1,
@@ -176,6 +220,8 @@ def main():
         aug = dt.dataset_info("aug.npz")
         assert aug["info"]["kind"] == "augment" and aug["info"]["source"]["dataset"] == "ex-a.npz"
         assert aug["stats"]["bpm"]["count"] == aug["stats"]["n_sequences"] > 0
+        assert aug["shape"][1:] == [dt.HP.max_seq_len, 4] and aug["compatible"]
+        assert aug["stats"]["without_eos"] == 0 and aug["stats"]["notes"]["total"] > 0
         ok, errors = mgr.start("augment", {"source": "ex-a.npz", "name": "aug2", "velocity_scales": "x"})
         assert not ok and "velocity_scales" in errors
         ok, errors = mgr.start("augment", {"source": "ex-a.npz", "name": "ex-a.npz", "overwrite": True})

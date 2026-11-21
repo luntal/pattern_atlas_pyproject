@@ -54,7 +54,7 @@ def test_value_changes():
         new_text = open(path, encoding='utf-8').read()
         for marker in ["# embedding dim and model dimension", "# num of trained epochs",
                        "# list of [normalized_position, beta_value] pairs", "# slope of exponential smoothing",
-                       "# training", "# tokens:", "'ff_dim': d_base * 2,"]:
+                       "# training", "# compound tokens (frames):", "'ff_dim': d_base * 2,"]:
             assert marker in new_text, marker
         assert os.path.exists(path + '.bak')
         assert open(path + '.bak', encoding='utf-8').read() == original_text

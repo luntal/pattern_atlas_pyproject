@@ -6,7 +6,9 @@
   <title>RBF Server</title>
   <style>
     body { margin: 0; font-family: Helvetica, Arial, sans-serif; background: #f5f6ef; color: #182225; }
-    .app { max-width: 1180px; margin: 0 auto; padding: 12px; display: grid; grid-template-columns: 1.6fr 1fr; gap: 12px; }
+    .app { max-width: 1180px; margin: 0 auto; padding: 12px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; align-items: start; }
+    .app > .panel { min-width: 0; }
+    .app pre, .app .render-progress-text, .app .app-banner, .app #modelStatus, .app #hoveredAnchorName { overflow-wrap: anywhere; word-break: break-word; }
     .panel { background: #fffdf7; border: 1px solid #d8d7cf; border-radius: 12px; padding: 10px; }
     canvas { width: 100%; border: 1px solid #d8d7cf; border-radius: 10px; background: #fff; display: block; }
     .field-wrap { position: relative; width: 100%; aspect-ratio: 1 / 1; margin-bottom: 10px; }
@@ -37,7 +39,19 @@
       background: transparent;
       z-index: 3;
     }
-    #recon { height: 200px; }
+    #recon { height: 240px; }
+    #reconPanel { margin-top: 6px; }
+    #reconPanel fieldset { border: 1px solid #d8d7cf; border-radius: 8px; margin: 8px 0 0; padding: 6px 10px 8px; min-width: 0; }
+    #reconPanel legend { font-size: 12px; font-weight: 700; color: #405347; padding: 0 6px; }
+    #reconPanel .trow { grid-template-columns: 120px minmax(0, 1fr); }
+    #reconPanel .trow input[type=number], #reconPanel .trow select { width: 100%; box-sizing: border-box; padding: 5px 6px; border: 1px solid #ced3cc; border-radius: 6px; background: #fff; }
+    #reconPanel .trow input[type=checkbox] { justify-self: start; }
+    #reconPanel .rc-inline { display: flex; gap: 6px; align-items: center; min-width: 0; }
+    #reconPanel .rc-inline select { flex: 1; min-width: 0; }
+    #reconPanel .hint { overflow-wrap: anywhere; }
+    #reconInfo { font-size: 12px; color: #405347; margin: 2px 0 4px; overflow-wrap: anywhere; }
+    #reconWarn { display: none; font-size: 12px; font-weight: 600; color: #7a4a00; background: #fff4d6; border: 1px solid #d9a441; border-radius: 6px; padding: 3px 8px; margin: 2px 0 4px; overflow-wrap: anywhere; }
+    #reconWarn.visible { display: block; }
     #latent { height: 30px; ; margin-bottom: 10px; }
     #influence { height: 120px; }
     .row { display: grid; grid-template-columns: 90px 1fr 60px; gap: 8px; align-items: center; margin: 8px 0; }
@@ -127,6 +141,7 @@
     .ds-kv b { color: #405347; font-weight: 600; }
     .ds-merge-list { max-height: 150px; overflow: auto; border: 1px solid #d8d7cf; border-radius: 6px; background: #fff; padding: 4px 8px; font-size: 13px; }
     .ds-merge-list label { display: block; padding: 1px 0; }
+    .ds-legacy td, label.ds-legacy { color: #8a8f88; font-style: italic; }
     .ds-chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .ds-chart-grid canvas, #dsRoll { width: 100%; box-sizing: border-box; border: 1px solid #e3e5dc; border-radius: 6px; background: #fff; }
     .ds-chart-grid canvas { height: 140px; }
@@ -155,7 +170,33 @@
       <h4>Latent Vector</h4>
       <canvas id="latent"></canvas>
       <h4>Reconstruction</h4>
-      <canvas id="recon"></canvas>
+      <div id="reconPanel">
+        <div id="reconInfo">Turn on <b>Decode</b> to see the reconstruction of the current latent vector.</div>
+        <div id="reconWarn"></div>
+        <canvas id="recon"></canvas>
+        <fieldset>
+          <legend>Pitch view &amp; MIDI playback</legend>
+          <div class="trow" title="Number of chromatic pitch rows shown in the piano roll (rows 0 .. range-1). Notes above this range are still played but not drawn; a warning tells you when that happens."><label for="rcRange">Pitch range</label><input id="rcRange" type="number" min="1" max="54" step="1" value="24" title="Number of chromatic pitch rows shown (0 .. range-1). Default 24." /></div>
+          <div class="trow" title="On: only the pitches that are used inside the pitch range are shown. Off: every row of the pitch range is shown."><label for="rcFold">Fold piano roll</label><input id="rcFold" type="checkbox" title="On: only used pitches inside the range are shown. Off: all rows of the range are shown." /></div>
+          <div class="trow" title="What the piano roll (and the playback) shows: only the decoded reconstruction (default), only the original notes of an anchor point, or the original anchor notes together with the reconstruction."><label for="rcShow">Show</label>
+            <select id="rcShow" title="Reconstruction only (default), original anchor only, or anchor + reconstruction."><option value="recon">Reconstruction only (default)</option><option value="anchor">Original anchor only</option><option value="both">Anchor + reconstruction</option></select></div>
+          <div class="trow" title="Which anchor point of the latent field supplies the original MIDI notes (the notes of the dataset sequence it was encoded from)."><label for="rcAnchor">Anchor point</label><select id="rcAnchor" title="Anchor point whose original notes are shown."></select></div>
+          <div class="trow" title="MIDI output port of this computer (Web MIDI). 'Browser synth' plays a simple preview sound without a MIDI device."><label for="rcMidiOut">MIDI output</label>
+            <div class="rc-inline"><select id="rcMidiOut"></select><button id="rcMidiBtn" type="button" title="Ask the browser for access to MIDI ports and refresh the list.">Connect MIDI</button></div></div>
+          <div class="trow" title="MIDI channel (10 = drums in General MIDI)."><label for="rcMidiCh">Channel</label><select id="rcMidiCh" title="MIDI channel (10 = drums in General MIDI)."></select></div>
+          <div class="trow" title="How chromatic pitch indices are mapped to MIDI notes."><label for="rcMidiMap">Pitch mapping</label>
+            <select id="rcMidiMap" title="How chromatic pitch indices are mapped to MIDI notes."><option value="midi">Chromatic + 36 (like server playback)</option><option value="generic">Generic MIDI mapping</option></select></div>
+          <div class="trow" title="Tempo override. Empty = the BPM interpolated at the current cursor position."><label for="rcMidiBpm">BPM override</label><input id="rcMidiBpm" type="number" min="20" max="400" step="1" placeholder="from field" title="Tempo override. Empty = the BPM interpolated at the cursor." /></div>
+          <div class="trow" title="Repeat the reconstruction until stopped."><label for="rcMidiLoop">Loop</label><input id="rcMidiLoop" type="checkbox" checked title="Repeat the reconstruction until stopped." /></div>
+          <div class="trow" title="Quantize the notes to the 16th grid: 0 % = original microtiming, 100 % = every note exactly on the grid. Applied live, also during playback."><label for="rcQuant">Quantize</label>
+            <div class="rc-inline"><input id="rcQuant" type="range" min="0" max="100" step="1" value="0" style="padding:0;border:0;flex:1;min-width:0" title="0 % = original microtiming, 100 % = fully quantized. Applied live." /><span id="rcQuantVal" class="hint" style="flex:0 0 44px;text-align:right">0 %</span></div></div>
+          <div class="btns">
+            <button id="rcPlayBtn" class="primary" type="button" title="Start playback of the reconstruction on the selected MIDI output. Playback follows the live reconstruction while you move the cursor.">&#9654; Start playback</button>
+            <button id="rcStopBtn" class="danger" type="button" disabled title="Stop playback and silence all notes.">&#9632; Stop</button>
+          </div>
+          <div class="hint" id="rcMidiStatus"></div>
+        </fieldset>
+      </div>
     </div>
     <div class="panel">
       <h4>Anchor Influence</h4>
@@ -251,6 +292,7 @@
         <div><div class="chart-title">Beta</div><canvas id="chBeta"></canvas></div>
         <div><div class="chart-title">Learning rate</div><canvas id="chLr"></canvas></div>
       </div>
+      <div class="chart-title" title="Cross entropy of the four parallel decoder heads per epoch (solid = train, dashed = val). The step head also decides the sequence end (EOS).">Reconstruction error per field (epoch: step / pitch / velocity / deviation)</div><canvas id="chFields" style="height:150px"></canvas>
       <div class="chart-title">Batch loss (live)</div><canvas id="chBatch" style="height:120px"></canvas>
       <h4>Log</h4>
       <pre id="tLog" class="train-log"></pre>
@@ -423,6 +465,11 @@ const S = {
   appIdle: false,
   appMessages: [],
   activeTab: "latent",
+  pitchLabels: [],
+  genericPitches: [],
+  anchorNotes: [],
+  anchorVersion: -1,
+  nVel: 32,
 };
 
 const field = document.getElementById("field");
@@ -904,32 +951,8 @@ function drawInfluence() {
 }
 
 function drawRecon() {
-  sizeCanvas(recon);
-  const ctx = recon.getContext("2d");
-  ctx.clearRect(0, 0, recon.width, recon.height);
-  if (!S.recon.length || !S.recon[0].length) return;
-  const rows = S.recon.length;
-  const cols = S.recon[0].length;
-  const cw = recon.width / cols;
-  const ch = recon.height / rows;
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const v = Math.max(0, Math.min(1, S.recon[r][c]));
-      const g = Math.floor(255 - 240 * v);
-      ctx.fillStyle = `rgb(${g},${g},${g})`;
-      ctx.fillRect(c * cw, recon.height - (r + 1) * ch, cw + 1, ch + 1);
-    }
-  }
-  ctx.strokeStyle = "rgba(80,80,80,0.3)";
-  for (let c = 0; c <= cols; c += Math.max(1, S.nTiming)) {
-    const x = c * cw;
-    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, recon.height); ctx.stroke();
-  }
-  ctx.strokeStyle = "rgba(80,80,80,0.2)";
-  for (let r = 0; r <= rows; r++) {
-    const y = recon.height - r * ch;
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(recon.width, y); ctx.stroke();
-  }
+  // The piano roll (and its MIDI playback) lives in the reconstruction viewer script at the end of this file.
+  if (window.__reconViewer) window.__reconViewer.draw();
 }
 
 function render() {
@@ -1023,6 +1046,7 @@ function payload() {
     latent_vector: null,
     midi_buffer: null,
     influence_values: null,
+    anchor_notes_version: S.anchorVersion,
     button_values: {
       heatmapMode: S.heatMode,
       influenceMode: S.influenceMode,
@@ -1334,6 +1358,8 @@ socket.on("bootstrap", (data) => {
   S.sampleRandomize = !!data.button_values.sampleRandomize;
   S.halfExtent = data.field_half_extent;
   S.nTiming = data.n_timing;
+  if (Number.isFinite(data.n_vel)) S.nVel = data.n_vel;
+  if (Array.isArray(data.anchor_notes)) { S.anchorNotes = data.anchor_notes; S.anchorVersion = Number(data.pool_version); }
   S.decodeStatus = data.decode_status || "idle";
   S.decodeStep = Number.isFinite(data.decode_progress_step) ? data.decode_progress_step : -1;
   S.renderStatus = data.render_status || "idle";
@@ -1342,10 +1368,14 @@ socket.on("bootstrap", (data) => {
   S.renderOutputPath = data.render_output_path || null;
   S.renderError = data.render_error || null;
   S.currentBpm = Number.isFinite(Number(data.current_bpm)) ? Number(data.current_bpm) : null;
+  if (Array.isArray(data.pitch_labels)) S.pitchLabels = data.pitch_labels;
+  if (Array.isArray(data.generic_pitches)) S.genericPitches = data.generic_pitches;
   anchorLabels = Array.isArray(data.labels) ? data.labels : [];
   setHoveredAnchor(-1);
   modelCatalog = data.model_options || { modes: {} };
   modelSelection = data.model_selection || { mode: "none", previous: 0, timestamp: null };
+  // Fill the dataset/checkpoint selectors first so a later UI error can never leave them empty.
+  try { renderDatasetSelector(); renderModelSelectors(); } catch (err) { console.error("selector update failed", err); }
   applyAppStatus(data.app_status);
   gridEl.value = String(S.grid);
   syncSampleControls();
@@ -1369,7 +1399,7 @@ socket.on("bootstrap", (data) => {
   applyFieldAspectMode(false);
   renderDatasetSelector();
   renderModelSelectors();
-  render();
+  try { render(); } catch (err) { console.error("render failed", err); }
   sendPayload(true);
 });
 
@@ -1408,6 +1438,11 @@ socket.on("frame", (data) => {
   S.renderOutputPath = data.render_output_path || S.renderOutputPath;
   S.renderError = data.render_error || null;
   S.currentBpm = Number.isFinite(Number(data.current_bpm)) ? Number(data.current_bpm) : S.currentBpm;
+  if (Array.isArray(data.pitch_labels)) S.pitchLabels = data.pitch_labels;
+  if (Array.isArray(data.generic_pitches)) S.genericPitches = data.generic_pitches;
+  if (Number.isFinite(data.n_timing)) S.nTiming = data.n_timing;
+  if (Number.isFinite(data.n_vel)) S.nVel = data.n_vel;
+  if (Array.isArray(data.anchor_notes)) { S.anchorNotes = data.anchor_notes; S.anchorVersion = Number(data.pool_version); }
 
   if (isRenderTerminalStatus(S.renderStatus)) {
     S.renderEnabled = false;
@@ -1451,6 +1486,7 @@ socket.on("frame", (data) => {
   if (!pendingModelSwitch && data.model_selection) {
     modelSelection = data.model_selection;
   }
+  try { renderDatasetSelector(); renderModelSelectors(); } catch (err) { console.error("selector update failed", err); }
   applyAppStatus(data.app_status);
   gridEl.value = String(S.grid);
   syncSampleControls();
@@ -1474,7 +1510,7 @@ socket.on("frame", (data) => {
   applyFieldAspectMode(false);
   renderDatasetSelector();
   renderModelSelectors();
-  render();
+  try { render(); } catch (err) { console.error("render failed", err); }
   flushPayload();
 });
 
@@ -1616,6 +1652,7 @@ render();
   // ------------------------------------------------------------------ tabs
   function showTab(name) {
     S.activeTab = name;
+    if (name !== "latent" && window.__reconViewer) window.__reconViewer.stop();
     const train = name === "train";
     const dataset = name === "dataset";
     latentTab.style.display = (train || dataset) ? "none" : "";
@@ -1945,7 +1982,8 @@ render();
     series.forEach((s) => {
       ctx.strokeStyle = s.color;
       ctx.fillStyle = s.color;
-      ctx.lineWidth = 1.6;
+      ctx.lineWidth = s.dashed ? 1.2 : 1.6;
+      ctx.setLineDash(s.dashed ? [4, 3] : []);
       ctx.beginPath();
       let open = false;
       s.data.forEach((v, i) => {
@@ -1953,6 +1991,7 @@ render();
         if (!open) { ctx.moveTo(px(i), py(v)); open = true; } else { ctx.lineTo(px(i), py(v)); }
       });
       ctx.stroke();
+      ctx.setLineDash([]);
       if (n <= 40) {
         s.data.forEach((v, i) => { if (Number.isFinite(v)) { ctx.beginPath(); ctx.arc(px(i), py(v), 2, 0, Math.PI * 2); ctx.fill(); } });
       }
@@ -1960,6 +1999,7 @@ render();
     // legend (one line)
     let lx = left;
     series.forEach((s) => {
+      if (s.noLegend) return;
       ctx.fillStyle = s.color;
       ctx.fillRect(lx, 3, 8, 3);
       ctx.fillStyle = "#405347";
@@ -1967,6 +2007,12 @@ render();
       lx += 11 + ctx.measureText(s.label).width + 10;
     });
     ctx.restore();
+  }
+
+  const FIELD_COLORS = [["step", "#2b7e7a"], ["pitch", "#d06c3b"], ["velocity", "#6a5acd"], ["deviation", "#b08a3a"]];
+  function fieldsText(fields) {
+    if (!fields) return "";
+    return FIELD_COLORS.map(([name]) => (fields[name] === undefined ? null : `${name} ${fmt(fields[name])}`)).filter(Boolean).join(" / ");
   }
 
   function redrawCharts() {
@@ -1983,6 +2029,12 @@ render();
     ]);
     drawChart($("chBeta"), [{ label: "beta", color: "#6a5acd", data: pick((e) => e.beta) }]);
     drawChart($("chLr"), [{ label: "lr", color: "#a34922", data: pick((e) => e.lr) }]);
+    const fieldSeries = [];
+    FIELD_COLORS.forEach(([name, color]) => {
+      fieldSeries.push({ label: name, color, data: pick((e) => e.train.fields[name]) });
+      fieldSeries.push({ label: `${name} val`, color, dashed: true, noLegend: true, data: pick((e) => e.val && e.val.fields && e.val.fields[name]) });
+    });
+    drawChart($("chFields"), fieldSeries, "no per field values yet");
     const batches = (snap && snap.batches) || [];
     drawChart($("chBatch"), [{ label: "loss", color: "#2d9d5b", data: batches.map((b) => Number(b.loss)) }]);
   }
@@ -2027,6 +2079,10 @@ render();
     if (lastEpoch) {
       const v = lastEpoch.val ? `, val ${fmt(lastEpoch.val.loss)}` : "";
       lines.push(`last epoch ${lastEpoch.epoch}: train ${fmt(lastEpoch.train.loss)} (rec ${fmt(lastEpoch.train.rec)}, kl ${fmt(lastEpoch.train.kl)})${v}, ppl ${fmt(lastEpoch.train.ppl)}, ${lastEpoch.epoch_time.toFixed(1)} s/epoch`);
+      if (lastEpoch.train.fields) {
+        const vf = lastEpoch.val && lastEpoch.val.fields ? ` · val ${fieldsText(lastEpoch.val.fields)}` : "";
+        lines.push(`field CE: train ${fieldsText(lastEpoch.train.fields)}${vf}`);
+      }
     }
     lines.push(`elapsed ${fmtDuration(s.elapsed)}${remaining !== null ? `, remaining ~${fmtDuration(remaining)}` : ""}${s.pid ? `, pid ${s.pid}` : ""}`);
     if (s.error) lines.push(`error: ${s.error}`);
@@ -2101,13 +2157,15 @@ render();
     select.innerHTML = "";
     (cfg.datasets || []).forEach((name) => select.appendChild(el("option", { value: name, text: name })));
     if (!(cfg.datasets || []).length) {
-      select.appendChild(el("option", { value: "", text: "no dataset found" }));
+      select.appendChild(el("option", { value: "", text: (cfg.legacy_datasets || []).length ? "no compound dataset found" : "no dataset found" }));
     }
     select.disabled = !(cfg.datasets || []).length;
     fillDefaults(cfg.defaults, false);
     if (currentDataset && [...select.options].some((o) => o.value === currentDataset) && select.dataset.dirty === "1") select.value = currentDataset;
     if (!shownRunConfig && !compileEl.dataset.touched) compileEl.checked = !!(cfg.options && cfg.options.torch_compile);
-    envEl.textContent = `Branch: ${cfg.branch} \u00b7 device: ${cfg.device} \u00b7 data/${cfg.branch}/: ${(cfg.datasets || []).length} dataset(s)`;
+    const legacyN = (cfg.legacy_datasets || []).length;
+    envEl.textContent = `Branch: ${cfg.branch} \u00b7 device: ${cfg.device} \u00b7 data/${cfg.branch}/: ${(cfg.datasets || []).length} dataset(s)`
+      + (legacyN ? ` \u00b7 ${legacyN} legacy (triplet) dataset(s) hidden, re-extract them in the Dataset tab` : "");
     renderResumeSelectors();
     if (cfg.state) applySnapshot(cfg.state);
     updateControls();
@@ -2267,7 +2325,7 @@ render();
     { key: "velocity_scales", label: "Velocity scales", type: "text", def: "0.5, 0.75, 1.25",
       tip: "Comma separated global velocity factors applied to a whole sequence (0.5 = half as loud)." },
     { key: "microshift_deltas", label: "Micro-shift steps", type: "text", def: "-2, 2",
-      tip: "Comma separated shifts of all timing tokens in timing steps (+/- moves every note slightly early or late)." },
+      tip: "Comma separated shifts of the deviation field of every note in timing steps (+/- moves every note slightly early or late)." },
     { key: "seed", label: "Seed (optional)", type: "number", min: "0", step: "1", ph: "random",
       tip: "Random seed for reproducible augmentation. Empty = different result every time." },
     { key: "overwrite", label: "Overwrite existing", type: "checkbox", def: false,
@@ -2470,7 +2528,7 @@ render();
     jobButtons.forEach((id) => { $(id).disabled = busy; });
     folderEl.disabled = busy;
     [extractEls, mergeEls, augmentEls].forEach((els) => Object.values(els).forEach((n) => { n.disabled = busy; }));
-    $("dsMergeList").querySelectorAll("input").forEach((n) => { n.disabled = busy; });
+    $("dsMergeList").querySelectorAll("input").forEach((n) => { n.disabled = busy || n.dataset.legacy === "1"; });
     $("dsCancelBtn").disabled = !(ds.job && ds.job.state === "running");
   }
 
@@ -2549,7 +2607,11 @@ render();
     const body = $("dsListBody");
     body.innerHTML = "";
     ds.datasets.forEach((d) => {
-      const tr = el("tr", { class: d.name === ds.selected ? "sel" : "", title: d.description || d.name });
+      const legacy = d.compatible === false;
+      const tr = el("tr", {
+        class: (d.name === ds.selected ? "sel" : "") + (legacy ? " ds-legacy" : ""),
+        title: legacy ? `${d.name}: legacy (triplet) dataset. It can still be viewed, but training, inference, merge and augmentation need a compound dataset. Re-extract it from its MIDI folder.` : (d.description || d.name),
+      });
       [d.name, d.n_sequences === null ? "-" : String(d.n_sequences), fmtBytes(d.size), d.kind || "legacy", fmtDate(d.mtime)]
         .forEach((text) => tr.appendChild(el("td", { text })));
       const delBtn = el("button", { type: "button", class: "danger", text: "\u{1F5D1}", title: `Delete dataset '${d.name}' from the server (asks for confirmation).` });
@@ -2572,24 +2634,31 @@ render();
 
     const mergeBox = $("dsMergeList");
     mergeBox.innerHTML = "";
-    ds.merge = new Set(Array.from(ds.merge).filter((n) => ds.datasets.some((d) => d.name === n)));
+    const usable = ds.datasets.filter((d) => d.compatible !== false);
+    ds.merge = new Set(Array.from(ds.merge).filter((n) => usable.some((d) => d.name === n)));
     ds.datasets.forEach((d) => {
+      const legacy = d.compatible === false;
       const cb = el("input", { type: "checkbox" });
       cb.checked = ds.merge.has(d.name);
-      cb.disabled = isBusy();
+      cb.disabled = isBusy() || legacy;
+      cb.dataset.legacy = legacy ? "1" : "";
       cb.addEventListener("change", () => { if (cb.checked) ds.merge.add(d.name); else ds.merge.delete(d.name); });
-      mergeBox.appendChild(el("label", { title: `${d.n_sequences} sequences` }, [cb, document.createTextNode(` ${d.name} (${d.n_sequences === null ? "?" : d.n_sequences})`)]));
+      const suffix = legacy ? " – legacy (triplet), cannot be merged" : "";
+      mergeBox.appendChild(el("label", { class: legacy ? "ds-legacy" : "", title: legacy ? "Legacy (triplet) dataset: re-extract it to merge it." : `${d.n_sequences} sequences` },
+        [cb, document.createTextNode(` ${d.name} (${d.n_sequences === null ? "?" : d.n_sequences})${suffix}`)]));
     });
     if (!ds.datasets.length) mergeBox.textContent = "no dataset found";
 
     const sel = augmentEls.source;
     const current = sel.value;
     sel.innerHTML = "";
-    ds.datasets.forEach((d) => sel.appendChild(el("option", { value: d.name, text: d.name })));
-    if (!ds.datasets.length) sel.appendChild(el("option", { value: "", text: "no dataset found" }));
-    if (ds.datasets.some((d) => d.name === current)) sel.value = current;
-    else if (ds.selected && ds.datasets.some((d) => d.name === ds.selected)) sel.value = ds.selected;
-    sel.disabled = isBusy() || !ds.datasets.length;
+    usable.forEach((d) => sel.appendChild(el("option", { value: d.name, text: d.name })));
+    if (!usable.length) sel.appendChild(el("option", { value: "", text: ds.datasets.length ? "no compound dataset found" : "no dataset found" }));
+    if (usable.some((d) => d.name === current)) sel.value = current;
+    else if (ds.selected && usable.some((d) => d.name === ds.selected)) sel.value = ds.selected;
+    sel.disabled = isBusy() || !usable.length;
+    const legacyCount = ds.datasets.length - usable.length;
+    if (legacyCount) $("dsListEmpty").textContent += ` ${legacyCount} legacy (triplet) dataset(s) are only viewable; re-extract them for training and inference.`;
   }
 
   socket.on("ds_state", (st) => {
@@ -2684,6 +2753,7 @@ render();
     kv(sum, "Shape / dtype", `${d.shape.join(" \u00d7 ")} / ${d.dtype}`);
     kv(sum, "File size", fmtBytes(d.size));
     kv(sum, "Type", info.kind);
+    kv(sum, "Token format", d.compatible === false ? `legacy (triplet) \u2013 ${d.legacy_message || "re-extract it in the Dataset tab"}` : (d.token_format || "compound_v1"));
     kv(sum, "Created", fmtDate(info.created));
     kv(sum, "Modified", fmtDate(info.modified));
     kv(sum, "Source", sourceText(info.source));
@@ -2691,8 +2761,13 @@ render();
     kv(sum, "Unique sequences", st.unique_sequences !== undefined ? `${st.unique_sequences} (${st.duplicate_sequences} duplicates)` : "");
     if (st.notes) {
       kv(sum, "Notes / sequence", `${st.notes.mean} (min ${st.notes.min}, max ${st.notes.max}), total ${st.notes.total}`);
-      kv(sum, "Tokens / sequence", `${st.tokens.mean} (min ${st.tokens.min}, max ${st.tokens.max})`);
+      kv(sum, "Frames / sequence", `${st.tokens.mean} (min ${st.tokens.min}, max ${st.tokens.max}, incl. EOS; max_seq_len ${st.max_len})`);
       kv(sum, "Without EOS / empty", `${st.without_eos} / ${st.empty_sequences}`);
+      if (st.truncated_sequences !== undefined) {
+        kv(sum, "Truncated sequences", st.truncated_sequences
+          ? `${st.truncated_sequences} at the frame limit (${st.max_len - 1} notes): late notes of very dense windows were cut`
+          : `0 (max ${st.max_notes} notes per sequence)`);
+      }
     }
     if (st.bpm && st.bpm.count) kv(sum, "BPM", `${st.bpm.min} \u2013 ${st.bpm.max} (mean ${st.bpm.mean}, median ${st.bpm.median}) in ${st.bpm.count} sequences`);
     else kv(sum, "BPM", "not stored");
@@ -2799,7 +2874,8 @@ render();
     if (!ds.active || !ds.info) return;
     const st = ds.info.stats || {};
     if (!st.pitch_hist) {
-      ["dsChPitch", "dsChVel", "dsChTiming", "dsChNotes", "dsChBpm"].forEach((id) => drawEmpty($(id), "no statistics (empty dataset)"));
+      const why = st.legacy ? "no statistics (legacy triplet dataset, re-extract it)" : "no statistics (empty dataset)";
+      ["dsChPitch", "dsChVel", "dsChTiming", "dsChNotes", "dsChBpm"].forEach((id) => drawEmpty($(id), why));
       return;
     }
     const labels = st.pitch_labels || [];
@@ -2870,7 +2946,8 @@ render();
     ds.seq = seq;
     if (play.playing) rescheduleFromNow();  // keep playing, now with the new sequence from the current position
     const parts = [`#${seq.index}`, seq.filename ? `file: ${seq.filename}` : null, seq.window !== null ? `window ${seq.window}` : null,
-      seq.bpm ? `${seq.bpm} BPM` : "no BPM", `${seq.notes.length} notes`, `${seq.n_tokens} tokens`];
+      seq.bpm ? `${seq.bpm} BPM` : "no BPM", `${seq.notes.length} notes`,
+      seq.legacy ? "legacy (triplet) sequence: no piano roll, re-extract the dataset" : `${seq.n_tokens} frames (incl. EOS)`];
     $("dsSeqInfo").textContent = parts.filter(Boolean).join(" \u00b7 ");
     drawRoll();
   });
@@ -3090,6 +3167,8 @@ render();
     }
   }
 
+  window.__rbfSynth = { hit: synthHit, ensure: ensureAudio };  // shared with the reconstruction playback
+
   function currentPort() {
     if (outSel.value === SYNTH || !midi.access) return null;
     return midi.access.outputs.get(outSel.value) || null;
@@ -3254,6 +3333,539 @@ render();
   if (socket.connected) socket.emit("ds_get_state");
   updateControls();
   if (window.location.hash === "#dataset") window.__datasetTab.setActive(true);
+})();
+
+// ---------------------------------------------------------------------------------------------
+// Reconstruction viewer (Latent Field tab): piano roll like the Dataset > Sequence viewer + MIDI playback.
+// The server sends the decoded note matrix [pitch rows x (steps * n_timing) columns]; the notes are recovered
+// here with the same onset rule as modules/compound.py::matrix_to_notes.
+// ---------------------------------------------------------------------------------------------
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const canvas = $("recon");
+  const LOOKAHEAD_MS = 100;
+  const SYNTH = "__synth__";
+  const NOTE_THRESHOLD = 0.02;
+  const L = { left: 104, right: 6, top: 14, bottom: 4 };
+  const store = {
+    get: (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } },
+    set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) { /* ignore */ } },
+  };
+  const rangeEl = $("rcRange"), foldEl = $("rcFold"), outSel = $("rcMidiOut"), chSel = $("rcMidiCh"), mapSel = $("rcMidiMap");
+  const bpmEl = $("rcMidiBpm"), loopEl = $("rcMidiLoop"), quantEl = $("rcQuant");
+  const showEl = $("rcShow"), anchorEl = $("rcAnchor");
+  const midi = { access: null };
+  const play = { playing: false, queue: [], sounding: new Map(), nextStart: 0, timer: null, raf: null, passes: [], port: null, ch: 9, endAt: 0, sentUntil: 0, firstPass: false };
+  const view = { notes: [], steps: 32, src: null, sig: "", hidden: 0, hiddenMax: -1, rows: [], anchorNotes: [], anchorKey: "", anchorSig: "" };
+
+  function opt(value, text) {
+    const o = document.createElement("option");
+    o.value = value; o.textContent = text;
+    return o;
+  }
+  for (let i = 1; i <= 16; i++) chSel.appendChild(opt(String(i - 1), String(i)));
+  rangeEl.value = store.get("rc.range", "24");
+  foldEl.checked = store.get("rc.fold", "0") === "1";
+  chSel.value = store.get("rc.ch", "9");
+  mapSel.value = store.get("rc.map", "midi");
+  loopEl.checked = store.get("rc.loop", "1") === "1";
+  quantEl.value = store.get("rc.quant", "0");
+  showEl.value = store.get("rc.show", "recon");
+  if (showEl.value !== "anchor" && showEl.value !== "both") showEl.value = "recon";
+  let wantedAnchor = parseInt(store.get("rc.anchor", "0"), 10) || 0;
+
+  function nRows() {
+    return Math.max(1, (S.pitchLabels && S.pitchLabels.length) || (S.recon && S.recon.length) || 54);
+  }
+  function pitchRange() {
+    const max = nRows();
+    const v = parseInt(rangeEl.value, 10);
+    return Math.max(1, Math.min(max, Number.isFinite(v) ? v : 24));
+  }
+  function quantAmount() {
+    return Math.max(0, Math.min(1, (parseFloat(quantEl.value) || 0) / 100));
+  }
+  function updateQuantLabel() {
+    $("rcQuantVal").textContent = `${parseInt(quantEl.value, 10) || 0} %`;
+  }
+
+  // ------------------------------------------------------------------ matrix -> notes
+  function extractNotes(matrix) {
+    const rows = matrix.length;
+    const cols = rows ? matrix[0].length : 0;
+    const nT = Math.max(1, Number(S.nTiming) | 0);
+    const notes = [];
+    if (!rows || !cols) return { notes, steps: 32 };
+    const center = Math.floor(nT / 2);
+    const half = Math.max(1, Math.floor(nT / 2));
+    for (let r = 0; r < rows; r++) {
+      const row = matrix[r];
+      for (let c = 0; c < cols; c++) {
+        const v = row[c];
+        if (!(v > NOTE_THRESHOLD)) continue;
+        const prev = row[(c - 1 + cols) % cols];
+        if (prev > NOTE_THRESHOLD && prev === v) continue;
+        const shifted = (c + center) % cols;
+        const step = Math.floor(shifted / nT);
+        const dev = shifted % nT;
+        const shift = (dev - center) / half;
+        const velNorm = Math.min(1, v);
+        notes.push({
+          pitch: r, step, shift, pos: step + 0.5 * shift, vel_norm: velNorm,
+          vel: Math.max(1, Math.round(velNorm * 127)), midi: r + 36,
+          generic: (S.genericPitches && S.genericPitches[r] !== undefined) ? S.genericPitches[r] : r + 36,
+          src: "recon",
+        });
+      }
+    }
+    notes.sort((a, b) => a.pos - b.pos || a.pitch - b.pitch);
+    return { notes, steps: Math.max(1, Math.round(cols / nT)) };
+  }
+
+  function syncFromState() {
+    if (S.recon === view.src) return;
+    view.src = S.recon;
+    const res = extractNotes(Array.isArray(S.recon) ? S.recon : []);
+    view.notes = res.notes;
+    view.steps = res.steps;
+    const sig = `${view.steps}|${view.notes.map((n) => `${n.pos.toFixed(3)}:${n.pitch}:${n.vel}`).join(",")}`;
+    const changed = sig !== view.sig;
+    view.sig = sig;
+    if (changed && play.playing) rescheduleFromNow();  // follow the live reconstruction without a break
+  }
+
+  // ------------------------------------------------------------------ drawing
+  // ------------------------------------------------------------------ original notes of the anchor points
+  function anchorOffset() {
+    return (typeof isHiddenAnchor0Mode === "function" && isHiddenAnchor0Mode(S.latentFallbackMode)) ? 1 : 0;
+  }
+  function refreshAnchorOptions() {
+    const offset = anchorOffset();
+    const labels = Array.isArray(anchorLabels) ? anchorLabels : [];
+    const sig = `${offset}|${labels.join("\u0001")}`;
+    if (sig === view.anchorSig && anchorEl.options.length) return;
+    view.anchorSig = sig;
+    anchorEl.innerHTML = "";
+    labels.forEach((label, i) => {
+      const poolIdx = i + offset;
+      anchorEl.appendChild(opt(String(poolIdx), `${poolIdx}: ${anchorBaseName(label, poolIdx)}`));
+    });
+    if (!labels.length) anchorEl.appendChild(opt("-1", "(no anchors)"));
+    const wanted = String(wantedAnchor);
+    anchorEl.value = Array.from(anchorEl.options).some((o) => o.value === wanted) ? wanted : anchorEl.options[0].value;
+    anchorEl.disabled = !labels.length;
+  }
+  function selectedAnchor() {
+    const v = parseInt(anchorEl.value, 10);
+    return Number.isFinite(v) ? v : -1;
+  }
+  function anchorNotesFor(idx) {
+    const key = `${S.anchorVersion}:${idx}:${S.nTiming}:${S.nVel}`;
+    if (key === view.anchorKey) return view.anchorNotes;
+    view.anchorKey = key;
+    const raw = (idx >= 0 && S.anchorNotes && S.anchorNotes[idx]) || [];
+    const nT = Math.max(1, Number(S.nTiming) | 0);
+    const center = Math.floor(nT / 2);
+    const half = Math.max(1, Math.floor(nT / 2));
+    const nVel = Math.max(2, Number(S.nVel) | 0);
+    const notes = raw.map((f) => {
+      const step = f[0], pitch = f[1], dev = f[3];
+      const shift = (dev - center) / half;
+      const velNorm = Math.min(1, f[2] / (nVel - 1));
+      return {
+        pitch, step, shift, pos: step + 0.5 * shift, vel_norm: velNorm,
+        vel: Math.max(1, Math.round(velNorm * 127)), midi: pitch + 36,
+        generic: (S.genericPitches && S.genericPitches[pitch] !== undefined) ? S.genericPitches[pitch] : pitch + 36,
+        src: "anchor",
+      };
+    });
+    notes.sort((a, b) => a.pos - b.pos || a.pitch - b.pitch);
+    view.anchorNotes = notes;
+    return notes;
+  }
+  // Notes shown in the piano roll and played back: reconstruction (default), original anchor, or both.
+  function shownNotes() {
+    const mode = showEl.value;
+    if (mode === "anchor") return anchorNotesFor(selectedAnchor());
+    if (mode === "both") return anchorNotesFor(selectedAnchor()).concat(view.notes);
+    return view.notes;
+  }
+  function anchorName() {
+    const o = anchorEl.options[anchorEl.selectedIndex];
+    return o ? o.textContent : "-";
+  }
+
+  function notePos(n) {
+    const q = quantAmount();
+    let p = Math.max(0, n.pos);
+    if (q > 0) {
+      p += (Math.round(p) - p) * q;
+      if (p >= view.steps) p -= view.steps;
+    }
+    return p;
+  }
+
+  function visiblePitches() {
+    const range = pitchRange();
+    if (foldEl.checked) {
+      return Array.from(new Set(shownNotes().filter((n) => n.pitch < range).map((n) => n.pitch))).sort((a, b) => a - b);
+    }
+    return Array.from({ length: range }, (_, i) => i);
+  }
+
+  function updateInfo() {
+    const range = pitchRange();
+    const hidden = shownNotes().filter((n) => n.pitch >= range);
+    view.hidden = hidden.length;
+    view.hiddenMax = hidden.reduce((m, n) => Math.max(m, n.pitch), -1);
+    const info = $("reconInfo");
+    const mode = showEl.value;
+    if (mode === "anchor") {
+      const an = anchorNotesFor(selectedAnchor());
+      info.textContent = [`original anchor ${anchorName()}`, `${an.length} notes`, `${view.steps} steps`].join(" \u00b7 ");
+    } else if (!Array.isArray(S.recon) || !S.recon.length) {
+      info.innerHTML = mode === "both"
+        ? `Original anchor <b>${anchorName().replace(/[&<>]/g, "")}</b> shown. Turn on <b>Decode</b> to add the reconstruction.`
+        : "Turn on <b>Decode</b> to see the reconstruction of the current latent vector.";
+    } else {
+      const bpm = Number.isFinite(S.currentBpm) ? `${S.currentBpm.toFixed(1)} BPM` : "no BPM";
+      const parts = [`${view.notes.length} notes`, `${view.steps} steps`, bpm, `decode: ${S.decodeStatus}`];
+      if (mode === "both") parts.unshift(`anchor ${anchorName()} (${anchorNotesFor(selectedAnchor()).length} notes, orange outline) + reconstruction (teal)`);
+      info.textContent = parts.join(" \u00b7 ");
+    }
+    const warn = $("reconWarn");
+    if (hidden.length) {
+      warn.textContent = `\u26A0 ${hidden.length} note(s) with pitch \u2265 ${range} (highest: ${view.hiddenMax}) are outside the pitch range and not shown. They are still played. Increase "Pitch range" to see them.`;
+      warn.classList.add("visible");
+    } else {
+      warn.classList.remove("visible");
+    }
+  }
+
+  function prep(c) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = c.clientWidth, h = c.clientHeight;
+    if (!w || !h) return null;
+    if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
+      c.width = Math.round(w * dpr);
+      c.height = Math.round(h * dpr);
+    }
+    const ctx = c.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    return { ctx, w, h };
+  }
+
+  function currentPlayStep() {
+    if (!play.playing) return null;
+    const now = performance.now();
+    const pass = play.passes.find((p) => now >= p.start && now < p.start + p.dur);
+    return pass ? (now - pass.start) / pass.stepMs : null;
+  }
+
+  function draw(playStep) {
+    syncFromState();
+    refreshAnchorOptions();
+    updateInfo();
+    const pitches = visiblePitches();
+    const rows = Math.max(1, pitches.length);
+    view.rows = pitches;
+    canvas.style.height = `${Math.max(140, Math.min(720, rows * 11 + L.top + L.bottom + 6))}px`;
+    const p = prep(canvas);
+    if (!p) return;
+    const { ctx, w, h } = p;
+    const steps = view.steps;
+    const plotW = w - L.left - L.right, plotH = h - L.top - L.bottom;
+    const rowH = plotH / rows, stepW = plotW / steps;
+    const labels = S.pitchLabels || [];
+    for (let s = 0; s <= steps; s++) {
+      const x = L.left + s * stepW;
+      ctx.strokeStyle = s % 16 === 0 ? "#8a948c" : (s % 4 === 0 ? "#c4cbc2" : "#eceee8");
+      ctx.beginPath(); ctx.moveTo(x, L.top); ctx.lineTo(x, L.top + plotH); ctx.stroke();
+      if (s % 4 === 0 && s < steps) {
+        ctx.fillStyle = "#5b6a60"; ctx.font = "9px Helvetica, Arial, sans-serif"; ctx.textAlign = "left"; ctx.textBaseline = "top";
+        ctx.fillText(`${Math.floor(s / 16) + 1}.${(s % 16) / 4 + 1}`, x + 2, 2);
+      }
+    }
+    pitches.forEach((pitch, r) => {
+      const y = L.top + plotH - (r + 1) * rowH;
+      ctx.fillStyle = r % 2 ? "rgba(0,0,0,0.025)" : "rgba(0,0,0,0)";
+      ctx.fillRect(L.left, y, plotW, rowH);
+      if (rowH >= 8) {
+        ctx.fillStyle = "#405347"; ctx.font = `${Math.min(11, Math.floor(rowH))}px Helvetica, Arial, sans-serif`;
+        ctx.textAlign = "right"; ctx.textBaseline = "middle";
+        ctx.fillText(`${pitch}${labels[pitch] ? " " + labels[pitch] : ""}`.slice(0, 20), L.left - 5, y + rowH / 2);
+      }
+    });
+    const index = new Map(pitches.map((pt, r) => [pt, r]));
+    const shown = shownNotes();
+    const overlay = showEl.value === "both";
+    shown.forEach((n) => {
+      const r = index.get(n.pitch);
+      if (r === undefined) return;  // outside the pitch range (or folded away)
+      const x = L.left + notePos(n) * stepW;
+      const y = L.top + plotH - (r + 1) * rowH + 1;
+      const light = 80 - 50 * n.vel_norm;
+      const nw = Math.max(3, stepW * 0.8), nh = Math.max(3, rowH - 2);
+      if (n.src === "anchor") {
+        if (overlay) {
+          // original note behind the reconstruction: translucent fill with a strong orange outline
+          ctx.fillStyle = `hsla(28, 90%, ${light}%, 0.35)`;
+          ctx.strokeStyle = "hsl(28, 90%, 42%)";
+          ctx.lineWidth = 1.5;
+          ctx.fillRect(x, y, nw, nh);
+          ctx.strokeRect(x + 0.75, y + 0.75, nw - 1.5, nh - 1.5);
+          ctx.lineWidth = 1;
+        } else {
+          ctx.fillStyle = `hsl(28, 85%, ${light}%)`;
+          ctx.strokeStyle = `hsl(28, 85%, ${Math.max(15, light - 25)}%)`;
+          ctx.fillRect(x, y, nw, nh);
+          ctx.strokeRect(x + 0.5, y + 0.5, nw - 1, nh - 1);
+        }
+        return;
+      }
+      ctx.fillStyle = `hsl(172, 62%, ${light}%)`;
+      ctx.strokeStyle = `hsl(172, 62%, ${Math.max(15, light - 25)}%)`;
+      ctx.fillRect(x, y, nw, nh);
+      ctx.strokeRect(x + 0.5, y + 0.5, nw - 1, nh - 1);
+    });
+    if (!shown.length) {
+      ctx.fillStyle = "#77807a"; ctx.font = "12px Helvetica, Arial, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      const reconOn = Array.isArray(S.recon) && S.recon.length;
+      const msg = showEl.value === "anchor" ? "the anchor has no notes" : (showEl.value === "both" && !reconOn ? "decode is off and the anchor has no notes" : (reconOn ? "no notes generated" : "decode is off"));
+      ctx.fillText(msg, L.left + plotW / 2, L.top + plotH / 2);
+    }
+    if (view.hidden > 0) {
+      // small indicator in the top right corner of the plot: notes above the pitch range exist
+      const text = `\u25B2 +${view.hidden} above range`;
+      ctx.font = "bold 10px Helvetica, Arial, sans-serif"; ctx.textAlign = "right"; ctx.textBaseline = "top";
+      const tw = ctx.measureText(text).width;
+      ctx.fillStyle = "#fff4d6"; ctx.fillRect(w - L.right - tw - 8, L.top + 1, tw + 8, 14);
+      ctx.strokeStyle = "#d9a441"; ctx.strokeRect(w - L.right - tw - 8 + 0.5, L.top + 1.5, tw + 7, 13);
+      ctx.fillStyle = "#7a4a00"; ctx.fillText(text, w - L.right - 4, L.top + 3);
+    }
+    const ps = playStep === undefined ? currentPlayStep() : playStep;
+    if (ps !== undefined && ps !== null) {
+      const x = L.left + Math.max(0, Math.min(steps, ps)) * stepW;
+      ctx.strokeStyle = "#c94d44"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(x, L.top - 2); ctx.lineTo(x, L.top + plotH); ctx.stroke();
+      ctx.lineWidth = 1;
+    }
+  }
+
+  canvas.addEventListener("mousemove", (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const rows = Math.max(1, view.rows.length);
+    const plotW = rect.width - L.left - L.right, plotH = rect.height - L.top - L.bottom;
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    const r = Math.floor((L.top + plotH - y) / (plotH / rows));
+    const step = (x - L.left) / (plotW / view.steps);
+    const hit = shownNotes().slice().reverse().find((n) => {
+      const np = notePos(n);
+      return n.pitch === view.rows[r] && step >= np - 0.05 && step <= np + 0.9;
+    });
+    canvas.title = hit ? `${hit.src === "anchor" ? "original anchor: " : "reconstruction: "}pitch ${hit.pitch}${(S.pitchLabels || [])[hit.pitch] ? " (" + S.pitchLabels[hit.pitch] + ")" : ""} \u00b7 MIDI ${hit.midi} \u00b7 step ${hit.step} \u00b7 velocity ${hit.vel} \u00b7 shift ${hit.shift.toFixed(2)}` : "";
+  });
+
+  // ------------------------------------------------------------------ settings
+  rangeEl.addEventListener("input", () => { store.set("rc.range", rangeEl.value); draw(); });
+  foldEl.addEventListener("change", () => { store.set("rc.fold", foldEl.checked ? "1" : "0"); draw(); });
+  showEl.addEventListener("change", () => {
+    store.set("rc.show", showEl.value);
+    draw();
+    if (play.playing) rescheduleFromNow();  // playback follows what is shown
+  });
+  anchorEl.addEventListener("change", () => {
+    wantedAnchor = selectedAnchor();
+    store.set("rc.anchor", String(wantedAnchor));
+    draw();
+    if (play.playing && showEl.value !== "recon") rescheduleFromNow();
+  });
+  chSel.addEventListener("change", () => store.set("rc.ch", chSel.value));
+  mapSel.addEventListener("change", () => { store.set("rc.map", mapSel.value); if (play.playing) rescheduleFromNow(); });
+  loopEl.addEventListener("change", () => store.set("rc.loop", loopEl.checked ? "1" : "0"));
+  outSel.addEventListener("change", () => { store.set("rc.out", outSel.value); if (play.playing) stopPlayback(); });
+  quantEl.addEventListener("input", () => {
+    store.set("rc.quant", quantEl.value);
+    updateQuantLabel();
+    draw();
+    if (play.playing) rescheduleFromNow();  // quantization is applied in real time
+  });
+  bpmEl.addEventListener("input", () => { if (play.playing) rescheduleFromNow(); });
+  updateQuantLabel();
+
+  // ------------------------------------------------------------------ Web MIDI
+  function refreshOutputs() {
+    const wanted = outSel.value || store.get("rc.out", SYNTH);
+    outSel.innerHTML = "";
+    outSel.appendChild(opt(SYNTH, "Browser synth (preview, no MIDI device)"));
+    if (midi.access) {
+      midi.access.outputs.forEach((out) => outSel.appendChild(opt(out.id, `${out.name}${out.manufacturer ? " (" + out.manufacturer + ")" : ""}${out.state === "disconnected" ? " [disconnected]" : ""}`)));
+    }
+    outSel.value = Array.from(outSel.options).some((o) => o.value === wanted) ? wanted : SYNTH;
+    const n = midi.access ? midi.access.outputs.size : 0;
+    $("rcMidiStatus").textContent = midi.access ? `${n} MIDI output port(s) found.` : "Press 'Connect MIDI' to list the MIDI output ports of this computer.";
+  }
+  async function connectMidi() {
+    if (!navigator.requestMIDIAccess) {
+      $("rcMidiStatus").textContent = "Web MIDI is not available in this browser (use Chrome/Edge/Opera). Only the browser synth can be used.";
+      return;
+    }
+    if (!window.isSecureContext) {
+      $("rcMidiStatus").textContent = "Web MIDI needs a secure page: open the server as http://localhost:<port> or via https.";
+    }
+    try {
+      midi.access = await navigator.requestMIDIAccess({ sysex: false });
+      midi.access.onstatechange = refreshOutputs;
+      refreshOutputs();
+    } catch (err) {
+      $("rcMidiStatus").textContent = `MIDI access denied: ${err && err.message ? err.message : err}`;
+    }
+  }
+  $("rcMidiBtn").addEventListener("click", connectMidi);
+  refreshOutputs();
+
+  function currentPort() {
+    if (outSel.value === SYNTH || !midi.access) return null;
+    return midi.access.outputs.get(outSel.value) || null;
+  }
+  function sendEvent(ev) {
+    const key = `${ev.pitch}`;
+    if (ev.type === "on") {
+      play.sounding.set(key, ev.pitch);
+      if (play.port) { try { play.port.send([0x90 | play.ch, ev.pitch, Math.max(1, ev.vel)], ev.t); } catch (e) { /* port gone */ } }
+      else if (window.__rbfSynth) window.__rbfSynth.hit(ev.pitch, ev.vel, ev.t);
+    } else {
+      play.sounding.delete(key);
+      if (play.port) { try { play.port.send([0x80 | play.ch, ev.pitch, 0], ev.t); } catch (e) { /* port gone */ } }
+    }
+  }
+  function mapPitch(n) {
+    const value = mapSel.value === "generic" ? n.generic : n.midi;
+    return Math.max(0, Math.min(127, value | 0));
+  }
+  function passTiming() {
+    const override = parseFloat(bpmEl.value);
+    const bpm = override > 0 ? override : (Number.isFinite(S.currentBpm) && S.currentBpm > 0 ? S.currentBpm : 120);
+    return { bpm, stepMs: 60000 / bpm / 4 };
+  }
+
+  // Queue the events of one pass of the current reconstruction starting at t0 (ms); events before minT are skipped.
+  function buildPass(t0, minT) {
+    const cut = minT === undefined ? -Infinity : minT;
+    const { bpm, stepMs } = passTiming();
+    const total = view.steps * stepMs;
+    shownNotes().forEach((n) => {
+      const pitch = mapPitch(n);
+      const on = t0 + notePos(n) * stepMs;
+      if (on < cut) return;
+      play.queue.push({ t: on, type: "on", pitch, vel: n.vel });
+      play.queue.push({ t: on + stepMs * 0.9, type: "off", pitch, vel: 0 });
+    });
+    play.queue.sort((a, b) => a.t - b.t);
+    play.passes.push({ start: t0, dur: total, stepMs, bpm });
+    if (play.passes.length > 3) play.passes.shift();
+    return total;
+  }
+
+  // Switch to the current notes / quantize / BPM without a break: continue at the position the playback is at now.
+  function rescheduleFromNow() {
+    if (!play.playing) return;
+    const now = performance.now();
+    const base = play.passes.find((p) => now < p.start + p.dur);
+    if (!base) return;  // nothing scheduled yet: tick() builds the next pass from the current notes
+    let phase = (now - base.start) / base.stepMs;
+    if (phase >= view.steps) phase %= view.steps;
+    let cutoff = Math.max(now, play.sentUntil);
+    const pending = Array.from(play.sounding.values());
+    play.queue = [];
+    if (play.port && typeof play.port.clear === "function") {
+      try { play.port.clear(); } catch (e) { /* not supported */ }
+      pending.forEach((pitch) => { try { play.port.send([0x80 | play.ch, pitch, 0]); } catch (e) { /* ignore */ } });
+      play.sounding.clear();
+      cutoff = now;
+    } else {
+      pending.forEach((pitch) => play.queue.push({ t: cutoff, type: "off", pitch, vel: 0 }));
+    }
+    const { stepMs } = passTiming();
+    const start = now - phase * stepMs;
+    play.passes = [];
+    const total = buildPass(start, cutoff);
+    play.endAt = start + total;
+    play.nextStart = start + total;
+    play.firstPass = false;
+  }
+
+  function tick() {
+    if (!play.playing) return;
+    const now = performance.now();
+    if (now + 400 >= play.nextStart && (play.firstPass || loopEl.checked) && !(play.endAt && !loopEl.checked)) {
+      const total = buildPass(play.nextStart);
+      play.endAt = play.nextStart + total;
+      play.nextStart += total;
+      play.firstPass = false;
+    }
+    while (play.queue.length && play.queue[0].t < now + LOOKAHEAD_MS) sendEvent(play.queue.shift());
+    play.sentUntil = now + LOOKAHEAD_MS;
+    if (!loopEl.checked && now > play.endAt + 50 && !play.queue.length) { stopPlayback(); return; }
+  }
+
+  function animate() {
+    if (!play.playing) return;
+    draw(currentPlayStep());
+    play.raf = requestAnimationFrame(animate);
+  }
+
+  function startPlayback() {
+    if (play.playing) return;
+    play.port = currentPort();
+    if (outSel.value !== SYNTH && !play.port) {
+      $("rcMidiStatus").textContent = "The selected MIDI output is not available. Press 'Connect MIDI' or choose the browser synth.";
+      return;
+    }
+    if (!play.port && window.__rbfSynth) window.__rbfSynth.ensure();
+    play.ch = parseInt(chSel.value, 10) || 0;
+    play.playing = true;
+    play.firstPass = true;
+    play.endAt = 0;
+    play.sentUntil = 0;
+    play.queue = [];
+    play.passes = [];
+    play.nextStart = performance.now() + 80;
+    $("rcPlayBtn").disabled = true;
+    $("rcStopBtn").disabled = false;
+    const label = play.port ? `${play.port.name}, channel ${play.ch + 1}` : "browser synth";
+    $("rcMidiStatus").textContent = `Playing on ${label}.` + (shownNotes().length ? "" : " (no notes yet: turn on Decode)");
+    play.timer = setInterval(tick, 20);
+    tick();
+    play.raf = requestAnimationFrame(animate);
+  }
+
+  function stopPlayback() {
+    const wasPlaying = play.playing;
+    play.playing = false;
+    clearInterval(play.timer); play.timer = null;
+    if (play.raf) cancelAnimationFrame(play.raf);
+    play.raf = null;
+    play.queue = [];
+    if (play.port) {
+      try { if (typeof play.port.clear === "function") play.port.clear(); } catch (e) { /* not supported */ }
+      play.sounding.forEach((pitch) => { try { play.port.send([0x80 | play.ch, pitch, 0]); } catch (e) { /* ignore */ } });
+      try { play.port.send([0xB0 | play.ch, 123, 0]); } catch (e) { /* ignore */ }
+    }
+    play.sounding.clear();
+    play.passes = [];
+    $("rcPlayBtn").disabled = false;
+    $("rcStopBtn").disabled = true;
+    if (wasPlaying) $("rcMidiStatus").textContent = "Stopped.";
+    draw();
+  }
+  $("rcPlayBtn").addEventListener("click", startPlayback);
+  $("rcStopBtn").addEventListener("click", stopPlayback);
+  window.addEventListener("beforeunload", stopPlayback);
+
+  window.__reconViewer = { draw, stop: () => { if (play.playing) stopPlayback(); } };
+  draw();
 })();
 </script>
 </body>

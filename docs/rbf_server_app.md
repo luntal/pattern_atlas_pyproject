@@ -28,6 +28,7 @@
 12. [Startup and Configuration](#12-startup-and-configuration)
 13. [Training Tab](#13-training-tab)
 14. [Dataset Tab](#14-dataset-tab)
+15. [Compound Token Format](#15-compound-token-format)
 
 ---
 
@@ -106,9 +107,11 @@ A `@dataclass` that holds the single source of truth for all UI-driven state on 
 
 Manages model loading and device selection (CUDA → MPS → CPU). Wraps the `TransformerVAE` and exposes:
 
-- `decode_latent_to_matrix(latent_vector)` — synchronous greedy autoregressive decoding of a latent into a piano-roll matrix `(height × width*n_timing)`
-- `encode_midi_buffer_to_latent(midi_buffer)` — encodes a MIDI token sequence or matrix back to the VAE encoder's `mu` latent
-- `_tokens_from_matrix_buffer(matrix)` — converts a piano-roll matrix back to the token vocabulary for re-encoding
+- `decode_latents_to_matrices(latents)` / `decode_latent_to_matrix(latent_vector)` — batched greedy, constrained decoding with KV-cache (`Decoder.generate`) into piano-roll matrices `(height × width*n_timing)`; the sequence ends at the first EOS frame
+- `encode_midi_buffer_to_latent(midi_buffer)` — encodes `{frames: [[step, pitch, velocity, deviation], ...]}`, a plain list of 4-element frames or `{matrix}` back to the VAE encoder's `mu` latent (padded / cut to `max_seq_len` frames). Flat triplet token lists are rejected with `ValueError`
+- `_tokens_from_matrix_buffer(matrix)` — `compound.matrix_to_frames`: piano-roll matrix → frames sorted by `(step, pitch)` plus EOS
+
+The token format is described in §15 (compound frames).
 
 ---
 
@@ -141,7 +144,7 @@ The main coordinator class. Constructed once at server startup.
 
 ### 3.4 FullFieldRenderManager
 
-Runs a full `grid_resolution × grid_resolution` decode pass in a background daemon thread. Each cell is decoded by `CudaRBFRuntime.decode_latent_to_matrix()` and its token sequence is collected into a flat array. A cancel event allows the render to be aborted mid-run.
+Runs a full `grid_resolution × grid_resolution` decode pass in a background daemon thread. Cells are decoded in blocks by `CudaRBFRuntime.decode_latents_to_matrices()` and every frame sequence is padded with PAD frames to `hparams.max_seq_len`. The export `outputs/<branch>/field_render_*.npz` holds `sequences` `[N, L, 4]` (`int16`) plus `token_format`, `field_names`, `field_vocab_sizes`, `n_specials`, `pad/sos/eos_token`, `center_timing`, `width`, `height`, `max_seq_len`, BPMs and the interpolation data (no `sequences_1d` and no `*_token` metadata anymore). A cancel event allows the render to be aborted mid-run.
 
 Progress is published thread-safely via a generation counter (`_latest_generation` / `_last_consumed_generation`). The main loop polls `consume_latest_update()` on each frame and forwards progress to the client.
 
@@ -149,7 +152,7 @@ Progress is published thread-safely via a generation counter (`_latest_generatio
 
 ### 3.5 RealtimeDecoderManager
 
-Runs a single autoregressive decode in a background daemon thread using the `TransformerVAE` decoder. Publishes partial piano-roll updates after each note event, enabling the UI to display decoding progress in real time. A new decode job cancels any running one.
+Runs a single autoregressive decode in a background daemon thread using the `TransformerVAE` decoder (`decode_step` + `Decoder.pick_frame`, same constraints as the batched path). Every generated frame is one finished note, so a partial piano-roll update is published after each note, enabling the UI to display decoding progress in real time. A new decode job cancels any running one.
 
 ---
 
@@ -224,20 +227,19 @@ Both are min-max normalized. The heatmap is cached with a signature `(point_shap
 
 ## 6. Decoding: Latent → MIDI Matrix
 
-The decoder is a Transformer cross-attending to a latent memory block. Decoding is greedy autoregressive with a custom token vocabulary:
+The decoder is a Transformer cross-attending to a latent memory block. Decoding is greedy and autoregressive over **compound frames** (one frame = one note, see §15):
 
-- **SOS** → start of sequence
-- **Pitch tokens** — one per drum track (row in the piano-roll)
-- **Velocity tokens** — quantized velocity level
-- **Timing tokens** — sub-step timing offset relative to the beat center
-- **Step token** — advances the beat counter
-- **EOS / PAD** — terminate / fill
+- **SOS frame** `[1,1,1,1]` → start of sequence (decoder input only)
+- **Note frame** `[step, pitch, velocity, deviation]` — absolute 16th position in the 2-bar window, drum row, quantized velocity, micro timing
+- **EOS frame** `[2,2,2,2]` → end of sequence, afterwards **PAD** frames `[0,0,0,0]`
+
+Four parallel heads predict the four fields from the same decoder state. `Decoder.pick_frame` chooses them in the order step → pitch → velocity / deviation with constraints (switchable via `constrained`): the step never falls, at the same step the pitch must rise (if no higher pitch is left the next step or EOS is taken). This keeps the order `(step, pitch)` and avoids duplicates that the independent heads could otherwise produce. The step head also decides the end (EOS).
 
 The output is a 2-D matrix `(height × width*n_timing)` where each cell encodes velocity (0.0–1.0) with timing offset. A note of `n_timing // 2` steps wide is drawn from the onset column.
 
 `RealtimeDecoderManager` publishes partial matrices after each note event, so the UI piano-roll updates column-by-column as decoding progresses.
 
-Important nuance for exported token data (`sequences_1d` in Section 10): the saved sequence is not a direct byte-for-byte dump of the decoder's internal autoregressive token stream. For full-field export, each cell is decoded to a matrix first, then re-tokenized from that matrix, and finally normalized to a fixed length (`sequence_length`, currently 256) via truncate/pad. This matrix round-trip is intended to preserve project semantics, but token IDs can differ from a hypothetical raw decoder stream while remaining musically equivalent or near-equivalent.
+Exported frames (`sequences` in Section 10) are the decoder's own frames up to EOS, padded with PAD frames to `max_seq_len` (`RETOKENIZE = False`). With `RETOKENIZE = True` each cell is converted to a matrix and back with `compound.matrix_to_frames` first.
 
 ---
 
@@ -389,10 +391,10 @@ data = np.load("outputs/branch/field_render_2026-04-23_14-30-00.npz")
 
 | Key | Shape / Type | Description |
 |---|---|---|
-| `sequences_1d` | `(grid² × sequence_length,)` int64 | All decoded token sequences concatenated in row-major order. Reshape to `(grid², sequence_length)` to get one sequence per cell |
+| `sequences` | `(grid², max_seq_len, 4)` int16 | Decoded compound frames per cell in row-major order: `[step, pitch, velocity, deviation]` with offset `n_specials` (3), EOS frame `[2,2,2,2]`, then PAD frames. Decode with `modules.compound.frames_to_notes` / `frames_to_matrix` |
 | `bpms_1d` | `(grid²,)` float32 | Interpolated BPM at each cell, row-major order |
 | `control_points` | `(N, 2)` float32 | Full anchor positions at render time, including hidden anchor 0 if applicable |
-| `sequence_length` | scalar int | Fixed token sequence length per cell (always 256) |
+| `sequence_length` | scalar int | Frames per cell (= `max_seq_len`, 128 by default) |
 | `grid_resolution` | scalar int | Grid cells per axis |
 | `traversal_order` | str | Always `"row_major"` (top-left to bottom-right, row by row) |
 | `bpm_interp_mode` | str | `"gaussian_blend"` or `"exact_rbf"` |
@@ -402,6 +404,12 @@ data = np.load("outputs/branch/field_render_2026-04-23_14-30-00.npz")
 | `total_points` | scalar int | Total cells rendered (`grid_resolution²`) |
 | `branch` | str | Git branch name at render time |
 | `timestamp` | str | Render start time, `YYYY-MM-DD_HH-MM-SS` (Europe/Berlin timezone) |
+| `token_format` | str | `"compound_v1"` |
+| `field_names`, `field_vocab_sizes` | `(4,)` | `step, pitch, velocity, deviation` and `[35, 57, 35, 36]` |
+| `n_specials`, `pad_token`, `sos_token`, `eos_token`, `center_timing` | scalar int | `3`, `0`, `1`, `2`, `16` (raw deviation of an on-grid note) |
+| `width`, `height`, `n_pitch`, `n_vel`, `n_timing`, `max_seq_len`, `dataset_name` | scalar | Format and model metadata of the render |
+
+Older exports (`sequences_1d`, `*_token` keys) were written in the flat triplet format and cannot be read with the compound codec.
 
 ### Reconstructing grid coordinates
 
@@ -419,10 +427,12 @@ xs = -h + (np.arange(g) + 0.5) * cell_size   # col → x coordinate
 ### Reconstructing sequences per cell
 
 ```python
-seqs = data["sequences_1d"].reshape(g * g, int(data["sequence_length"]))
+from modules import compound
+seqs = data["sequences"]       # shape (g*g, max_seq_len, 4)
 bpms = data["bpms_1d"]          # shape (g*g,)
 cell_idx = row * g + col        # row-major index
-cell_seq = seqs[cell_idx]       # token sequence for that cell
+cell_seq = seqs[cell_idx]       # compound frames for that cell
+cell_notes = compound.frames_to_notes(cell_seq)   # [{step, pitch, vel, shift, ...}, ...]
 cell_bpm = bpms[cell_idx]
 ```
 
@@ -477,7 +487,7 @@ The page has two tabs: **Latent Field** (inference, unchanged) and **Training**.
 | Model | `d_model`, `n_heads`, `n_layers`, `ff_dim`, `dropout`, `latent_dim`, `n_memory_tokens` |
 | Options | `torch_compile` (default on when CUDA and a C compiler exist), event interval |
 
-Token vocabulary and `ranges` are not editable. The values shown are read fresh from `hparams.py`.
+The compound token format (`field_sizes`, `field_vocab_sizes`, `max_seq_len`, `field_loss_weights`, `token_format`) is not editable in the GUI; change it in `hparams.py`. The values shown are read fresh from `hparams.py`. Only compound datasets are offered; legacy (triplet) datasets are rejected with a field error, and resuming from a legacy checkpoint fails with a clear message (§15.4). The extra chart *Reconstruction error per field* shows the cross entropy of the step, pitch, velocity and deviation heads per epoch.
 
 **Modes:** *New* starts from scratch. *Resume / retrain* loads a checkpoint (`last`, `best_val`, `best_train`, `none`) including optimizer and scheduler state. In resume mode only fields you changed override the checkpoint's values; the architecture fields are locked and come from the checkpoint. Extra options: keep beta constant, warm-start LR, end-LR factor.
 
@@ -616,6 +626,78 @@ Saving meta info rewrites the file atomically (temp file + `os.replace`); the se
 4. After a finished job the banner names the new dataset, which is selected automatically; it appears in the list, in the merge list, in the augment source menu and (after a moment) in the Training tab's dataset menu.
 5. Statistics: five charts are drawn, hovering a bar shows its value; resizing the window redraws them.
 6. Meta info: edit description, tags, notes and custom fields, *Save meta info*, reload the page and select the dataset again — the values are still there.
-7. Sequence viewer: slider, ◀ ▶, arrow keys and *Random* change the piano roll and the info line (file, window, BPM, notes, tokens).
+7. Sequence viewer: slider, ◀ ▶, arrow keys and *Random* change the piano roll and the info line (file, window, BPM, notes, frames incl. EOS).
 8. Playback: *Connect MIDI* (Chrome/Edge, `http://localhost`), choose a port, channel 10, *Start playback* — notes arrive on the port, the playhead runs, *Stop* silences everything; with *Browser synth* a click track is audible. Leaving the tab stops playback.
 9. Start the server without any dataset: the tab shows "no dataset found"; extraction still works and creates the first dataset.
+
+---
+
+## 15. Compound Token Format
+
+The whole pipeline (Dataset tab, training, Latent Field) uses **compound tokens** (`token_format = "compound_v1"`). One frame describes exactly one note; the former flat triplet stream (`pitch, velocity, timing` + `STEP` tokens, 256 tokens, vocabulary 123) is gone. All offsets, sorting and matrix mapping live in one place: `src/modules/compound.py`.
+
+### 15.1 Frame layout
+
+| Field (tensor order) | Raw value | Index in the frame | Vocabulary |
+|---|---|---|---|
+| `step` | 0–31 (absolute 16th in the 2-bar window) | raw + 3 | 35 |
+| `pitch` | 0–53 (chromatic drum row) | raw + 3 | 57 |
+| `velocity` | 0–31 | raw + 3 | 35 |
+| `deviation` | 0–32 (center 16 = on the grid) | raw + 3 | 36 |
+
+Every field has its own index space: `PAD = 0`, `SOS = 1`, `EOS = 2`; a special frame carries the id in all four fields. A sequence holds the note frames sorted by `(step, pitch)`, one EOS frame and PAD frames up to `max_seq_len` (128, set in `hparams.py`). Notes with the same `(step, pitch)` in a window are merged (loudest velocity wins, e.g. flams). Windows with more than `max_seq_len - 1` notes are cut after time; their number is shown in the extraction log and in the dataset statistics (*Truncated sequences*). SOS is only prepended as decoder input. The matrix mapping is unchanged: column = `step * n_timing + (deviation - center)`, note length `n_timing // 2`, wrapped at the window end.
+
+### 15.2 Files
+
+- Dataset `.npz`: `data` `(N, max_seq_len, 4)` int16, `metadata` `(file name, window, BPM)`, `info` JSON with `token_format`, `field_names`, `field_vocab_sizes`, `n_specials`, `max_seq_len`.
+- Checkpoints: `hparams` contains `token_format`, `field_vocab_sizes`, `field_loss_weights`.
+- Render export: see §10.
+
+### 15.3 Model
+
+- Input embedding: sum of four field embeddings (`FieldEmbedding`, scaled by `1/sqrt(4)`) plus the learned position embedding over the frame index; there is no beat embedding anymore (the position in the window is the step field).
+- Encoder: padding mask from the step field, CLS pooling, `fc_mu` / `fc_logvar` as before.
+- Decoder: one `Linear(d_model, 163)` split into the four heads (`field_slices`), KV-cache (`init_cache`, `decode_step(frame)`), `pick_frame`, `generate` → `[B, L, 4]`.
+- Loss: sum of the per field cross entropies (weights `field_loss_weights`), averaged over non-PAD frames; on EOS frames only the step head counts. KL is normalised per frame. Training events and the CSV log contain the cross entropy per field; the Training tab shows it as an extra chart (solid = train, dashed = val) and in the status line.
+
+### 15.4 Legacy data and models
+
+- Datasets in the old 2D format appear in the Dataset tab as `legacy (triplet)`: they can be viewed (list, size), but statistics and piano roll are empty, and they cannot be merged, augmented, trained or used for inference. `load_dataset` rejects them with "legacy triplet dataset, re-extract it in the Dataset tab". The Training tab and the Latent Field only list compound datasets; if only legacy datasets exist the banner says so.
+- Checkpoints without `token_format = "compound_v1"` are rejected by `load_model` before `load_state_dict` (`LegacyCheckpointError`); the server stays idle and shows the message in the banner. They still appear in the checkpoint menu.
+- Encode MIDI accepts `{matrix}`, `{frames: [[s,p,v,d], ...]}` or a list of frames; flat token lists raise an error.
+
+### 15.5 Not migrated (follow-up work)
+
+The offline scripts still use the flat triplet format and do not run with compound models: `evaluation*.py`, `inference*.py`, `rbf.py`, `rbf_interpolation*.py`, `convert_to_onnx.py` / `ONNXWrapper`, `midi_mapping_visualizer*.py` and the older tests `tests/test_0*.py`, `tests/test.py`, `tests/onnx_test_*.py`, `tests/test_emptytokenlist.py`.
+
+### 15.6 Tests
+
+- `python tests/test_compound_codec.py` — codec, sorting, duplicates, truncation, matrix equality with the former triplet parser, matrix round trip.
+- `python tests/test_compound_model.py` — field embedding, KV-cache vs. `forward` (post- and pre-norm), batch vs. single, `pick_frame` edge cases, loss masks, legacy checkpoint check, overfit on 8 sequences.
+- `python tests/test_compound_pipeline.py` — idle start, extraction from `midifiles/`, mini training through the server, bootstrap ready, realtime decode, 4×4 render export, Encode MIDI.
+- Adjusted: `tests/test_kv_cache.py`, `tests/test_dataset_tools.py`, `tests/test_dataset_server.py`, `tests/test_training_stop.py`, `tests/test_train_server.py`.
+
+### 15.7 Manual checklist (compound)
+
+1. Dataset tab: extract a MIDI folder; the summary shows *Token format compound_v1*, *Frames / sequence* and *Truncated sequences*; the piano roll and playback work.
+2. An old dataset is listed in grey as `legacy (triplet)`, cannot be ticked in the merge list and is missing in the augment source menu and in the Training tab.
+3. Training tab: start a run on the new dataset; the chart *Reconstruction error per field* and the status line `field CE: …` update per epoch.
+4. Latent Field: with the new checkpoint the banner disappears; decoding fills the piano roll note by note; a full-field render writes `field_render_*.npz` with `sequences` `[N, 128, 4]`.
+5. Select an old checkpoint: the banner shows the legacy message and the field stays idle; switching back to a compound checkpoint restores inference.
+
+
+## 16. Reconstruction Viewer (Latent Field tab)
+
+The Latent Field tab uses two columns of equal width (50:50). Long texts wrap, so the XY field keeps its size while a render runs.
+
+The *Reconstruction* view is a piano roll in the style of *Dataset > Sequence viewer*:
+
+- The server sends the decoded note matrix (`decoded_matrix`) plus `pitch_labels` and `generic_pitches` (chromatic index -> generic MIDI note). The browser recovers the notes with the same onset rule as `compound.matrix_to_notes`.
+- **Pitch range** (default 24) sets the shown rows `0 .. range-1`. If notes above the range are generated, an orange warning appears above the canvas and a small `above range` marker in the plot. Those notes are still played.
+- **Fold piano roll** shows only the used pitches inside the range.
+- **MIDI playback** has the same controls as the Sequence viewer: output port (Web MIDI or browser synth), channel, pitch mapping, BPM override (empty = BPM interpolated at the cursor), loop, quantize (0-100 %, applied live) and Start/Stop. While playing, the notes follow the live reconstruction (cursor moves, decoding progress) and continue at the current position. Leaving the tab stops playback.
+- **Show / Anchor point** choose what the piano roll and the playback use: `Reconstruction only` (default), `Original anchor only` (the notes of the dataset sequence the selected anchor was encoded from, orange) or `Anchor + reconstruction` (anchor as orange translucent outline behind the teal reconstruction; both are played). The anchor works without *Decode*. The list shows the anchors that are visible in the field (anchor 0 is hidden in the "Anchor 0 fallback" modes). Pitch range, fold, quantize and playback apply to the anchor notes as well.
+- The server sends the original anchor notes as raw frames `[step, pitch, velocity, deviation]` (`anchor_notes`) together with `pool_version`, `n_vel`. They are only included when the client's `anchor_notes_version` (sent in every frame payload) differs from the current `pool_version`, i.e. after a dataset / sample change.
+- The settings are stored in the browser (`localStorage`, keys `rc.*`).
+
+Manual check: turn on *Decode*, move the cursor, change *Pitch range* (e.g. 12 to see the warning), start playback and move the quantize slider. Then set *Show* to `Original anchor only`, pick other anchors, switch to `Anchor + reconstruction` and start playback.

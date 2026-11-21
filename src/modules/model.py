@@ -27,6 +27,48 @@ def kl_divergence(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     return -0.5 * torch.sum(1.0 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
 
 
+N_FRAME_FIELDS = 4
+N_SPECIAL_IDS = 3  # 0 = PAD, 1 = SOS, 2 = EOS in every field; raw values start at this offset
+
+
+def field_vocab_sizes_of(_hparams: SimpleNamespace) -> list:
+    """Vocabulary size per frame field (step, pitch, velocity, deviation) incl. the 3 special ids."""
+    sizes = getattr(_hparams, 'field_vocab_sizes', None)
+    if sizes:
+        return [int(s) for s in sizes]
+    return [int(_hparams.width) + N_SPECIAL_IDS, int(_hparams.n_pitch) + N_SPECIAL_IDS,
+            int(_hparams.n_vel) + N_SPECIAL_IDS, int(_hparams.n_timing) + N_SPECIAL_IDS]
+
+
+def field_slices_of(field_vocab_sizes) -> list:
+    """(start, end) of every field inside the concatenated output logits."""
+    slices, start = [], 0
+    for size in field_vocab_sizes:
+        slices.append((start, start + int(size)))
+        start += int(size)
+    return slices
+
+
+class FieldEmbedding(nn.Module):
+    """Sum of one embedding per frame field, scaled by 1/sqrt(n_fields). frames: [..., 4] -> [..., d_model].
+
+    The absolute position inside the 2-bar window is carried by the step field.
+    """
+
+    def __init__(self, field_vocab_sizes, d_model: int, pad_token: int = 0):
+        super().__init__()
+        self.embeddings = nn.ModuleList(
+            nn.Embedding(int(size), int(d_model), padding_idx=pad_token) for size in field_vocab_sizes
+        )
+        self.scale = 1.0 / math.sqrt(len(self.embeddings))
+
+    def forward(self, frames: torch.Tensor) -> torch.Tensor:
+        out = self.embeddings[0](frames[..., 0])
+        for i in range(1, len(self.embeddings)):
+            out = out + self.embeddings[i](frames[..., i])
+        return out * self.scale
+
+
 class Encoder(nn.Module):
     def __init__(self, _hparams: SimpleNamespace):
         super().__init__()
@@ -35,13 +77,11 @@ class Encoder(nn.Module):
         self.d_model = int(_hparams.d_model)
         self.n_layers = int(_hparams.n_layers)
         self.latent_dim = _hparams.latent_dim
-        self.n_tokens = _hparams.vocab_size
         self.max_seq_len = int(_hparams.max_seq_len)
+        self.pad_token = int(getattr(_hparams, 'pad_token', 0))
+        self.field_vocab_sizes = field_vocab_sizes_of(_hparams)
 
-        beat_emb_dim = _hparams.total_steps // 2
-        self.embedding = nn.Embedding(_hparams.vocab_size, self.d_model)
-        self.beat_embedding = nn.Embedding(_hparams.total_steps, beat_emb_dim)
-        self.projection = nn.Linear(self.d_model+beat_emb_dim, self.d_model)
+        self.embedding = FieldEmbedding(self.field_vocab_sizes, self.d_model, self.pad_token)
         # Rotary Positional Embedding
         # self.positional_embedding = RotaryPositionalEmbeddings(self.h_dim)
         self.positional_embedding = nn.Embedding(self.max_seq_len, self.d_model)
@@ -57,58 +97,29 @@ class Encoder(nn.Module):
 
         # Learnable [CLS] token embedding
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.d_model))
-        # Output Projection
-        self.out = nn.Linear(self.d_model, self.d_model)
         self.fc_mu = nn.Linear(self.d_model, _hparams.latent_dim)
         self.fc_logvar = nn.Linear(self.d_model, _hparams.latent_dim)
 
-    def scalars_to_normalized_tensor(self, v: torch.Tensor, total_steps: float, length: int):
-        # v: [B] (float or int)
-        v = v.to(torch.float32)
-        norm = (v / max(1.0, float(total_steps))).clamp(0.0, 1.0)  # [B]
-        return norm.unsqueeze(1).expand(-1, length)  # [B, length]
-
-    def forward(self, x, beat_tokens):
-        src_key_padding_mask = (x == 0)
-        x = self.embedding(x)
-
-        # beat tokens as concatenated vector, then projected to d_model
-        beat_tokens = self.beat_embedding(beat_tokens)
-        x = torch.cat((x, beat_tokens), dim=-1)
-        x = self.projection(x)
-
-        # # beat tokens as added vector
-        # x = x + beat_tokens
-        # Create tgt_key_padding_mask where tokens equal to 0 are masked
-
-        # print(src_key_padding_mask)
+    def forward(self, frames):
+        """frames: [B, T, 4] (step, pitch, velocity, deviation) -> mu, logvar [B, latent_dim]."""
+        # PAD frames (step field == PAD) are ignored by the attention.
+        src_key_padding_mask = (frames[..., 0] == self.pad_token)
+        x = self.embedding(frames)
 
         pos_emb = self.positional_embedding(torch.arange(x.shape[1], device=x.device)).unsqueeze(0)
-        x += pos_emb
-
-        ## rotary positional embedding
-        # x = x.view(x.shape[0], x.shape[1], self.n_heads, self.h_dim)
-        # x = self.positional_embedding(x)
-        # x = x.view(x.shape[0], x.shape[1], self.d_model)
-
+        x = x + pos_emb
 
         # Expand cls token for batch
         cls_tokens = self.cls_token.expand(x.size(0), -1, -1)  # [batch, 1, d_model]
         x = torch.cat((cls_tokens, x), dim=1)  # Result: (batch, seq_len + 1, d_model)
-        # print('x shape                   : ', x.shape)
 
         # Add column of False to the mask for the CLS token
         cls_padding = torch.zeros(src_key_padding_mask.size(0), 1, dtype=torch.bool, device=src_key_padding_mask.device)
         src_key_padding_mask = torch.cat((cls_padding, src_key_padding_mask), dim=1)
-        # print('src_key_padding_mask shape: ', src_key_padding_mask.shape)
 
         x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
         # Extract CLS representation
         x = x[:, 0, :]  # [batch, d_model]
-
-        # cls_token = self.cls_token.expand(x.shape[0], -1, -1)
-        # x = torch.cat((cls_token, x), dim=1)
-        # x = self.out(cls_repr)
         mu = self.fc_mu(x)
         logvar = self.fc_logvar(x)
         return mu, logvar
@@ -117,18 +128,17 @@ class Encoder(nn.Module):
 
 # ------------------------- Transformer Decoder -------------------------
 class Decoder(nn.Module):
+    """Autoregressive frame decoder with four parallel output heads (one per field on the same state)."""
+
     def __init__(self, _hparams: SimpleNamespace):
         super().__init__()
-        self.vocab_size = _hparams.vocab_size
         self.emb_size = int(_hparams.d_model)
-        self.sos_token = _hparams.sos_token
-        self.eos_token = _hparams.eos_token
-        self.pad_token = _hparams.pad_token
-        self.step_token = _hparams.step_token
-        self.token_embedding = nn.Embedding(self.vocab_size, self.emb_size, padding_idx=_hparams.pad_token)
-        beat_emb_dim = self.emb_size//2
-        self.beat_embedding = nn.Embedding(_hparams.total_steps, beat_emb_dim)
-        self.projection = nn.Linear(self.emb_size + beat_emb_dim, self.emb_size)
+        self.sos_token = int(_hparams.sos_token)
+        self.eos_token = int(_hparams.eos_token)
+        self.pad_token = int(_hparams.pad_token)
+        self.field_vocab_sizes = field_vocab_sizes_of(_hparams)
+        self.field_slices = field_slices_of(self.field_vocab_sizes)
+        self.token_embedding = FieldEmbedding(self.field_vocab_sizes, self.emb_size, self.pad_token)
         self.pos_embedding = nn.Embedding(_hparams.max_seq_len, self.emb_size)
 
         decoder_layer = nn.TransformerDecoderLayer(d_model=self.emb_size, nhead=_hparams.n_heads, dim_feedforward=_hparams.ff_dim, batch_first=True)
@@ -136,31 +146,34 @@ class Decoder(nn.Module):
 
         self.n_memory_tokens = getattr(_hparams, 'n_memory_tokens', 1)
         self.z_to_mem = nn.Linear(_hparams.latent_dim, self.emb_size * self.n_memory_tokens)
-        self.fc_out = nn.Linear(self.emb_size, self.vocab_size)
+        # One linear layer for all heads; the logits are split per field with field_slices.
+        self.fc_out = nn.Linear(self.emb_size, sum(self.field_vocab_sizes))
         self.max_seq_len = _hparams.max_seq_len
 
-    def forward(self, tgt_tokens, z, beat_tokens):
-        B, T = tgt_tokens.size()
-        # if T > self.max_seq_len:
-        #     raise ValueError(f"T={T} > max_seq_len={self.max_seq_len}")
+    def split_logits(self, logits: torch.Tensor) -> list:
+        """[..., sum(field_vocab_sizes)] -> list of 4 tensors [..., field_vocab_size]."""
+        return [logits[..., s:e] for s, e in self.field_slices]
 
-        emb = self.token_embedding(tgt_tokens)
-        beat_emb = self.beat_embedding(beat_tokens)
-        emb = self.projection(torch.cat((emb, beat_emb), dim=-1))
-        pos_emb = self.pos_embedding(torch.arange(T, device=tgt_tokens.device)).unsqueeze(0)
-        emb += pos_emb
-        # emb = emb + pos_emb
+    def special_frame(self, kind_id: int, batch: int, device) -> torch.Tensor:
+        return torch.full((batch, N_FRAME_FIELDS), int(kind_id), dtype=torch.long, device=device)
 
+    def forward(self, tgt_frames, z):
+        """tgt_frames: [B, T, 4] decoder input (SOS frame first), z: [B, latent_dim] -> logits [B, T, sum]."""
+        B, T = tgt_frames.shape[:2]
+
+        emb = self.token_embedding(tgt_frames)
+        pos_emb = self.pos_embedding(torch.arange(T, device=tgt_frames.device)).unsqueeze(0)
+        emb = emb + pos_emb
 
         memory = self.z_to_mem(z).view(B, self.n_memory_tokens, self.emb_size)
-        tgt_mask = nn.Transformer.generate_square_subsequent_mask(T).to(tgt_tokens.device)
-        tgt_key_padding_mask = (tgt_tokens == self.pad_token).float()
+        tgt_mask = nn.Transformer.generate_square_subsequent_mask(T).to(tgt_frames.device)
+        tgt_key_padding_mask = (tgt_frames[..., 0] == self.pad_token).float()
         out = self.transformer_decoder(tgt=emb, memory=memory, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask)
         logits = self.fc_out(out)
         return logits
 
     # ------------------------- KV-cache incremental decoding -------------------------
-    # The functions below mirror `forward` (post-norm / pre-norm nn.TransformerDecoderLayer) for one new token
+    # The functions below mirror `forward` (post-norm / pre-norm nn.TransformerDecoderLayer) for one new frame
     # at a time. Self-attention keys/values of all previous positions and the cross-attention keys/values of
     # the latent memory are cached, so every step costs O(T) instead of re-running the whole sequence.
     # They are meant for inference (eval mode, no dropout).
@@ -186,34 +199,26 @@ class Decoder(nn.Module):
             'mem_kv': mem_kv,
             'self_kv': [None] * len(mem_kv),
             'pad_bias': torch.zeros(B, 1, 1, 0, dtype=memory.dtype, device=memory.device),
-            'n_steps': torch.zeros(B, dtype=torch.long, device=memory.device),
             'pos': 0,
         }
 
     @torch.no_grad()
-    def decode_step(self, tokens: torch.Tensor, cache: dict) -> torch.Tensor:
-        """Feed one token per sequence (tokens: [B]) and return the next-token logits [B, vocab].
+    def decode_step(self, frame: torch.Tensor, cache: dict) -> torch.Tensor:
+        """Feed one frame per sequence (frame: [B, 4]) and return the logits of the next frame [B, sum].
 
-        The first call must feed the SOS token. Beat tokens are tracked inside the cache
-        (0 for the first position, afterwards 1 + number of STEP tokens seen so far).
+        The first call must feed the SOS frame.
         """
         pos = cache['pos']
         if pos >= self.max_seq_len:
             raise ValueError(f"pos={pos} >= max_seq_len={self.max_seq_len}")
-        B = tokens.size(0)
+        B = frame.size(0)
         D = self.emb_size
 
-        cache['n_steps'] = cache['n_steps'] + (tokens == self.step_token).to(torch.long)
-        if pos == 0:
-            beat = torch.zeros_like(tokens)
-        else:
-            beat = (cache['n_steps'] + 1).clamp(max=self.beat_embedding.num_embeddings - 1)
-
-        x = self.projection(torch.cat((self.token_embedding(tokens), self.beat_embedding(beat)), dim=-1))
+        x = self.token_embedding(frame)
         x = (x + self.pos_embedding.weight[pos]).unsqueeze(1)  # [B, 1, D]
 
         # Same quirk as the training path: the float padding mask is added to the attention scores.
-        pad_now = (tokens == self.pad_token).to(x.dtype).view(B, 1, 1, 1)
+        pad_now = (frame[:, 0] == self.pad_token).to(x.dtype).view(B, 1, 1, 1)
         pad_bias = torch.cat((cache['pad_bias'], pad_now), dim=-1)
         cache['pad_bias'] = pad_bias
 
@@ -257,43 +262,91 @@ class Decoder(nn.Module):
         cache['pos'] = pos + 1
         return self.fc_out(x[:, 0, :])
 
-    @torch.no_grad()
-    def generate(self, z, max_len=None, temperature=1.0, sample=False, pad_after_eos=True):
-        """Batched autoregressive generation with KV-cache. Returns tokens [B, L] (without SOS).
+    @staticmethod
+    def _choose(logits: torch.Tensor, invalid: torch.Tensor, sample: bool, temperature: float) -> torch.Tensor:
+        logits = logits.float().masked_fill(invalid, float('-inf'))
+        if sample:
+            probs = F.softmax(logits / max(1e-8, float(temperature)), dim=-1)
+            return torch.multinomial(probs, num_samples=1).squeeze(1)
+        return torch.argmax(logits, dim=-1)
 
-        With `pad_after_eos=True` finished sequences are filled with PAD after their EOS token,
-        otherwise they keep generating (legacy behaviour of `sample`).
+    @torch.no_grad()
+    def pick_frame(self, logits: torch.Tensor, prev_frame: torch.Tensor | None = None, sample: bool = False,
+                   temperature: float = 1.0, constrained: bool = True) -> torch.Tensor:
+        """Choose the next frame [B, 4] from the parallel head logits [B, sum].
+
+        Fields are chosen in the order step -> pitch -> velocity / deviation. PAD and SOS are never chosen,
+        EOS only in the step field (an EOS step gives an EOS frame). With ``constrained`` (default) the step
+        never falls below the previous note's step, and at the same step the pitch must rise above the previous
+        pitch. If no higher pitch is left, the same step is blocked too (next step or EOS).
+        """
+        step_l, pitch_l, vel_l, dev_l = self.split_logits(logits)
+        B, device = logits.size(0), logits.device
+        eos = self.eos_token
+
+        step_idx = torch.arange(step_l.size(-1), device=device)
+        pitch_idx = torch.arange(pitch_l.size(-1), device=device)
+        step_invalid = ((step_idx < N_SPECIAL_IDS) & (step_idx != eos)).unsqueeze(0).expand(B, -1)
+        pitch_invalid = (pitch_idx < N_SPECIAL_IDS).unsqueeze(0).expand(B, -1)
+
+        if constrained and prev_frame is not None:
+            prev_frame = prev_frame.to(device=device, dtype=torch.long)
+            prev_step, prev_pitch = prev_frame[:, 0], prev_frame[:, 1]
+            is_note = (prev_step >= N_SPECIAL_IDS) & (prev_pitch >= N_SPECIAL_IDS)
+            no_pitch_left = is_note & (prev_pitch >= pitch_l.size(-1) - 1)
+            falls = is_note.unsqueeze(1) & (step_idx.unsqueeze(0) < prev_step.unsqueeze(1)) & (step_idx.unsqueeze(0) != eos)
+            same_blocked = no_pitch_left.unsqueeze(1) & (step_idx.unsqueeze(0) == prev_step.unsqueeze(1))
+            step_invalid = step_invalid | falls | same_blocked
+        step = self._choose(step_l, step_invalid, sample, temperature)
+
+        if constrained and prev_frame is not None:
+            same_step = is_note & (step == prev_step)
+            not_rising = same_step.unsqueeze(1) & (pitch_idx.unsqueeze(0) <= prev_pitch.unsqueeze(1))
+            pitch_invalid = pitch_invalid | not_rising
+        pitch = self._choose(pitch_l, pitch_invalid, sample, temperature)
+
+        vel_invalid = (torch.arange(vel_l.size(-1), device=device) < N_SPECIAL_IDS).unsqueeze(0).expand(B, -1)
+        dev_invalid = (torch.arange(dev_l.size(-1), device=device) < N_SPECIAL_IDS).unsqueeze(0).expand(B, -1)
+        vel = self._choose(vel_l, vel_invalid, sample, temperature)
+        dev = self._choose(dev_l, dev_invalid, sample, temperature)
+
+        frame = torch.stack((step, pitch, vel, dev), dim=1)
+        is_eos = (step == eos).unsqueeze(1)
+        return torch.where(is_eos, torch.full_like(frame, eos), frame)
+
+    @torch.no_grad()
+    def generate(self, z, max_len=None, temperature=1.0, sample=False, constrained=True, pad_after_eos=True):
+        """Batched autoregressive generation with KV-cache. Returns frames [B, L, 4] (without SOS).
+
+        With `pad_after_eos=True` finished sequences are filled with PAD frames after their EOS frame.
         """
         device = z.device
         B = z.size(0)
         max_len = int(self.max_seq_len if max_len is None else max_len)
         cache = self.init_cache(z)
-        cur = torch.full((B,), self.sos_token, dtype=torch.long, device=device)
+        cur = self.special_frame(self.sos_token, B, device)
         finished = torch.zeros(B, dtype=torch.bool, device=device)
-        pad = torch.full((B,), self.pad_token, dtype=torch.long, device=device)
+        pad = self.special_frame(self.pad_token, B, device)
         out = []
         for _ in range(max_len):
             if cache['pos'] >= self.max_seq_len or finished.all():
                 break
-            logits = self.decode_step(cur, cache) / max(1e-8, temperature)
-            if sample:
-                nxt = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1).squeeze(1)
-            else:
-                nxt = torch.argmax(logits, dim=-1)
+            logits = self.decode_step(cur, cache)
+            nxt = self.pick_frame(logits, cur, sample=sample, temperature=temperature, constrained=constrained)
             if pad_after_eos:
-                nxt = torch.where(finished, pad, nxt)
-            finished = finished | (nxt == self.eos_token)
+                nxt = torch.where(finished.unsqueeze(1), pad, nxt)
+            finished = finished | (nxt[:, 0] == self.eos_token)
             out.append(nxt)
             cur = nxt
         if not out:
-            return torch.zeros((B, 0), dtype=torch.long, device=device)
+            return torch.zeros((B, 0, N_FRAME_FIELDS), dtype=torch.long, device=device)
         return torch.stack(out, dim=1)
 
     @torch.no_grad()
-    def sample(self, z, max_len, temperature=1.0, sample=True, device=None):
+    def sample(self, z, max_len, temperature=1.0, sample=True, device=None, constrained=True):
         device = device or next(self.parameters()).device
         z = z.to(device)
-        return self.generate(z, max_len=max_len, temperature=temperature, sample=sample, pad_after_eos=False)
+        return self.generate(z, max_len=max_len, temperature=temperature, sample=sample, constrained=constrained)
 
 
 # ------------------------- VAE wrapper -------------------------
@@ -303,42 +356,22 @@ class TransformerVAE(nn.Module):
         self.encoder = Encoder(_hparams)
         self.decoder = Decoder(_hparams)
         self.latent_dim = _hparams.latent_dim
-        self.step_token = _hparams.step_token
-        self.pad_token = _hparams.pad_token
+        self.pad_token = int(_hparams.pad_token)
+        self.eos_token = int(_hparams.eos_token)
 
-    def forward(self, tokens):
-        B, T = tokens.size()
-        sos = torch.full((B, 1), self.decoder.sos_token, dtype=torch.long, device=tokens.device)
-        decoder_input = torch.cat([sos, tokens[:, :-1]], dim=1)
-        # mask the input eos token
-        decoder_input[decoder_input == 2] = 0
-        # decoder_input = torch.where(decoder_input == 2, torch.zeros_like(decoder_input), decoder_input)
-        beat_tokens_enc = make_beat_tokens(
-            tokens,
-            step_token=int(self.step_token),
-            pad_token=int(self.pad_token),
-            total_steps=int(self.decoder.beat_embedding.num_embeddings),
-        )
+    def forward(self, frames):
+        """frames: [B, T, 4] -> logits [B, T, sum(field_vocab_sizes)], mu, logvar."""
+        B = frames.size(0)
+        sos = torch.full((B, 1, N_FRAME_FIELDS), self.decoder.sos_token, dtype=torch.long, device=frames.device)
+        decoder_input = torch.cat([sos, frames[:, :-1]], dim=1)
+        # EOS frames in the decoder input become PAD frames
+        is_eos = (decoder_input[..., 0] == self.eos_token).unsqueeze(-1)
+        decoder_input = decoder_input.masked_fill(is_eos, self.pad_token)
 
-        beat0 = torch.zeros((B, 1), dtype=torch.long, device=tokens.device)
-        beat_tokens_dec = torch.cat([beat0, beat_tokens_enc[:, :-1]], dim=1)
-
-        # print('enc input shape: ', tokens.shape)
-        mu, logvar = self.encoder(tokens, beat_tokens_enc)
+        mu, logvar = self.encoder(frames)
         z = reparameterize(mu, logvar)
-        logits = self.decoder(decoder_input, z, beat_tokens_dec)
+        logits = self.decoder(decoder_input, z)
         return logits, mu, logvar
-
-    # def make_beat_tokens(self, tokens: torch.Tensor, step_token: int, pad_token: int) -> torch.Tensor:
-    #     # tokens: [B, T] (long)
-    #     is_step = (tokens == step_token).to(torch.long)  # [B, T] in {0,1}
-    #     beat_tokens = torch.cumsum(is_step, dim=1)  # [B, T]
-    #     beat_tokens += 1
-    #     beat_tokens[:,0] = 0
-    #     # padding with zeros
-    #     pad_mask = (tokens == pad_token)
-    #     beat_tokens = beat_tokens.masked_fill(pad_mask, 0)
-    #     return beat_tokens
 
     @torch.no_grad()
     def sample(self, z=None, max_len=128, temperature=1.0, sample=True, device=None):
@@ -355,97 +388,72 @@ class EncoderWrapper(nn.Module):
         self.hparams = hparams
         self.return_numpy = return_numpy
 
-    def forward(self, tokens):
-        if not torch.is_tensor(tokens):
-            tokens = torch.tensor(tokens, dtype=torch.long, device=next(self.encoder.parameters()).device)
+    def forward(self, frames):
+        """frames: [B, T, 4] compound frames -> mu."""
+        if not torch.is_tensor(frames):
+            frames = torch.tensor(frames, dtype=torch.long, device=next(self.encoder.parameters()).device)
         else:
-            tokens = tokens.to(device=next(self.encoder.parameters()).device, dtype=torch.long)
-
-        beat_tokens = make_beat_tokens(
-            tokens,
-            step_token=int(self.hparams.step_token),
-            pad_token=int(self.hparams.pad_token),
-            total_steps=int(self.hparams.total_steps),
-        )
-        mu, _ = self.encoder(tokens, beat_tokens)
+            frames = frames.to(device=next(self.encoder.parameters()).device, dtype=torch.long)
+        mu, _ = self.encoder(frames)
         if self.return_numpy:
             mu = mu.detach().cpu().numpy()
         return mu
 
 
 
-def make_beat_tokens(tokens: torch.Tensor, step_token: int, pad_token: int, total_steps: int) -> torch.Tensor:
-    # tokens: [B, T] (long)
-    is_step = (tokens == step_token).to(torch.long)  # [B, T] in {0,1}
-    beat_tokens = torch.cumsum(is_step, dim=1)  # [B, T]
-    beat_tokens += 1
-    beat_tokens[:, 0] = 0
-    beat_tokens = beat_tokens.clamp(min=0, max=max(int(total_steps) - 1, 0))
-    # padding with zeros
-    pad_mask = (tokens == pad_token)
-    beat_tokens = beat_tokens.masked_fill(pad_mask, 0)
-    return beat_tokens
-
-
-
 
 # ------------------------- Loss & Training helpers -------------------------
-def vae_losss(logits, targets, mu, logvar, beta=1.0, free_bits=0.0, pad_token=0):
-    B = targets.size(0)
-    T = targets.size(1)
-    recon = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=pad_token, reduction='sum') / (B * T)
-    # kl = kl_divergence(mu, logvar)
-    # kl = kl_divergence(mu, logvar)# .mean() / targets.size(1)  # Normalize by seq_len
-    # kl divergence:
-    kl = -0.5 * (1 + logvar - mu ** 2 - logvar.exp()).mean(dim=0)
+def vae_loss(logits, targets, mu, logvar, beta=1.0, free_bits=0.0, field_slices=None, field_weights=None,
+             pad_token=0, eos_token=2):
+    """Compound loss.
 
-    if free_bits > 0:
-        min_kl = free_bits # * mu.size(-1)
-        # kl = torch.clamp(kl / mu.size(-1), min=min_kl).mean()
-        kl = torch.clamp(kl, min=min_kl).mean()
-    else:
-        # kl = kl.mean() / mu.size(-1)
-        kl = kl.mean()
-    kl = beta * kl
-    loss = recon + kl
+    logits: [B, T, sum(field_vocab_sizes)], targets: [B, T, 4].
+    recon = sum over fields of w_f * CE_f, averaged over the non-PAD frames. On EOS frames only the step head is
+    trained (the other fields are ignored). KL is normalised per frame of each sequence.
+    Returns (total, recon, kl, perplexity, n_frames, field_ce[4]); field_ce is the mean CE per field over its
+    valid targets (detached) and perplexity = exp(mean(field_ce)).
+    """
+    n_fields = targets.size(-1)
+    if field_slices is None:
+        raise ValueError('field_slices are required (Decoder.field_slices)')
+    if field_weights is None:
+        field_weights = [1.0] * n_fields
 
+    step_targets = targets[..., 0]
+    frame_mask = step_targets != pad_token  # [B, T]
+    n_frames = frame_mask.sum().clamp(min=1)
+    n_frames_f = n_frames.to(logits.device, dtype=torch.float32)
+    is_eos = step_targets == eos_token
 
-    return loss, recon, kl
-
-def vae_loss(logits, targets, mu, logvar, beta=1.0, free_bits=0.0, pad_token=0):
-    B, T = targets.size()
-    logits_flat = logits.reshape(-1, logits.size(-1))
-    targets_flat = targets.reshape(-1)
-    mask = (targets_flat != pad_token)
-    token_count = mask.sum().clamp(min=1)  # int64, safe from float16 overflow
-    token_count_f = token_count.to(logits.device, dtype=logits.dtype)  # cast only for loss division
-    ce_sum = F.cross_entropy(logits_flat, targets_flat, ignore_index=pad_token, reduction="sum")
-    # loss per token
-    recon = ce_sum / token_count_f
+    recon = logits.new_zeros((), dtype=torch.float32)
+    field_ce = []
+    for f, (start, end) in enumerate(field_slices):
+        target_f = targets[..., f]
+        if f > 0:
+            target_f = target_f.masked_fill(is_eos, pad_token)
+        logits_f = logits[..., start:end].reshape(-1, end - start)
+        ce_sum = F.cross_entropy(logits_f.float(), target_f.reshape(-1), ignore_index=pad_token, reduction='sum')
+        count = (target_f != pad_token).sum().clamp(min=1).to(torch.float32)
+        recon = recon + float(field_weights[f]) * ce_sum / n_frames_f
+        field_ce.append((ce_sum / count).detach())
+    field_ce = torch.stack(field_ce)
 
     # Dimension-wise KL with per-dimension free bits
     kl_per_dim = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())  # [B, latent_dim]
     if free_bits > 0:
         kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)  # free bits per dimension
-    kl_per_sample = kl_per_dim.sum(dim=1)  # [B]
+    kl_per_sample = kl_per_dim.float().sum(dim=1)  # [B]
 
-    # number of valid tokens per sample
-    tokens_per_sample = (targets != pad_token).sum(dim=1).clamp(min=1).to(logits.dtype)  # [B]
-
-    # normalize KL per token
-    kl_per_token = kl_per_sample / tokens_per_sample  # [B]
-    kl = kl_per_token.mean()
+    # normalize KL per frame of every sequence
+    frames_per_sample = frame_mask.sum(dim=1).clamp(min=1).to(torch.float32)  # [B]
+    kl = (kl_per_sample / frames_per_sample).mean()
     kl = beta * kl
     total_loss = recon + kl
 
-    # info = (
-    #     f"CE/token: {recon.item():.4f} "
-    #     f"PPL: {torch.exp(torch.clamp(recon, max=20)).item():.4f} "
-    # )
     # Kept as a tensor so the training loop does not need a host sync per batch.
-    perplexity = torch.exp(torch.clamp(recon.detach(), max=20))
+    perplexity = torch.exp(torch.clamp(field_ce.mean(), max=20))
 
-    return total_loss, recon, kl, perplexity, token_count.float()
+    return total_loss, recon, kl, perplexity, n_frames.float(), field_ce
 
 
 def _atomic_torch_save(obj, path):
@@ -638,15 +646,30 @@ def train_vae(
     else:
         print("CPU mode - no hardware-specific optimizations")
 
+    # Compound frames: one cross entropy per field (step, pitch, velocity, deviation).
+    field_names = list(getattr(_hparams, 'field_names', None) or ['step', 'pitch', 'velocity', 'deviation'])
+    field_slices = raw_model.decoder.field_slices
+    field_weights = getattr(_hparams, 'field_loss_weights', None)
+    pad_token = int(_hparams.pad_token)
+    eos_token = int(_hparams.eos_token)
+
+    def _loss(logits, frames, mu, logvar, beta):
+        return vae_loss(logits, frames, mu, logvar, beta=beta, free_bits=free_bits, field_slices=field_slices,
+                        field_weights=field_weights, pad_token=pad_token, eos_token=eos_token)
+
+    def _fields_dict(values):
+        values = [float(v) for v in values]
+        return {name: values[i] for i, name in enumerate(field_names)}
+
     with open(log_file, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
             'epoch', 'batch_size', 'total_loss', 'reconstruction_loss', 'kl_loss',
-            'perplexity', 'avg_tokens_per_sequence', 'learning_rate', 'beta',
+            'perplexity', 'avg_frames_per_sequence', 'learning_rate', 'beta',
             'annealing_factor', 'val_total_loss', 'val_reconstruction_loss', 'val_kl_loss',
             'val_perplexity', 'epoch_time_seconds', 'elapsed_time_seconds',
             'remaining_time_seconds', 'saved_cache'
-        ])
+        ] + [f'ce_{name}' for name in field_names] + [f'val_ce_{name}' for name in field_names])
 
     def _log(text):
         print(text, flush=True)
@@ -727,6 +750,7 @@ def train_vae(
             'rec': torch.zeros((), device=device),
             'kl': torch.zeros((), device=device),
             'n_tokens': torch.zeros((), device=device),
+            'fields': torch.zeros(len(field_slices), device=device),
         }
         batch_iteration = 0
         prev_time = time.time()
@@ -749,7 +773,7 @@ def train_vae(
             if use_amp:
                 with autocast_ctx():
                     logits, mu, logvar = model(batch)
-                    loss, rec, kl, perplexity, token_count = vae_loss(logits, batch, mu, logvar, beta=weighted_beta, free_bits=free_bits, pad_token=_hparams.pad_token)
+                    loss, rec, kl, perplexity, token_count, field_ce = _loss(logits, batch, mu, logvar, weighted_beta)
 
                 if scaler is not None:
                     # fp16: scaled backward pass
@@ -766,7 +790,7 @@ def train_vae(
             else:
                 # Standard FP32 training
                 logits, mu, logvar = model(batch)
-                loss, rec, kl, perplexity, token_count = vae_loss(logits, batch, mu, logvar, beta=weighted_beta, free_bits=free_bits, pad_token=_hparams.pad_token)
+                loss, rec, kl, perplexity, token_count, field_ce = _loss(logits, batch, mu, logvar, weighted_beta)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -777,6 +801,7 @@ def train_vae(
             running['rec'] += rec.detach()
             running['kl'] += kl.detach()
             running['n_tokens'] += token_count.detach()
+            running['fields'] += field_ce.detach()
 
             if on_event is None:
                 print(f'\rEpoch {epoch:03d}/{epochs} | Step {batch_iteration:2d}/{n_batches} | step_time: {time_elapsed:.2f}s', end='')
@@ -797,6 +822,7 @@ def train_vae(
                     'beta': float(weighted_beta),
                     'lr': float(optimizer.param_groups[0]['lr']),
                     'step_time': step_time,
+                    'fields': _fields_dict(field_ce.detach().cpu().tolist()),
                 })
         print()
 
@@ -812,6 +838,7 @@ def train_vae(
                 'rec': torch.zeros((), device=device),
                 'kl': torch.zeros((), device=device),
                 'perplexity': torch.zeros((), device=device),
+                'fields': torch.zeros(len(field_slices), device=device),
             }
             with torch.no_grad():
                 for val_batch in val_loader:
@@ -821,24 +848,23 @@ def train_vae(
                     if use_amp:
                         with autocast_ctx():
                             logits, mu, logvar = model(val_batch)
-                            val_loss, val_rec, val_kl, val_perplexity, _ = vae_loss(
-                                logits, val_batch, mu, logvar, beta=weighted_beta,
-                                free_bits=free_bits, pad_token=_hparams.pad_token
-                            )
+                            val_loss, val_rec, val_kl, val_perplexity, _, val_field_ce = _loss(
+                                logits, val_batch, mu, logvar, weighted_beta)
                     else:
                         logits, mu, logvar = model(val_batch)
-                        val_loss, val_rec, val_kl, val_perplexity, _ = vae_loss(
-                            logits, val_batch, mu, logvar, beta=weighted_beta,
-                            free_bits=free_bits, pad_token=_hparams.pad_token
-                        )
+                        val_loss, val_rec, val_kl, val_perplexity, _, val_field_ce = _loss(
+                            logits, val_batch, mu, logvar, weighted_beta)
 
                     val_sums['loss'] += val_loss.detach()
                     val_sums['rec'] += val_rec.detach()
                     val_sums['kl'] += val_kl.detach()
                     val_sums['perplexity'] += val_perplexity.detach()
+                    val_sums['fields'] += val_field_ce.detach()
 
             n_val_batches = max(len(val_loader), 1)
+            val_fields = (val_sums.pop('fields') / n_val_batches).cpu().tolist()
             val_metrics = {k: float(v) / n_val_batches for k, v in val_sums.items()}
+            val_metrics['fields'] = _fields_dict(val_fields)
 
         now = time.time()
         epoch_time = now - prev_epoch_time
@@ -856,6 +882,7 @@ def train_vae(
             'kl': float(running['kl']) / n_batches,
             'ppl': float(perplexity),
             'n_tokens': float(running['n_tokens']),
+            'fields': _fields_dict((running['fields'] / n_batches).cpu().tolist()),
         }
         loss_history.append(train_epoch['loss'])
 
@@ -919,8 +946,10 @@ def train_vae(
         _log(f"Epoch {epoch}/{epochs} | Train Loss {train_epoch['loss']:.4f} | rec {train_epoch['rec']:.4f} | kl {train_epoch['kl']:.4f} | Epoch_time: {epoch_time:.2f}s | saved cache: {save_cache} | lr: {lr:.10f}")
         if val_metrics is not None:
             _log(f"Val Loss {val_metrics['loss']:.4f} | rec {val_metrics['rec']:.4f} | kl {val_metrics['kl']:.4f} | perplexity {val_metrics['perplexity']:.4f}")
-        avg_tokens = train_epoch['n_tokens'] / n_train_samples
-        print(f"Model Perplexity: {train_epoch['ppl']} | Avg tokens per sequence: {avg_tokens:.2f}")
+        avg_frames = train_epoch['n_tokens'] / n_train_samples
+        fields_text = ' | '.join(f"{name} {value:.4f}" for name, value in train_epoch['fields'].items())
+        _log(f"Field CE: {fields_text}")
+        print(f"Model Perplexity: {train_epoch['ppl']} | Avg frames per sequence: {avg_frames:.2f}")
 
         # print time elapsed and remaining
         elapsed_time = time.time() - train_start_time
@@ -937,7 +966,8 @@ def train_vae(
             'type': 'epoch',
             'epoch': epoch,
             'epochs': epochs,
-            'train': {k: train_epoch[k] for k in ('loss', 'rec', 'kl', 'ppl')},
+            'train': {k: train_epoch[k] for k in ('loss', 'rec', 'kl', 'ppl', 'fields')},
+            'avg_frames_per_sequence': avg_frames,
             'val': dict(val_metrics, ppl=val_metrics['perplexity']) if val_metrics is not None else None,
             'beta': float(weighted_beta),
             'lr': float(lr),
@@ -957,7 +987,7 @@ def train_vae(
                 f"{train_epoch['rec']:.6f}",
                 f"{train_epoch['kl']:.6f}",
                 f"{train_epoch['ppl']:.4f}",
-                f"{avg_tokens:.2f}",
+                f"{avg_frames:.2f}",
                 f"{lr:.10f}",
                 f"{weighted_beta:.6f}",
                 f"{weighted_beta:.6f}",
@@ -969,7 +999,8 @@ def train_vae(
                 f"{elapsed_time:.2f}",
                 f"{remaining_time:.2f}",
                 save_cache
-            ])
+            ] + [f"{v:.6f}" for v in train_epoch['fields'].values()]
+              + ([f"{v:.6f}" for v in val_metrics['fields'].values()] if val_metrics is not None else [''] * len(field_names)))
 
     if stopped:
         # Persist the exact stop state (mid-epoch) as resume checkpoint.

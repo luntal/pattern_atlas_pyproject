@@ -1,11 +1,11 @@
-"""Tokenized dataset augmentation utility.
+"""Compound token dataset augmentation utility.
 
-Loads tokenized rhythm sequences from an NPZ file in the data directory,
-applies several augmentation strategies, and saves the augmented tokenized
-dataset back to NPZ.
+Loads compound frame sequences ([N, T, 4] = step, pitch, velocity, deviation) from an NPZ file in the
+data directory, applies several augmentation strategies directly on the note fields, and saves the
+augmented dataset back to NPZ (frames are encoded with modules.compound).
 
 Augmentation types:
-- Random note removal: remove one note triplet at a time and save each step
+- Random note removal: remove up to three notes at a time and save each step
 	until only a random minimum of 4-8 notes remains.
 - Pitch-line removal: for each pitch, remove notes in pairs (two at a time),
 	saving after each removal step.
@@ -26,7 +26,11 @@ import time
 import numpy as np
 
 from hparams import hparams
+from modules import compound
 from modules.branch_paths import latest_in_branch, safe_branch_name, get_current_branch
+
+# A note is a raw tuple (step, pitch, velocity, deviation); a sequence is a sorted list of notes.
+Note = Tuple[int, int, int, int]
 
 
 
@@ -56,140 +60,77 @@ def _load_npz_from_data(filename: str) -> Tuple[np.ndarray, np.ndarray]:
 	return sequences, metadata
 
 
-def _trim_sequence(seq: np.ndarray) -> List[int]:
-	trimmed: List[int] = []
-	for token in seq.tolist():
-		if token == hparams.pad_token:
-			break
-		trimmed.append(int(token))
-		if token == hparams.eos_token:
-			break
-	if not trimmed or trimmed[-1] != hparams.eos_token:
-		trimmed.append(hparams.eos_token)
-	return trimmed
+def _trim_sequence(seq: np.ndarray) -> List[Note]:
+	"""Frame sequence [T, 4] -> sorted list of raw notes (up to EOS)."""
+	return [tuple(int(x) for x in row) for row in compound.frames_to_raw(seq, hparams).tolist()]
 
 
-def _note_triplets(seq_tokens: List[int]) -> List[Tuple[int, int]]:
-	notes: List[Tuple[int, int]] = []
-	i = 0
-	while i < len(seq_tokens):
-		token = seq_tokens[i]
-		if token == hparams.eos_token:
-			break
-		if i + 2 < len(seq_tokens):
-			t1 = seq_tokens[i + 1]
-			t2 = seq_tokens[i + 2]
-			is_vel_t1 = hparams.min_vel_token <= t1 < hparams.max_vel_token
-			is_pitch_token = hparams.min_pitch_token <= token < hparams.max_pitch_token
-			is_timing_token = hparams.min_timing_token <= token < hparams.max_timing_token
-			is_pitch_t2 = hparams.min_pitch_token <= t2 < hparams.max_pitch_token
-			is_timing_t2 = hparams.min_timing_token <= t2 < hparams.max_timing_token
-
-			# New order: pitch, velocity, timing
-			if is_pitch_token and is_vel_t1 and is_timing_t2:
-				notes.append((i, token))
-				i += 3
-				continue
-
-			# Old order: timing, velocity, pitch
-			if is_timing_token and is_vel_t1 and is_pitch_t2:
-				notes.append((i, t2))
-				i += 3
-				continue
-		i += 1
-	return notes
-
-
-def _remove_note_by_ordinal(seq_tokens: List[int], ordinal: int) -> List[int]:
-	notes = _note_triplets(seq_tokens)
-	if ordinal < 0 or ordinal >= len(notes):
-		return seq_tokens
-	start, _ = notes[ordinal]
-	return seq_tokens[:start] + seq_tokens[start + 3:]
-
-
-def _random_note_removals(base_seq: List[int]) -> List[List[int]]:
-	results: List[List[int]] = []
+def _random_note_removals(base_seq: List[Note]) -> List[List[Note]]:
+	results: List[List[Note]] = []
 	current = base_seq[:]
-	notes = _note_triplets(current)
-	n_notes = len(notes)
+	n_notes = len(current)
 	if n_notes <= 4:
 		return results
 
 	target_min = random.randint(4, 8)
 	target = min(target_min, n_notes)
 
-	while len(_note_triplets(current)) > target:
-		current_notes = _note_triplets(current)
-		max_removable = len(current_notes) - target
+	while len(current) > target:
+		max_removable = len(current) - target
 		remove_count = min(3, max_removable)
 		if remove_count <= 0:
 			break
-		remove_idxs = sorted(random.sample(range(len(current_notes)), remove_count), reverse=True)
-		for remove_idx in remove_idxs:
-			current = _remove_note_by_ordinal(current, remove_idx)
+		remove_idxs = set(random.sample(range(len(current)), remove_count))
+		current = [note for i, note in enumerate(current) if i not in remove_idxs]
 		results.append(current[:])
 
 	return results
 
 
-def _pitch_line_removals(base_seq: List[int]) -> List[List[int]]:
-	results: List[List[int]] = []
-	notes = _note_triplets(base_seq)
-	unique_pitches = sorted({pitch for _, pitch in notes})
+def _pitch_line_removals(base_seq: List[Note]) -> List[List[Note]]:
+	results: List[List[Note]] = []
+	unique_pitches = sorted({note[1] for note in base_seq})
 
 	for pitch in unique_pitches:
 		current = base_seq[:]
 		while True:
-			current_notes = _note_triplets(current)
-			pitch_ordinals = [i for i, (_, p) in enumerate(current_notes) if p == pitch]
+			pitch_ordinals = [i for i, note in enumerate(current) if note[1] == pitch]
 			if len(pitch_ordinals) < 3:
 				break
 
-			remove_group = pitch_ordinals[:3]
-			for ord_idx in reversed(remove_group):
-				current = _remove_note_by_ordinal(current, ord_idx)
+			remove_group = set(pitch_ordinals[:3])
+			current = [note for i, note in enumerate(current) if i not in remove_group]
 			results.append(current[:])
 
 	return results
 
 
 def _apply_global_velocity_and_microshift(
-	seq_tokens: List[int],
+	seq_notes: List[Note],
 	velocity_scale: float,
 	microshift_delta: int,
 	velocity_jitter: int = 1,
 	microshift_jitter: int = 1,
-) -> List[int]:
-	out: List[int] = []
-	for token in seq_tokens:
-		if hparams.min_vel_token <= token < hparams.max_vel_token:
-			v = token - hparams.min_vel_token
-			v_new = int(round(v * velocity_scale))
-			if velocity_jitter > 0:
-				v_new += random.randint(-velocity_jitter, velocity_jitter)
-			v_new = max(0, min(v_new, hparams.n_vel - 1))
-			out.append(hparams.min_vel_token + v_new)
-			continue
-		if hparams.min_timing_token <= token < hparams.max_timing_token:
-			t = token - hparams.min_timing_token
-			t_new = t + microshift_delta
-			if microshift_jitter > 0:
-				t_new += random.randint(-microshift_jitter, microshift_jitter)
-			t_new = max(0, min(t_new, hparams.n_timing - 1))
-			out.append(hparams.min_timing_token + t_new)
-			continue
-		out.append(token)
+) -> List[Note]:
+	out: List[Note] = []
+	for step, pitch, v, t in seq_notes:
+		v_new = int(round(v * velocity_scale))
+		if velocity_jitter > 0:
+			v_new += random.randint(-velocity_jitter, velocity_jitter)
+		v_new = max(0, min(v_new, hparams.n_vel - 1))
+		t_new = t + microshift_delta
+		if microshift_jitter > 0:
+			t_new += random.randint(-microshift_jitter, microshift_jitter)
+		t_new = max(0, min(t_new, hparams.n_timing - 1))
+		out.append((step, pitch, v_new, t_new))
 	return out
 
 
-def _to_padded_array(sequences: List[List[int]], max_len: int) -> np.ndarray:
-	arr = np.zeros((len(sequences), max_len), dtype=int)
+def _to_padded_array(sequences: List[List[Note]], max_len: int) -> np.ndarray:
+	"""Note lists -> int16 frames [N, max_len, 4] (EOS after the notes, PAD after EOS)."""
+	arr = np.zeros((len(sequences), max_len, compound.N_FIELDS), dtype=np.int16)
 	for i, seq in enumerate(sequences):
-		clipped = seq[:max_len]
-		if clipped and clipped[-1] != hparams.eos_token:
-			clipped[-1] = hparams.eos_token
-		arr[i, : len(clipped)] = clipped
+		arr[i] = compound.notes_to_frames(seq, hparams, max_len=max_len)
 	return arr
 
 
@@ -238,7 +179,7 @@ def build_augmented_dataset(
 	should_stop=None,
 	seed=None,
 ):
-	"""Pure computation part of the augmentation (no file access).
+	"""Pure computation part of the augmentation (no file access). ``data`` holds compound frames [N, T, 4].
 
 	Returns (padded_array, metadata_list, stats_dict).
 	progress_callback(done, total) is called once per source sequence.
@@ -248,10 +189,15 @@ def build_augmented_dataset(
 		raise ValueError("keep_percentage must be between 0 and 100.")
 	if seed is not None:
 		random.seed(seed)
+	if not compound.is_compound_array(data):
+		raise ValueError(
+			"Augmentation needs a compound dataset [N, T, 4]; legacy triplet datasets must be re-extracted in the Dataset tab."
+		)
+	max_len = int(np.shape(data)[1])
 
-	original_sequences: List[List[int]] = []
+	original_sequences: List[List[Note]] = []
 	original_meta: List[object] = []
-	augmented_sequences: List[List[int]] = []
+	augmented_sequences: List[List[Note]] = []
 	augmented_meta: List[object] = []
 	n_total = len(data)
 	last_progress_time = time.time()
@@ -328,7 +274,7 @@ def build_augmented_dataset(
 	final_sequences = selected_aug_sequences
 	final_meta = selected_aug_meta
 
-	padded = _to_padded_array(final_sequences, hparams.max_seq_len)
+	padded = _to_padded_array(final_sequences, max_len)
 	if progress_callback is not None:
 		progress_callback(n_total, n_total)
 	stats = {
@@ -358,10 +304,13 @@ def augment_dataset(
 		output_filename += ".npz"
 	output_path = _data_dir() / output_filename
 
+	import json
+	info = dict(compound.format_info(hparams), kind="augment", name=output_filename, max_seq_len=int(padded.shape[1]))
 	np.savez(
 		output_path,
 		data=padded,
 		metadata=np.array(final_meta, dtype=object),
+		info=np.array(json.dumps(info)),
 	)
 	print(f"Saved augmented dataset to {output_path}")
 	print(f"Sequences: {stats['output_sequences']}")

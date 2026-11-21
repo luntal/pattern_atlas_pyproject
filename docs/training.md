@@ -66,9 +66,11 @@ Every checkpoint (all four types above) contains the same set of keys:
         'best_train_loss':  float, # best train loss seen so far at save time
         'best_val_loss':    float, # best val loss seen so far at save time
     },
-    'hparams':              dict,  # all hyperparameters (no optimizer/scaler state)
+    'hparams':              dict,  # all hyperparameters (no optimizer/scaler state), incl. token_format
 }
 ```
+
+`hparams['token_format']` is `"compound_v1"` for models trained on compound frames. `load_model()` rejects checkpoints without it (old triplet models) with `LegacyCheckpointError` before the weights are loaded.
 
 `hparams` stores epoch and global_step for reference but never stores optimizer, scheduler, or scaler state — those live at the top level of the checkpoint so they can be restored cleanly on resume.
 
@@ -104,7 +106,7 @@ scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
 ## Training Log
 
-In addition to checkpoint files, each training run writes a CSV log to `docs/<branch>/training_log_<timestamp>.csv` containing per-epoch metrics: total loss, reconstruction loss, KL loss, perplexity, learning rate, beta, annealing factor, validation metrics, and timing information.
+In addition to checkpoint files, each training run writes a CSV log to `docs/<branch>/training_log_<timestamp>.csv` containing per-epoch metrics: total loss, reconstruction loss, KL loss, perplexity, `avg_frames_per_sequence`, learning rate, beta, annealing factor, validation metrics, timing information and the cross entropy per field (`ce_step`, `ce_pitch`, `ce_velocity`, `ce_deviation` and the `val_ce_*` counterparts). `training_log.py` plots them in an extra panel.
 
 View logs with:
 
@@ -112,6 +114,21 @@ View logs with:
 python src/training_log.py       # latest log
 python src/training_log.py 1     # previous log
 ```
+
+---
+
+# Data and Loss (compound tokens)
+
+Training data are compound frames `[N, max_seq_len, 4]` = `(step, pitch, velocity, deviation)` per note, sorted by `(step, pitch)`, followed by an EOS frame and PAD frames (see `docs/rbf_server_app.md`, section 15). `load_dataset()` only accepts this format; old 2D triplet datasets raise "legacy triplet dataset, re-extract it in the Dataset tab".
+
+The decoder input is the SOS frame followed by the frames shifted by one (EOS frames in the input become PAD). The decoder has four parallel heads; the loss is
+
+$$\text{recon} = \sum_f w_f \cdot \frac{\sum \text{CE}_f}{\text{non-PAD frames}}, \qquad \text{KL} = \beta \cdot \text{mean}_b\left(\frac{\text{KL}_b}{\text{frames}_b}\right)$$
+
+- PAD frames are ignored; on EOS frames only the step head is trained (it decides the sequence end).
+- `field_loss_weights` (default `[1, 1, 1, 1]`, order step, pitch, velocity, deviation) is set in `hparams.py` only.
+- Perplexity is `exp(mean(field_ce))`.
+- Because reconstruction (four decisions per frame) and KL are both normalised per frame, the ratio stays roughly as before and `annealing_list` / `free_bits` are kept as starting values. Check them after the first run.
 
 ---
 
@@ -196,7 +213,8 @@ The settings above can also be set in the **Training** tab of `rbf_server_app` (
 - No `.item()` sync per batch: metrics stay tensors and are read once per epoch (and once per event interval when a callback is used).
 - bf16 autocast on CUDA when supported (no GradScaler needed), otherwise fp16 with scaler as before. `torch.compile` is a switch (`torch_compile`); checkpoints always hold the uncompiled `state_dict`.
 - Checkpoints are written atomically (temporary file, then `os.replace`), so a stop never leaves a half-written file.
-- Fixes: scheduler works with `validation_split = 0`; `avg_tokens_per_sequence` is divided by the real training-set size instead of `n_samples`; `train_vae` no longer needs the DataLoader's `.dataset`.
+- Fixes: scheduler works with `validation_split = 0`; `avg_frames_per_sequence` (formerly `avg_tokens_per_sequence`) is divided by the real training-set size instead of `n_samples`; `train_vae` no longer needs the DataLoader's `.dataset`.
+- `batch` and `epoch` events carry `fields: {step, pitch, velocity, deviation}` (train and val) for the per field chart of the Training tab.
 
 ### Stop and resume
 

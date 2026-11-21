@@ -4,6 +4,7 @@ import time
 import os
 from pathlib import Path
 from modules.branch_paths import latest_in_branch, safe_branch_name, get_current_branch, project_root
+from modules import compound
 from modules.model import TransformerVAE, reparameterize, ONNXWrapper
 from types import SimpleNamespace
 import torch
@@ -15,6 +16,22 @@ def create_latent_vectors(input_data: np.ndarray, model):
     logits, mu, log_var = model(data_tensor)
     z = mu.detach().numpy()
     return z
+
+class LegacyCheckpointError(ValueError):
+    """Raised when a checkpoint was trained on the old flat triplet tokens (not loadable by the compound model)."""
+
+
+def check_checkpoint_format(hparams_dict, path=None):
+    """Reject checkpoints that are not in the compound token format (before load_state_dict)."""
+    token_format = (hparams_dict or {}).get('token_format') if isinstance(hparams_dict, dict) else None
+    if token_format != compound.TOKEN_FORMAT:
+        name = Path(str(path)).name if path is not None else 'checkpoint'
+        found = f"'{token_format}'" if token_format else 'legacy triplet tokens (no token_format)'
+        raise LegacyCheckpointError(
+            f"{name}: {found} is not supported; the model needs '{compound.TOKEN_FORMAT}' compound tokens. "
+            f"Train a new model on a compound dataset in the Training tab."
+        )
+
 
 def load_model(previous=0, onnx=False, return_checkpoint=False, checkpoint_kind=None, name=None, branch=None):
     """Load a model checkpoint from the branch-specific models directory.
@@ -114,6 +131,7 @@ def load_model(previous=0, onnx=False, return_checkpoint=False, checkpoint_kind=
     checkpoint = torch.load(str(selected_model), map_location='cpu')
     model_state_dict = checkpoint['model_state_dict']
     hparams_dict = checkpoint['hparams']
+    check_checkpoint_format(hparams_dict, selected_model)
 
     # Recreate the hparams object
     hparams = SimpleNamespace(**hparams_dict)
@@ -152,6 +170,24 @@ def load_dataset(hparams, shuffle=True):
     full_data = np.load(dataset_name, allow_pickle=True)
     data = full_data['data']
     metadata = full_data['metadata']
+    if not compound.is_compound_array(data):
+        raise ValueError(
+            f"Dataset '{requested_name}' has shape {tuple(data.shape)}: legacy triplet dataset, "
+            f"re-extract it in the Dataset tab (compound frames [N, T, 4] are required)."
+        )
+    if 'info' in full_data.files:
+        import json
+        try:
+            declared = json.loads(str(full_data['info'][()])).get('token_format')
+        except (TypeError, ValueError, AttributeError):
+            declared = None
+        if declared not in (None, compound.TOKEN_FORMAT):
+            raise ValueError(f"Dataset '{requested_name}' has token format '{declared}', expected '{compound.TOKEN_FORMAT}'.")
+    if int(data.shape[1]) > int(getattr(hparams, 'max_seq_len', data.shape[1])):
+        raise ValueError(
+            f"Dataset '{requested_name}' has {data.shape[1]} frames per sequence, "
+            f"but the model allows max_seq_len={hparams.max_seq_len}."
+        )
 
     print('Total amount of samples: ', data.shape)
 
@@ -246,21 +282,8 @@ def play_midi(_global_vars):
         _global_vars.step()
 
 def seq2mat(seq, _hparams):
-    mat = np.zeros((_hparams.height, _hparams.width))
-    idx = 0
-    vel = 0
-    for token in seq:
-        if _hparams.min_vel_token <= token < _hparams.max_vel_token:
-            vel = token - _hparams.min_vel_token
-            vel /= (_hparams.n_vel - 1)
-        if _hparams.min_pitch_token <= token < _hparams.max_pitch_token:
-            pitch = token - _hparams.min_pitch_token
-            mat[pitch, idx] = vel
-        if token == _hparams.step_token:
-            idx += 1
-        if idx >= _hparams.width:
-            break
-    return mat
+    """Compound frames [T, 4] -> note matrix (thin wrapper around modules.compound.frames_to_matrix)."""
+    return compound.frames_to_matrix(seq, _hparams)
 
 
 def syncopation_measure(mat: np.ndarray) -> float:

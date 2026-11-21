@@ -1,30 +1,16 @@
 d_base = 256
 
-ranges = {
-    'specials': 3,
-    'step': 1,
-    'pitch': 54,
-    'velocity': 32,
-    'timing': 33,
-}
+# Compound token format ("compound_v1"): one frame per note = [step, pitch, velocity, deviation].
+# Every field has its own index space: 0 = PAD, 1 = SOS, 2 = EOS, raw values start at offset n_specials.
+n_specials = 3
+n_step = 32       # absolute 16th position inside the 2-bar window (0..31)
+n_pitch = 54      # chromatic pitch index (0..53)
+n_vel = 32        # quantised velocity (0..31)
+n_timing = 33     # micro timing deviation (0..32, center = 16)
 
-vocab_size = sum(ranges.values())
-
-specials_index = list(ranges.keys()).index('specials')
-step_index = list(ranges.keys()).index('step')
-pitch_index = list(ranges.keys()).index('pitch')
-velocity_index = list(ranges.keys()).index('velocity')
-timing_index = list(ranges.keys()).index('timing')
-
-keys = list(ranges.keys())
-
-min_tokens = []
-current_min_token = 0
-for i in range(len(keys)):
-    min_tokens.append(current_min_token)
-    current_min_token += ranges[keys[i]]
-# print(min_tokens)
-# print(min_tokens[step_index])
+field_names = ['step', 'pitch', 'velocity', 'deviation']
+field_sizes = [n_step, n_pitch, n_vel, n_timing]
+field_vocab_sizes = [size + n_specials for size in field_sizes]
 
 
 hyper_params = {
@@ -59,55 +45,41 @@ hyper_params = {
     'n_memory_tokens': 32,
 
     'steps_per_bar': 32,
-    'total_steps': 32 * 2,
-    'height': ranges['pitch'],
-    'width': 32,
+    'height': n_pitch,
+    'width': n_step,
     'channels': 1,
-    'vocab_size': vocab_size,
 
     'd_model': d_base, # embedding dim and model dimension
     'n_heads': 4,
     'n_layers': 4,
     'ff_dim': d_base * 2,
     'dropout': 0.1,
-    'max_seq_len': 256,
+    'max_seq_len': 128, # max number of frames (notes + EOS) per 2-bar window
 
-    # tokens:
-    'min_specials_token': min_tokens[specials_index],
-    'max_specials_token': min_tokens[specials_index] + ranges['specials'],
-    'pad_token': min_tokens[specials_index],
-    'sos_token': min_tokens[specials_index] + 1,
-    'eos_token': min_tokens[specials_index] + 2,
-    'n_steps': ranges['step'],
-    'step_token': min_tokens[step_index],
-    # 'sixteenth_step_token': min_tokens[step_index],
-    'n_pitch': ranges['pitch'],
-    'min_pitch_token': min_tokens[pitch_index],
-    'max_pitch_token': min_tokens[pitch_index] + ranges['pitch'] ,
-    'n_vel': ranges['velocity'],
-    'min_vel_token': min_tokens[velocity_index],
-    'max_vel_token': min_tokens[velocity_index] + ranges['velocity'],
-    'n_timing': ranges['timing'],
-    'min_timing_token': min_tokens[timing_index],
-    'max_timing_token': min_tokens[timing_index] + ranges['timing'],
-    'center_timing_token': min_tokens[timing_index] + ranges['timing'] // 2,
-
-    'token_bias': 4,
+    # compound tokens (frames):
+    'token_format': 'compound_v1',
+    'n_specials': n_specials,
+    'pad_token': 0,
+    'sos_token': 1,
+    'eos_token': 2,
+    'field_names': field_names,
+    'field_sizes': field_sizes,
+    'field_vocab_sizes': field_vocab_sizes,
+    'field_loss_weights': [1.0, 1.0, 1.0, 1.0], # weights of the per field cross entropies (step, pitch, velocity, deviation)
+    'n_step': n_step,
+    'n_pitch': n_pitch,
+    'n_vel': n_vel,
+    'n_timing': n_timing,
+    'center_timing': n_timing // 2,
 }
 print_info = False
 # print_info = True
 if print_info:
-    print('total number of tokens: ', vocab_size)
-
-    print('pad token:', hyper_params['pad_token'])
-    print('sos token:', hyper_params['sos_token'])
-    print('eos token:', hyper_params['eos_token'])
-    print('step token:', hyper_params['step_token']),
-    print('pitch range: ', hyper_params['min_pitch_token'], hyper_params['max_pitch_token'])
-    print('velocity range', hyper_params['min_vel_token'], hyper_params['max_vel_token'])
-    print('timing range', hyper_params['min_timing_token'], hyper_params['max_timing_token'])
-    print('center timing token:', hyper_params['center_timing_token'])
-    print('Ranges are excluding upper bound!')
+    print('token format:', hyper_params['token_format'])
+    print('fields:', field_names)
+    print('field vocab sizes:', field_vocab_sizes)
+    print('pad / sos / eos:', hyper_params['pad_token'], hyper_params['sos_token'], hyper_params['eos_token'])
+    print('center timing (raw):', hyper_params['center_timing'])
 
 from types import SimpleNamespace
 

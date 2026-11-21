@@ -22,8 +22,9 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.join(ROOT, 'src'))
 
 from hparams import hparams as default_hp  # noqa: E402
+from modules import compound  # noqa: E402
 from modules.training import TensorBatcher, run_training  # noqa: E402
-from modules.utilities import load_model  # noqa: E402
+from modules.utilities import LegacyCheckpointError, load_model  # noqa: E402
 
 BRANCH = '_test_training'
 DIRS = [os.path.join(ROOT, sub, BRANCH) for sub in ('models', 'data', 'docs')]
@@ -33,12 +34,15 @@ TINY_MODEL = {'d_model': 32, 'n_heads': 4, 'n_layers': 1, 'ff_dim': 64, 'latent_
 
 
 def make_dataset(n=64, seed=0):
+    """Synthetic compound dataset [n, max_seq_len, 4] with 5..40 random notes per sequence."""
     rng = np.random.default_rng(seed)
-    data = np.zeros((n, default_hp.max_seq_len), dtype=np.int64)
+    seqs = []
     for i in range(n):
-        length = int(rng.integers(20, 60))
-        data[i, :length] = rng.integers(default_hp.step_token, default_hp.vocab_size, size=length)
-        data[i, length] = default_hp.eos_token
+        n_notes = int(rng.integers(5, 40))
+        notes = [(int(rng.integers(32)), int(rng.integers(54)), int(rng.integers(32)), int(rng.integers(33)))
+                 for _ in range(n_notes)]
+        seqs.append(compound.notes_to_frames(notes, default_hp))
+    data = np.stack(seqs).astype(np.int16)
     metadata = np.empty(n, dtype=object)
     for i in range(n):
         metadata[i] = (f'file{i}', 0, 120)
@@ -84,6 +88,14 @@ def test_full_run():
     epoch_events = [e for e in events if e['type'] == 'epoch']
     assert epoch_events[-1]['val'] is not None
     assert epoch_events[0]['train']['loss'] > 0
+    fields = epoch_events[-1]['train']['fields']
+    assert set(fields) == {'step', 'pitch', 'velocity', 'deviation'} and all(v > 0 for v in fields.values()), fields
+    assert set(epoch_events[-1]['val']['fields']) == set(fields)
+    assert 'fields' in [e for e in events if e['type'] == 'batch'][0]
+    assert 5 < epoch_events[-1]['avg_frames_per_sequence'] <= 41, epoch_events[-1]['avg_frames_per_sequence']
+    log_files = glob.glob(os.path.join(ROOT, 'docs', BRANCH, 'training_log_*.csv'))
+    header = open(log_files[0]).readline().strip().split(',')
+    assert 'ce_step' in header and 'val_ce_deviation' in header and 'avg_frames_per_sequence' in header, header
     assert result['stopped'] is False and result['epochs_completed'] == 2
     kinds = {e['kind'] for e in events if e['type'] == 'checkpoint'}
     assert {'last', 'best_train', 'final'} <= kinds, kinds
@@ -91,6 +103,7 @@ def test_full_run():
     assert not glob.glob(os.path.join(ROOT, 'models', BRANCH, '*.tmp')), 'no half-written files'
     model, hp = load_model(onnx=False, checkpoint_kind='last', branch=BRANCH)
     assert hp.d_model == 32 and hp.latent_dim == 16
+    assert hp.token_format == 'compound_v1' and list(hp.field_vocab_sizes) == [35, 57, 35, 36]
     model, hp = load_model(onnx=False, branch=BRANCH, name=os.path.basename(result['model_path']))
     steps = [e['step'] for e in events if e['type'] == 'batch']
     assert max(steps) == 3, f'48 train samples / 16 = 3 batches, got {steps}'
@@ -142,6 +155,34 @@ def test_resume(previous_result):
     first_step = [e for e in events if e['type'] == 'batch'][0]['step']
     assert first_step == 1
     print('ok resume: global_step', before['global_step'], '->', result['global_step'])
+
+
+def test_legacy_rejected():
+    legacy = np.zeros((8, 256), dtype=np.int64)
+    legacy[:, :4] = [10, 70, 106, 2]
+    np.savez(os.path.join(ROOT, 'data', BRANCH, 'legacy.npz'), data=legacy,
+             metadata=np.array([('l.mid', 0, 120)] * 8, dtype=object))
+    try:
+        run_training(base_config(dataset_name='legacy.npz'))
+        raise AssertionError('legacy dataset accepted')
+    except ValueError as exc:
+        assert 'legacy triplet dataset' in str(exc), exc
+    # a legacy checkpoint (no token_format) is rejected before load_state_dict, also when resuming
+    time.sleep(1.1)
+    stamp = time.strftime('%Y-%m-%d_%H-%M-%S')
+    old = os.path.join(ROOT, 'models', BRANCH, f'model_last_{stamp}.pt')
+    torch.save({'model_state_dict': {}, 'hparams': {'vocab_size': 123, 'd_model': 32}}, old)
+    try:
+        cfg = {'mode': 'resume', 'resume': {'mode': 'last', 'previous': 0}, 'overrides': {'n_epochs': 1},
+               'options': {'torch_compile': False}}
+        try:
+            run_training(cfg)
+            raise AssertionError('legacy checkpoint accepted')
+        except LegacyCheckpointError as exc:
+            assert 'compound_v1' in str(exc), exc
+    finally:
+        os.remove(old)
+    print('ok legacy dataset and checkpoint rejected')
 
 
 def test_invalid_config():
@@ -216,6 +257,7 @@ if __name__ == '__main__':
         time.sleep(1.1)
         stopped = test_stop()
         test_resume(stopped)
+        test_legacy_rejected()
         test_worker_subprocess()
         print('ALL OK')
     finally:

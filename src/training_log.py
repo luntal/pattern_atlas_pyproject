@@ -41,7 +41,7 @@ print(f'Total epochs: {len(df)}')
 print(df.head())
 
 # Create a figure with multiple subplots
-fig, axes = plt.subplots(3, 2, figsize=(15, 10))
+fig, axes = plt.subplots(4, 2, figsize=(15, 13))
 fig.suptitle(f'Training Metrics - {os.path.basename(selected_log)}', fontsize=16)
 
 # Plot 1: Total Loss (Train vs Val)
@@ -109,6 +109,31 @@ ax.set_xlabel('Epoch')
 ax.set_ylabel('Annealing Factor')
 ax.set_title('KL Annealing Factor')
 ax.legend()
+ax.grid(True, alpha=0.3)
+
+# Plot 7: Cross entropy per compound field (step, pitch, velocity, deviation)
+ax = axes[3, 0]
+field_cols = [c for c in df.columns if c.startswith('ce_')]
+for col in field_cols:
+    line, = ax.plot(df['epoch'], df[col], label=f'Train {col[3:]}', linewidth=2)
+    val_col = 'val_' + col
+    if val_col in df.columns and df[val_col].notna().any():
+        ax.plot(df['epoch'], df[val_col], label=f'Val {col[3:]}', linewidth=1.5, linestyle='--', color=line.get_color())
+ax.set_xlabel('Epoch')
+ax.set_ylabel('Cross entropy')
+ax.set_title('Reconstruction error per field' if field_cols else 'Per field error (not logged)')
+if field_cols:
+    ax.legend(fontsize=8)
+ax.grid(True, alpha=0.3)
+
+# Plot 8: Frames (or tokens of older logs) per sequence
+ax = axes[3, 1]
+len_col = 'avg_frames_per_sequence' if 'avg_frames_per_sequence' in df.columns else 'avg_tokens_per_sequence'
+if len_col in df.columns:
+    ax.plot(df['epoch'], df[len_col], linewidth=2, color='purple')
+ax.set_xlabel('Epoch')
+ax.set_ylabel(len_col.replace('_', ' '))
+ax.set_title('Sequence length')
 ax.grid(True, alpha=0.3)
 
 plt.tight_layout()

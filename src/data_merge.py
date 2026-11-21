@@ -1,6 +1,9 @@
+import json
+
 import numpy as np
 from pathlib import Path
 from hparams import hparams
+from modules import compound
 from modules.branch_paths import branch_dir, get_current_branch,safe_branch_name
 
 current_branch = safe_branch_name(get_current_branch())
@@ -27,7 +30,11 @@ all_metadata = []
 for file_path in files_to_merge:
     npz_file = np.load(file_path, allow_pickle=True)
     data = npz_file['data']
-    all_data.append(data)
+    if not compound.is_compound_array(data):
+        raise SystemExit(f"{file_path.name} is a legacy triplet dataset {data.shape}; re-extract it in the Dataset tab.")
+    if all_data and data.shape[1] != all_data[0].shape[1]:
+        raise SystemExit(f"{file_path.name} has {data.shape[1]} frames per sequence, expected {all_data[0].shape[1]}.")
+    all_data.append(data.astype(np.int16))
     print(f"Loaded {file_path}: shape {data.shape}")
 
     # Load metadata if it exists
@@ -50,8 +57,9 @@ else:
     merged_metadata = None
 
 # Save merged dataset
+info = dict(compound.format_info(hparams), kind='merge', name=save_path.name, max_seq_len=int(merged_data.shape[1]))
 if merged_metadata is not None:
-    np.savez(save_path, data=merged_data, metadata=merged_metadata)
+    np.savez(save_path, data=merged_data, metadata=merged_metadata, info=np.array(json.dumps(info)))
 else:
-    np.savez(save_path, data=merged_data)
+    np.savez(save_path, data=merged_data, info=np.array(json.dumps(info)))
 print(f"\nData saved to {save_path}")

@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'src'))
 sys.path.insert(0, str(ROOT / 'tests'))
 
+import numpy as np  # noqa: E402
+
 import rbf_server_app as server  # noqa: E402
 from test_dataset_tools import make_midi  # noqa: E402
 
@@ -97,8 +99,11 @@ def main():
         missing = h.ask('ds_info', {'name': '../nope.npz'}, 'ds_info_result')
         assert not missing['ok'], missing
 
+        assert info['dataset']['shape'][1:] == [server._DEFAULT_HPARAMS.max_seq_len, 4] and info['dataset']['compatible'], info
+
         seq = h.ask('ds_sequence', {'name': 'srv-a.npz', 'index': 0}, 'ds_sequence_result')
         assert seq['ok'] and seq['sequence']['notes'] and seq['sequence']['bpm'] > 0, seq
+        assert seq['sequence']['tokens'][-1] == [2, 2, 2, 2] and not seq['sequence']['legacy'], seq
 
         saved = h.ask('ds_save_info', {'name': 'srv-a.npz', 'patch': {'description': 'server test', 'tags': ['x'], 'custom': {'k': 'v'}}},
                       'ds_save_info_result')
@@ -119,6 +124,26 @@ def main():
         assert final['state'] == 'finished', final
         names = [d['name'] for d in h.ask('ds_get_state', None, 'ds_state')['datasets']]
         assert names == ['srv-a.npz', 'srv-aug.npz', 'srv-merged.npz'], names
+
+        # extraction of a small real folder (midifiles/, Groove MIDI clips)
+        h.received.clear()
+        res = h.ask('ds_start', {'kind': 'extract', 'params': {'folder': str(ROOT / 'midifiles'), 'name': 'srv-groove',
+                                                                'mapping': 'groove_to_specific', 'take': 8}}, 'ds_start_result')
+        assert res['ok'], res
+        final = h.wait_event('ds_update', lambda s: s['state'] == 'failed' or (
+            s['state'] == 'finished' and (s.get('result') or {}).get('name') == 'srv-groove.npz'))
+        assert final['state'] == 'finished', final
+        groove = h.ask('ds_info', {'name': 'srv-groove.npz'}, 'ds_info_result')['dataset']
+        assert groove['shape'][1:] == [server._DEFAULT_HPARAMS.max_seq_len, 4] and groove['stats']['notes']['total'] > 0, groove['shape']
+        assert groove['info']['token_format'] == 'compound_v1'
+
+        # a legacy (triplet) dataset is listed but marked incompatible and cannot be merged
+        np.savez(ROOT / 'data' / BRANCH / 'old.npz', data=np.zeros((3, 256), dtype=int),
+                 metadata=np.array([('o.mid', 0, 100.0)] * 3, dtype=object))
+        datasets = {d['name']: d for d in h.ask('ds_get_state', None, 'ds_state')['datasets']}
+        assert datasets['old.npz']['compatible'] is False and datasets['srv-a.npz']['compatible'] is True, datasets
+        res = h.ask('ds_start', {'kind': 'merge', 'params': {'sources': ['srv-a.npz', 'old.npz'], 'name': 'mix'}}, 'ds_start_result')
+        assert not res['ok'] and 'legacy' in res['errors']['sources'], res
 
         # cancel without a running job is a no-op
         assert h.ask('ds_cancel', None, 'ds_cancel_result')['ok'] is False

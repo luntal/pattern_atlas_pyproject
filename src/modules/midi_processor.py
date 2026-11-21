@@ -16,6 +16,7 @@ import random
 from dataclasses import dataclass, field
 from typing import List, Tuple
 import re
+from modules import compound
 from modules.midi_mappings import (
     chromatic_to_generic,
     generic_to_chromatic as generic_to_chromatic_pitch,
@@ -54,6 +55,9 @@ class ExtractionStats:
     failed_files: List[Tuple[str, str]] = field(default_factory=list)
     one_bar_patterns: int = 0
     skipped_too_short: int = 0
+    truncated_sequences: int = 0  # windows with more notes than max_seq_len - 1 (cut after time)
+    merged_duplicates: int = 0    # notes merged because of the same (step, pitch) in a window
+    max_notes_per_window: int = 0
 
 
 class ExtractionCancelled(Exception):
@@ -429,10 +433,10 @@ class MidiProcessor:
         seen_sequences = set()
 
         for idx, seq in enumerate(self.sequences):
-            # Convert list to tuple so it can be hashed
-            seq_tuple = tuple(seq)
-            if seq_tuple not in seen_sequences:
-                seen_sequences.add(seq_tuple)
+            # Frame arrays are hashed via their bytes
+            seq_key = np.asarray(seq, dtype=np.int16).tobytes()
+            if seq_key not in seen_sequences:
+                seen_sequences.add(seq_key)
                 unique_sequences.append(seq)
                 # Keep metadata at the same index
                 if idx < len(self.metadata):
@@ -463,6 +467,9 @@ class MidiProcessor:
         print(f'Files skipped (time signature): {stats.skipped_time_signature}')
         print(f'Files skipped (too short): {stats.skipped_too_short}')
         print(f'Files with 1-bar patterns: {stats.one_bar_patterns}')
+        print(f'Max notes per window: {stats.max_notes_per_window} (max_seq_len {self.hparams.max_seq_len} frames incl. EOS)')
+        print(f'Truncated windows: {stats.truncated_sequences}')
+        print(f'Merged duplicate notes (same step and pitch): {stats.merged_duplicates}')
         if drums_only:
             print(f'Files skipped (no drums): {stats.skipped_no_drums}')
         print(f'Total sequences extracted: {stats.sequences_before_filter}')
@@ -686,11 +693,10 @@ class MidiProcessor:
                 print(f"n_patterns_full: {n_patterns}")
 
 
-                step_token = self.hparams.step_token  # 1 sixteenth
-                min_pitch_token = self.hparams.min_pitch_token
-                min_vel_token = self.hparams.min_vel_token
-                sos = self.hparams.sos_token
-                eos = self.hparams.eos_token
+                # Compound frames store raw field values (pitch 0..n_pitch-1, velocity 0..n_vel-1,
+                # deviation 0..n_timing-1); the per-field offsets are added by modules.compound.
+                center_timing = compound.center_timing(self.hparams)
+                n_timing = int(self.hparams.n_timing)
 
                 # extract midi notes and store them in a list of notes.
                 # note = {'step_idx': int, 'deviation': int, 'pitch': int, 'vel': int}
@@ -723,11 +729,8 @@ class MidiProcessor:
                     dev_norm = current_16th - current_time_idx_16th
                     # Normalize microshift to [-1, 1], where +/-1 equals half a sixteenth note.
                     shift_norm = max(-1.0, min(1.0, dev_norm * 2.0))
-                    dev_token = int(round((shift_norm * (self.hparams.n_timing // 2)) + self.hparams.center_timing_token))
-                    dev_token = max(self.hparams.min_timing_token, min(self.hparams.max_timing_token - 1, dev_token))
-                    valid_timing_range = self.hparams.min_timing_token <= dev_token < self.hparams.max_timing_token
-                    if not valid_timing_range:
-                        print(f'Warning: dev token out of range: {dev_token}')
+                    dev_idx = int(round((shift_norm * (n_timing // 2)) + center_timing))
+                    dev_idx = max(0, min(n_timing - 1, dev_idx))
 
                     note_interval = note.start - prev_note_start
                     note_interval_in_16th = note_interval / seconds_per_16th_note
@@ -751,15 +754,15 @@ class MidiProcessor:
                     advanced_note = {
                         'start': note.start,
                         'pitch': note.pitch,
-                        'pitch_token': pitch + min_pitch_token,
+                        'pitch_idx': pitch,
                         'velocity': note.velocity,
-                        'velocity_token': vel + min_vel_token,
+                        'velocity_idx': vel,
                         'current_16th': current_16th,
                         'current_time_idx_16th': current_time_idx_16th,
                         'qnt_time': qnt_time,
                         'deviation': dev,
                         'dev_norm': dev_norm,
-                        'dev_token': dev_token,
+                        'dev_idx': dev_idx,
                         'c_window': current_window,
                         'c_step_in_window': current_step_in_window,
                         'note_interval': note_interval,
@@ -781,7 +784,7 @@ class MidiProcessor:
                 if generic_to_chromatic and notes_advanced:
                     for i, n in enumerate(notes_advanced):
                         chromatic_note = generic_to_chromatic_pitch(int(n['pitch']))
-                        notes_advanced[i]['pitch_token'] = int(chromatic_note) + int(min_pitch_token)
+                        notes_advanced[i]['pitch_idx'] = int(chromatic_note)
 
 
                 # Apply feature-based fan-out to assign final chromatic pitches (0-53).
@@ -810,23 +813,22 @@ class MidiProcessor:
                                 fixed_map=window_fixed_map,
                             )
                             for list_idx, fanned_event in zip(step_indices, fanned):
-                                notes_advanced[list_idx]['pitch_token'] = (
-                                    fanned_event['chromatic_note'] + min_pitch_token
-                                )
+                                notes_advanced[list_idx]['pitch_idx'] = int(fanned_event['chromatic_note'])
 
                 # Deterministic merged->chromatic-specific mapping.
                 if groove_to_specific and notes_advanced:
                     for i, n in enumerate(notes_advanced):
                         chromatic_note = groove_merged_to_chromatic_specific(int(n['merged_note']))
-                        notes_advanced[i]['pitch_token'] = int(chromatic_note) + int(min_pitch_token)
+                        notes_advanced[i]['pitch_idx'] = int(chromatic_note)
 
                 # self.seq_advanced.append(notes_advanced)
                 token_list, metadata = self.notes_advanced_to_token_sequences_stream(
                     notes_advanced,
                     self.hparams.width,
-                    10,
+                    2,  # at least one note frame + EOS
                     max_window_exclusive=n_patterns,
                     jump=jump,
+                    stats=statistics,
                 )
                 self.metadata.extend(metadata)
 
@@ -848,30 +850,13 @@ class MidiProcessor:
 
 
     def convert_to_numpy(self):
-        # cut to max len 256
-
-        for i, seq in enumerate(self.sequences):
-            if len(seq) > 256:
-                self.sequences[i] = seq[:256]
-
-        # pad sequences:
-        max_length = max(len(seq) for seq in self.sequences)
-        padded_sequences = np.zeros((len(self.sequences), max_length), dtype=int)
-        for i, seq in enumerate(self.sequences):
-            padded_sequences[i, :len(seq)] = seq
-        return padded_sequences
+        """Sequences as int16 frame array [N, max_seq_len, 4]."""
+        return compound.pad_frames(self.sequences, int(self.hparams.max_seq_len))
 
 
     def save(self, dataset_name='dataset.npz'):
-        # pad sequences:
-        # max_length = max(len(seq) for seq in self.sequences)
-        max_length = self.hparams.max_seq_len
-        padded_sequences = np.zeros((len(self.sequences), max_length), dtype=int)
-        for i, seq in enumerate(self.sequences):
-            if len(seq) > max_length:
-                seq = seq[:max_length]
-                seq[-1] = self.hparams.eos_token
-            padded_sequences[i, :len(seq)] = seq
+        # frames [N, max_seq_len, 4] (int16), cut with EOS / padded with PAD frames
+        padded_sequences = self.convert_to_numpy()
 
         # save data:
         if not dataset_name.endswith('.npz'):
@@ -889,7 +874,9 @@ class MidiProcessor:
         # Convert metadata to numpy array for saving
         metadata_array = np.array(self.metadata, dtype=object)
 
-        np.savez(dataset_path, data=padded_sequences, metadata=metadata_array)
+        import json
+        info = dict(compound.format_info(self.hparams), kind='extract', name=dataset_name)
+        np.savez(dataset_path, data=padded_sequences, metadata=metadata_array, info=np.array(json.dumps(info)))
         print(f"Dataset saved to {dataset_path}")
         print(f"  - Branch folder: {branch_name}")
         print(f"  - Data shape: {padded_sequences.shape}")
@@ -901,75 +888,8 @@ class MidiProcessor:
         Turn sequences into matrices
         resolution: (steps * n_timing) x pitch
         """
-        min_pitch_token = self.hparams.min_pitch_token
-        min_vel_token = self.hparams.min_vel_token
-        max_pitch_token = self.hparams.max_pitch_token
-        max_vel_token = self.hparams.max_vel_token
-        step_token = self.hparams.step_token
-        min_timing_token = self.hparams.min_timing_token
-        max_timing_token = self.hparams.max_timing_token
-        center_timing_token = self.hparams.center_timing_token
-        n_timing = self.hparams.n_timing
-
-        # n_timing = 2
         def seq2mat(seq):
-            cols = self.hparams.width * n_timing
-            mat = np.zeros((self.hparams.height, cols))
-            idx = 0
-            vel = 0
-            timing = 0
-
-            def write_wrapped_segment(row: int, start: int, length: int, value: float) -> None:
-                """Write 'length' values into mat[row, :] starting at 'start', wrapping around cols."""
-                if length <= 0:
-                    return
-                length = min(length, cols)  # avoid weirdness if length >= cols
-                s = start % cols
-                e = s + length
-                if e <= cols:
-                    mat[row, s:e] = value
-                else:
-                    first_len = cols - s
-                    mat[row, s:cols] = value
-                    mat[row, 0:(length - first_len)] = value
-
-            for i, token in enumerate(seq):
-                if token == self.hparams.eos_token:
-                    break
-                if token == self.hparams.pad_token:
-                    continue
-                # if min_vel_token <= token < max_vel_token:
-                #     vel = token - min_vel_token
-                #     vel /= (self.hparams.n_vel - 1)
-                # if min_timing_token <= token < max_timing_token:
-                #     timing = token - min_timing_token - self.hparams.n_timing // 2
-
-                if min_pitch_token <= token < max_pitch_token:
-                    last_index = len(seq) - 1
-                    if i + 1 >= last_index:
-                        continue
-                    vel_token = seq[i+1]
-                    if min_vel_token <= vel_token < max_vel_token:
-                        timing_token = seq[i+2]
-                        if min_timing_token <= timing_token < max_timing_token:
-                            timing = timing_token - center_timing_token
-                            vel = vel_token - min_vel_token
-                            vel /= (self.hparams.n_vel - 1)
-
-                            pitch = token - min_pitch_token
-                            start = idx * n_timing + timing
-                            if n_timing < 2:
-                                length = 1
-                            else:
-                                length = n_timing // 2
-                            write_wrapped_segment(pitch, start, length, vel)
-                            # end = start + n_timing // 2
-                            # mat[pitch, start:end ] = vel
-                if token == step_token:
-                    idx += 1
-                if idx >= self.hparams.width:
-                    break
-            return mat
+            return compound.frames_to_matrix(seq, self.hparams).astype(np.float64)
 
         # if print_to_terminal:
         #     for i, seq in enumerate(self.sequences[:11]):
@@ -995,13 +915,11 @@ class MidiProcessor:
         # Count pitch occurrences in all sequences
         pitch_counts = {}
         for seq in self.sequences:
-            for token in seq:
-                if self.hparams.min_pitch_token <= token < self.hparams.max_pitch_token:
-                    pitch = token - self.hparams.min_pitch_token
-                    pitch_counts[pitch] = pitch_counts.get(pitch, 0) + 1
+            for pitch in compound.frames_to_raw(seq, self.hparams)[:, compound.FIELD_PITCH].tolist():
+                pitch_counts[pitch] = pitch_counts.get(pitch, 0) + 1
 
         # Ensure all pitches have an entry, even if count is 0
-        for pitch in range(self.hparams.max_pitch_token - self.hparams.min_pitch_token):
+        for pitch in range(int(self.hparams.n_pitch)):
             if pitch not in pitch_counts:
                 pitch_counts[pitch] = 0
 
@@ -1099,7 +1017,7 @@ class MidiProcessor:
             if playback and self.playback_wakeup_event is not None:
                 self.playback_wakeup_event.set()
             if print_tokens:
-                tokens = [token for token in self.sequences[idx] if  token != self.hparams.pad_token]
+                frames = compound.frames_to_raw(self.sequences[idx], self.hparams)
                 # print('seq: ', tokens)
 
 
@@ -1202,61 +1120,29 @@ class MidiProcessor:
             seq = self.sequences[current_seq_index]
             # matrix = np.array(matrix)
             # print(playback_position)
-            counter = 0
             interval_start = float(self.playback_position)
             interval_end = interval_start + 1.0
 
-            for i, token in enumerate(seq):
-                if counter > interval_end:
-                    break
-                if token == self.hparams.eos_token or token == 0:
-                    break
+            for note in compound.frames_to_notes(seq, self.hparams):
+                event_step = note['step'] + (0.5 * note['shift'] * deviation_strength)
+                if not (interval_start <= event_step < interval_end):
+                    continue
 
-                # if self.hparams.min_vel_token <= token < self.hparams.max_vel_token:
-                #     vel = (token - self.hparams.min_vel_token) * (127/(self.hparams.n_vel-1))
-                # if self.hparams.min_timing_token <= token < self.hparams.max_timing_token:
-                #     deviation = token - self.hparams.center_timing_token
-                #     # deviation = deviation - self.hparams.n_timing // 2 # scale to -16 to 16
-                #     deviation /= (self.hparams.n_timing // 2) # scale to -1 to 1
-                #     deviation *= (sixteenth_note_length / 2) * deviation_strength
-                #     delay = sixteenth_note_length + deviation
+                delay = (event_step - interval_start) * sixteenth_note_length
+                delay = max(0.0, delay)
 
-                if self.hparams.min_pitch_token <= token < self.hparams.max_pitch_token:
-                    vel_token = seq[i + 1] if i + 1 < len(seq) else None
-                    timing_token = seq[i + 2] if i + 2 < len(seq) else None
-                    if vel_token is None or timing_token is None:
-                        continue
-                    if not (self.hparams.min_vel_token <= vel_token < self.hparams.max_vel_token):
-                        continue
-                    if not (self.hparams.min_timing_token <= timing_token < self.hparams.max_timing_token):
-                        continue
+                chromatic_pitch = note['pitch']
+                if generic_midi_mapping:
+                    pitch = chromatic_to_generic(chromatic_pitch)
+                else:
+                    pitch = chromatic_pitch + 36
+                if pitch < 0 or pitch > 127:
+                    continue
 
-                    vel = (vel_token - self.hparams.min_vel_token) * (127 / (self.hparams.n_vel - 1))
-                    shift = (timing_token - self.hparams.center_timing_token) / (self.hparams.n_timing // 2)
-                    shift *= deviation_strength
-                    event_step = counter + (0.5 * shift)
-
-                    if not (interval_start <= event_step < interval_end):
-                        continue
-
-                    delay = (event_step - interval_start) * sixteenth_note_length
-                    delay = max(0.0, delay)
-
-                    chromatic_pitch = token - self.hparams.min_pitch_token
-                    if generic_midi_mapping:
-                        pitch = chromatic_to_generic(chromatic_pitch)
-                    else:
-                        pitch = chromatic_pitch + 36
-                    if pitch < 0 or pitch > 127:
-                        continue
-
-                    threading.Thread(
-                        target=play_single_note,
-                        args=(pitch, int(vel), delay, sixteenth_note_length),
-                    ).start()
-
-                if token == self.hparams.step_token:
-                    counter += 1
+                threading.Thread(
+                    target=play_single_note,
+                    args=(pitch, int(note['vel']), delay, sixteenth_note_length),
+                ).start()
 
 
 
@@ -1280,69 +1166,45 @@ class MidiProcessor:
         min_seq_len=0,
         max_window_exclusive=None,
         jump=1,
+        stats=None,
     ):
-        step_token = self.hparams.step_token
-        eos_token = self.hparams.eos_token
-    
+        """Notes of one instrument -> one compound frame sequence per 2-bar window.
+
+        Each note becomes a frame [step_in_window, pitch, velocity, deviation] (via modules.compound: sorted by
+        (step, pitch), duplicates merged, EOS, PAD up to max_seq_len, too long windows cut after time).
+        min_seq_len counts frames including EOS.
+        """
         sequences = []
         metadata = []
         if not notes_advanced:
             return sequences, metadata
-    
-        current_window = None
-        current_seq = []
-        last_step_in_window = None
-    
-        def flush_window():
-            nonlocal current_seq, last_step_in_window
-            if last_step_in_window is not None:
-                trailing = max(0, steps_per_window - last_step_in_window)
-                if trailing:
-                    current_seq.extend([step_token] * trailing)
-            current_seq.append(eos_token)
-    
-            if len(current_seq) >= min_seq_len:
-                sequences.append(current_seq)
-                metadata.append((
-                    notes_advanced[0]["filename"], 
-                    current_window, 
-                    notes_advanced[0]["bpm"] if notes_advanced[0]["bpm_from_name"] is None else notes_advanced[0]["bpm_from_name"]))
-    
-            current_seq = []
-            last_step_in_window = None
-    
+
+        max_len = int(self.hparams.max_seq_len)
+        bpm = notes_advanced[0]["bpm"] if notes_advanced[0]["bpm_from_name"] is None else notes_advanced[0]["bpm_from_name"]
+
+        windows: dict[int, list] = {}
         for n in notes_advanced:
             w = n["c_window"]
-            s = n["c_step_in_window"]
-
             # Keep only full 2-bar windows when requested.
             if max_window_exclusive is not None and w >= max_window_exclusive:
                 continue
-
             # Skip windows that are not multiples of jump.
             if w % jump != 0:
                 continue
-    
-            # Window change: close previous, start new
-            if current_window is None:
-                current_window = w
-            elif w != current_window:
-                flush_window()
-                current_window = w
-    
-            # Same-window note: emit step gap after previous note
-            if last_step_in_window is not None:
-                gap = max(0, s - last_step_in_window)
-                if gap:
-                    current_seq.extend([step_token] * gap)
-    
-            # Required order: pitch, velocity, deviation, then later step gap
-            current_seq.append(n["pitch_token"])
-            current_seq.append(n["velocity_token"])
-            current_seq.append(n["dev_token"])
-    
-            last_step_in_window = s
-    
-        # Final window
-        flush_window()
+            windows.setdefault(w, []).append(
+                (int(n["c_step_in_window"]) % int(steps_per_window), int(n["pitch_idx"]), int(n["velocity_idx"]), int(n["dev_idx"]))
+            )
+
+        for w in sorted(windows):
+            notes = windows[w]
+            frames, n_notes, truncated = compound.notes_to_frames(notes, self.hparams, max_len=max_len, return_info=True)
+            if stats is not None:
+                unique = len({(s, p) for s, p, _, _ in notes})
+                stats.merged_duplicates += len(notes) - unique
+                stats.max_notes_per_window = max(stats.max_notes_per_window, unique)
+                stats.truncated_sequences += int(truncated)
+            if n_notes + 1 < min_seq_len:
+                continue
+            sequences.append(frames)
+            metadata.append((notes_advanced[0]["filename"], w, bpm))
         return sequences, metadata

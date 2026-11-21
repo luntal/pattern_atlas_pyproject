@@ -10,6 +10,10 @@ Everything that touches files or does real work lives here; the browser is only 
   augmentation = data_augment.py) with progress, logs and cancel.
 
 Datasets are always written to ``<project_root>/data/<git-branch>/<name>.npz``.
+
+Token format: ``data`` holds compound frames ``[N, max_seq_len, 4]`` (int16, see ``modules.compound``) and
+``info.token_format == "compound_v1"``. Older 2D triplet datasets are listed as ``legacy (triplet)`` and are
+blocked for training, inference, merge and augmentation.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 import numpy as np
 
 from hparams import hparams as HP
+from modules import compound
 from modules.branch_paths import get_current_branch, project_root, safe_branch_name
 from modules.midi_mappings import chromatic_to_generic
 
@@ -306,6 +311,33 @@ def _complete_info(info: dict, name: str, path: Path | None = None) -> dict:
     return full
 
 
+# ---------------------------------------------------------------------------------------------- token format
+LEGACY_MESSAGE = "legacy triplet dataset, re-extract it in the Dataset tab"
+
+
+def dataset_format(shape, info: dict | None = None) -> str:
+    """Token format of a dataset: 'compound_v1', 'triplet' (legacy) or 'unknown'."""
+    detected = compound.detect_format(shape)
+    declared = str((info or {}).get("token_format") or "")
+    if detected == compound.TOKEN_FORMAT and declared not in ("", compound.TOKEN_FORMAT):
+        return "unknown"
+    return detected
+
+
+def is_compatible(shape, info: dict | None = None) -> bool:
+    """Only compound datasets can be used for training, inference, merge and augmentation."""
+    return dataset_format(shape, info) == compound.TOKEN_FORMAT
+
+
+def dataset_format_of(name: str) -> tuple[str, list | None]:
+    """(token_format, shape) of an existing dataset of the current branch (cheap header read)."""
+    path, error = existing_dataset_path(name)
+    if error:
+        return "missing", None
+    header = _read_npz_header(path)
+    return dataset_format(header["shape"], header["info"]), header["shape"]
+
+
 # ---------------------------------------------------------------------------------------------- read / write
 def _read_npz_header(path: Path) -> dict:
     """Cheap listing information (shape, info) without loading the whole array."""
@@ -346,14 +378,18 @@ def list_datasets() -> list[dict]:
         header = _read_npz_header(path)
         info = header["info"]
         shape = header["shape"]
+        token_format = dataset_format(shape, info)
+        compatible = token_format == compound.TOKEN_FORMAT
         items.append({
             "name": path.name,
             "size": int(stat.st_size),
             "mtime": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(timespec="seconds"),
             "n_sequences": shape[0] if shape else None,
             "max_len": shape[1] if shape and len(shape) > 1 else None,
-            "kind": info.get("kind", "legacy"),
+            "kind": info.get("kind", "legacy") if compatible else "legacy (triplet)" if token_format == compound.LEGACY_FORMAT else "unknown",
             "description": str(info.get("description", ""))[:120],
+            "token_format": token_format,
+            "compatible": compatible,
         })
     return items
 
@@ -400,16 +436,9 @@ def _invalidate_cache():
         _stats_cache.clear()
 
 
-def pad_sequences(sequences: list, max_len: int | None = None) -> np.ndarray:
-    max_len = int(max_len or HP.max_seq_len)
-    padded = np.zeros((len(sequences), max_len), dtype=int)
-    for i, seq in enumerate(sequences):
-        seq = list(seq)
-        if len(seq) > max_len:
-            seq = seq[:max_len]
-            seq[-1] = HP.eos_token
-        padded[i, :len(seq)] = seq
-    return padded
+def pad_frames(sequences: list, max_len: int | None = None) -> np.ndarray:
+    """Frame sequences -> int16 [N, max_len, 4] (cut with EOS as last frame, PAD filled)."""
+    return compound.pad_frames(sequences, int(max_len or HP.max_seq_len))
 
 
 def save_dataset(name: str, data: np.ndarray, metadata: list, info: dict, overwrite: bool = False) -> Path:
@@ -418,7 +447,13 @@ def save_dataset(name: str, data: np.ndarray, metadata: list, info: dict, overwr
     path = folder / name
     if path.exists() and not overwrite:
         raise FileExistsError(f"Dataset '{name}' already exists in {folder}")
+    data = np.asarray(data)
+    if not compound.is_compound_array(data):
+        raise ValueError(f"Only compound frame datasets [N, T, 4] can be saved (got shape {list(data.shape)}).")
+    data = data.astype(np.int16)
     info = dict(info)
+    info.update(compound.format_info(HP))
+    info["max_seq_len"] = int(data.shape[1])
     info["name"] = name
     info["modified"] = _now_iso()
     tmp = path.with_name(path.name + ".tmp")
@@ -487,7 +522,7 @@ def update_dataset_info(name: str, patch) -> dict:
 # ---------------------------------------------------------------------------------------------- statistics
 def pitch_labels() -> list[str]:
     """Chromatic pitch index -> label (from the compressed generic mapping CSV, '' if unknown)."""
-    n_pitch = int(HP.max_pitch_token - HP.min_pitch_token)
+    n_pitch = int(HP.n_pitch)
     labels = [""] * n_pitch
     csv_path = project_root() / "static" / "generic_midi_mapping_compressed.csv"
     try:
@@ -504,25 +539,36 @@ def pitch_labels() -> list[str]:
 
 def compute_stats(data: np.ndarray, metadata: list) -> dict:
     d = np.asarray(data)
-    if d.ndim != 2 or d.shape[0] == 0:
-        return {"n_sequences": int(d.shape[0]) if d.ndim else 0, "max_len": 0}
-    n, length = d.shape
-    n_pitch = int(HP.max_pitch_token - HP.min_pitch_token)
-    pitch_mask = (d >= HP.min_pitch_token) & (d < HP.max_pitch_token)
-    vel_mask = (d >= HP.min_vel_token) & (d < HP.max_vel_token)
-    timing_mask = (d >= HP.min_timing_token) & (d < HP.max_timing_token)
-    notes_per = pitch_mask.sum(axis=1)
-    steps_per = (d == HP.step_token).sum(axis=1)
-    lengths = (d != HP.pad_token).sum(axis=1)
-    has_eos = (d == HP.eos_token).any(axis=1)
+    token_format = dataset_format(d.shape)
+    if token_format != compound.TOKEN_FORMAT or d.shape[0] == 0:
+        return {
+            "n_sequences": int(d.shape[0]) if d.ndim else 0,
+            "max_len": int(d.shape[1]) if d.ndim > 1 else 0,
+            "token_format": token_format,
+            "legacy": token_format != compound.TOKEN_FORMAT,
+        }
+    n, length = int(d.shape[0]), int(d.shape[1])
+    n_specials = compound.N_SPECIALS
+    note_mask = compound.valid_note_mask(d, HP)  # [N, T]
+    notes_per = note_mask.sum(axis=1)
+    lengths = (d[..., compound.FIELD_STEP] != compound.PAD).sum(axis=1)
+    has_eos = (d[..., compound.FIELD_STEP] == compound.EOS).any(axis=1)
+    raw = d[note_mask].astype(np.int64) - n_specials  # [K, 4]
+    step_hits = np.zeros((n, int(HP.width)), dtype=bool)
+    seq_idx = np.nonzero(note_mask)[0]
+    step_hits[seq_idx, raw[:, compound.FIELD_STEP]] = True
+    steps_per = step_hits.sum(axis=1)
+    truncated = int((notes_per >= length - 1).sum())
 
-    pitch_hist = np.bincount((d[pitch_mask] - HP.min_pitch_token).astype(int), minlength=n_pitch)[:n_pitch]
-    vel_hist = np.bincount((d[vel_mask] - HP.min_vel_token).astype(int), minlength=int(HP.n_vel))[:int(HP.n_vel)]
-    timing_hist = np.bincount((d[timing_mask] - HP.min_timing_token).astype(int), minlength=int(HP.n_timing))[:int(HP.n_timing)]
+    n_pitch = int(HP.n_pitch)
+    pitch_hist = np.bincount(raw[:, compound.FIELD_PITCH], minlength=n_pitch)[:n_pitch]
+    vel_hist = np.bincount(raw[:, compound.FIELD_VEL], minlength=int(HP.n_vel))[:int(HP.n_vel)]
+    timing_hist = np.bincount(raw[:, compound.FIELD_DEV], minlength=int(HP.n_timing))[:int(HP.n_timing)]
+    step_hist = np.bincount(raw[:, compound.FIELD_STEP], minlength=int(HP.width))[:int(HP.width)]
     max_bins = 64
     notes_hist = np.bincount(np.minimum(notes_per, max_bins - 1).astype(int))
 
-    rows = np.ascontiguousarray(d)
+    rows = np.ascontiguousarray(d).reshape(n, -1)
     unique_rows = len({rows[i].tobytes() for i in range(n)})
     names = {_meta_name(entry).split(" | ")[0] for entry in metadata} if metadata else set()
     bpms = np.array([b for b in (_meta_bpm(entry) for entry in metadata) if b is not None], dtype=float)
@@ -538,28 +584,36 @@ def compute_stats(data: np.ndarray, metadata: list) -> dict:
             "edges": [round(float(e), 2) for e in edges], "counts": [int(c) for c in counts],
         })
 
+    frames_info = {
+        "mean": round(float(lengths.mean()), 2), "min": int(lengths.min()), "max": int(lengths.max()),
+        "total": int(lengths.sum()),
+    }
     return {
+        "token_format": token_format,
+        "legacy": False,
         "n_sequences": int(n),
         "max_len": int(length),
         "unique_sequences": int(unique_rows),
         "duplicate_sequences": int(n - unique_rows),
         "without_eos": int((~has_eos).sum()),
         "empty_sequences": int((notes_per == 0).sum()),
-        "tokens": {
-            "mean": round(float(lengths.mean()), 2), "min": int(lengths.min()), "max": int(lengths.max()),
-            "total": int(lengths.sum()),
-        },
+        "truncated_sequences": truncated,
+        "max_notes": int(notes_per.max()),
+        # frames per sequence including EOS (key kept as "tokens" for the GUI)
+        "tokens": frames_info,
+        "frames": frames_info,
         "notes": {
             "mean": round(float(notes_per.mean()), 2), "min": int(notes_per.min()), "max": int(notes_per.max()),
             "total": int(notes_per.sum()), "hist": [int(c) for c in notes_hist], "hist_cap": max_bins - 1,
-            "per_step": round(float(notes_per.sum() / max(1, steps_per.sum() + n)), 3),
+            "per_step": round(float(notes_per.sum() / max(1, n * int(HP.width))), 3),
         },
         "steps": {"mean": round(float(steps_per.mean()), 2), "max": int(steps_per.max())},
+        "step_hist": [int(c) for c in step_hist],
         "pitch_hist": [int(c) for c in pitch_hist],
         "pitch_labels": pitch_labels(),
         "velocity_hist": [int(c) for c in vel_hist],
         "timing_hist": [int(c) for c in timing_hist],
-        "timing_center": int(HP.center_timing_token - HP.min_timing_token),
+        "timing_center": int(HP.center_timing),
         "source_files": len(names),
         "bpm": bpm_info,
     }
@@ -574,7 +628,8 @@ def stats_summary(stats: dict) -> dict:
         "n_sequences": stats["n_sequences"], "unique_sequences": stats["unique_sequences"],
         "source_files": stats["source_files"], "notes_mean": stats["notes"]["mean"],
         "tokens_mean": stats["tokens"]["mean"], "bpm_min": bpm.get("min"), "bpm_max": bpm.get("max"),
-        "bpm_mean": bpm.get("mean"),
+        "bpm_mean": bpm.get("mean"), "max_notes": stats.get("max_notes"),
+        "truncated_sequences": stats.get("truncated_sequences"),
     }
 
 
@@ -589,6 +644,7 @@ def dataset_info(name: str) -> dict:
             _stats_cache[ds["key"]] = stats
     path: Path = ds["path"]
     stat = path.stat()
+    token_format = dataset_format(ds["data"].shape, ds["info"])
     return {
         "name": ds["name"],
         "path": str(path),
@@ -598,45 +654,25 @@ def dataset_info(name: str) -> dict:
         "has_metadata": bool(ds["metadata"]),
         "info": _complete_info(ds["info"], ds["name"], path),
         "stats": stats,
+        "token_format": token_format,
+        "compatible": token_format == compound.TOKEN_FORMAT,
+        "legacy_message": "" if token_format == compound.TOKEN_FORMAT else f"{ds['name']}: {LEGACY_MESSAGE}.",
         "hparams": {
             "width": int(HP.width), "n_timing": int(HP.n_timing), "n_vel": int(HP.n_vel),
-            "n_pitch": int(HP.max_pitch_token - HP.min_pitch_token), "max_seq_len": int(HP.max_seq_len),
+            "n_pitch": int(HP.n_pitch), "max_seq_len": int(HP.max_seq_len),
         },
     }
 
 
 # ---------------------------------------------------------------------------------------------- sequence view
 def parse_notes(seq) -> list[dict]:
-    """Token sequence -> note list (same triplet logic as MidiProcessor.generate_matrices / play_midi)."""
-    tokens = [int(t) for t in np.asarray(seq).tolist()]
-    notes = []
-    step = 0
-    half = max(1, int(HP.n_timing) // 2)
-    for i, token in enumerate(tokens):
-        if token == HP.eos_token:
-            break
-        if token == HP.pad_token:
-            continue
-        if HP.min_pitch_token <= token < HP.max_pitch_token and i + 2 < len(tokens):
-            vel_token, timing_token = tokens[i + 1], tokens[i + 2]
-            if HP.min_vel_token <= vel_token < HP.max_vel_token and HP.min_timing_token <= timing_token < HP.max_timing_token:
-                shift = (timing_token - HP.center_timing_token) / half
-                chromatic = token - HP.min_pitch_token
-                vel_norm = (vel_token - HP.min_vel_token) / max(1, int(HP.n_vel) - 1)
-                notes.append({
-                    "step": step,
-                    "pos": round(step + 0.5 * shift, 4),
-                    "shift": round(shift, 4),
-                    "pitch": int(chromatic),
-                    "midi": int(chromatic + 36),
-                    "generic": int(chromatic_to_generic(chromatic)),
-                    "vel": int(round(vel_norm * 127)),
-                    "vel_norm": round(float(vel_norm), 4),
-                })
-        if token == HP.step_token:
-            step += 1
-            if step >= int(HP.width):
-                break
+    """Frame sequence [T, 4] -> note list for piano roll and playback (legacy 2D sequences give no notes)."""
+    frames = np.asarray(seq)
+    if frames.ndim != 2 or frames.shape[-1] != compound.N_FIELDS:
+        return []
+    notes = compound.frames_to_notes(frames, HP)
+    for note in notes:
+        note["generic"] = int(chromatic_to_generic(note["pitch"]))
     return notes
 
 
@@ -648,13 +684,11 @@ def sequence_view(name: str, index: int) -> dict:
         raise ValueError("The dataset is empty.")
     idx = max(0, min(int(index), count - 1))
     seq = data[idx]
-    tokens: list[int] = []
-    for token in np.asarray(seq).tolist():
-        if token == HP.pad_token:
-            break
-        tokens.append(int(token))
-        if token == HP.eos_token:
-            break
+    legacy = not compound.is_compound_array(data)
+    if legacy:
+        frames: list = []
+    else:
+        frames = np.asarray(seq)[:compound.sequence_length(seq)].astype(int).tolist()
     meta = ds["metadata"][idx] if idx < len(ds["metadata"]) else None
     return {
         "name": ds["name"],
@@ -664,10 +698,13 @@ def sequence_view(name: str, index: int) -> dict:
         "window": _meta_window(meta),
         "bpm": _meta_bpm(meta),
         "steps": int(HP.width),
-        "n_pitch": int(HP.max_pitch_token - HP.min_pitch_token),
+        "n_pitch": int(HP.n_pitch),
         "notes": parse_notes(seq),
-        "n_tokens": len(tokens),
-        "tokens": tokens[:512],
+        "legacy": legacy,
+        "token_format": compound.LEGACY_FORMAT if legacy else compound.TOKEN_FORMAT,
+        # frames [step, pitch, velocity, deviation] (indexed) up to and including EOS
+        "n_tokens": len(frames),
+        "tokens": frames[:512],
     }
 
 
@@ -764,6 +801,14 @@ def validate_merge(raw) -> tuple[dict, dict]:
                 clean_sources.append(path.name)
         if "sources" not in errors and len(clean_sources) < 2:
             errors["sources"] = "Select at least two different datasets."
+        if "sources" not in errors:
+            formats = {source: dataset_format_of(source) for source in clean_sources}
+            legacy = [s for s, (fmt, _) in formats.items() if fmt != compound.TOKEN_FORMAT]
+            lengths = {shape[1] for fmt, shape in formats.values() if fmt == compound.TOKEN_FORMAT and shape}
+            if legacy:
+                errors["sources"] = "Cannot merge legacy (triplet) datasets: " + ", ".join(legacy) + f" ({LEGACY_MESSAGE})."
+            elif len(lengths) > 1:
+                errors["sources"] = "The datasets have different max_seq_len (" + ", ".join(str(x) for x in sorted(lengths)) + " frames)."
     name, overwrite = _check_output_name(raw, errors, clean_sources)
     return {"sources": clean_sources, "name": name, "overwrite": overwrite, "dedupe": _flag(raw, "dedupe")}, errors
 
@@ -774,6 +819,8 @@ def validate_augment(raw) -> tuple[dict, dict]:
     source, error = existing_dataset_path(raw.get("source"))
     if error:
         errors["source"] = error
+    elif dataset_format_of(source.name)[0] != compound.TOKEN_FORMAT:
+        errors["source"] = f"{source.name}: {LEGACY_MESSAGE}."
     name, overwrite = _check_output_name(raw, errors, [source.name] if source else None)
 
     def _list(key, caster, lo, hi, default):
@@ -988,6 +1035,8 @@ class DatasetJobManager:
                     "sequences": int(n_sequences), "skipped_invalid": stats.skipped_invalid,
                     "skipped_time_signature": stats.skipped_time_signature, "skipped_no_drums": stats.skipped_no_drums,
                     "skipped_too_short": stats.skipped_too_short, "one_bar_patterns": stats.one_bar_patterns,
+                    "truncated_sequences": stats.truncated_sequences, "merged_duplicates": stats.merged_duplicates,
+                    "max_notes_per_window": stats.max_notes_per_window,
                 }
                 self._bump()
 
@@ -1012,8 +1061,15 @@ class DatasetJobManager:
             raise ValueError("No sequences could be extracted (see the skipped-file counters).")
 
         self._set(phase="saving", progress=0.92, message="Writing dataset")
-        padded = pad_sequences(processor.sequences)
+        padded = pad_frames(processor.sequences)
         metadata = [_normalize_meta_entry(m, i) for i, m in enumerate(processor.metadata)]
+        if stats.truncated_sequences:
+            self._log(
+                f"{stats.truncated_sequences} window(s) had more than {int(HP.max_seq_len) - 1} notes and were cut "
+                f"(max {stats.max_notes_per_window} notes per window)"
+            )
+        if stats.merged_duplicates:
+            self._log(f"Merged {stats.merged_duplicates} duplicate note(s) with the same step and pitch")
         summary = stats_summary(compute_stats(padded, metadata))
         info = _base_info(params["name"], "extract")
         info["source"] = {"folder": folder, "midi_files": scan["midi_files"]}
@@ -1025,6 +1081,8 @@ class DatasetJobManager:
             "skipped_time_signature": stats.skipped_time_signature, "skipped_no_drums": stats.skipped_no_drums,
             "skipped_too_short": stats.skipped_too_short, "one_bar_patterns": stats.one_bar_patterns,
             "sequences_before_filter": stats.sequences_before_filter, "failed_files": len(stats.failed_files),
+            "truncated_sequences": stats.truncated_sequences, "merged_duplicates": stats.merged_duplicates,
+            "max_notes_per_window": stats.max_notes_per_window,
             "seconds": round(time.time() - started, 1),
         })
         info["description"] = f"MIDI extraction from {os.path.basename(folder.rstrip('/')) or folder}"
@@ -1038,7 +1096,9 @@ class DatasetJobManager:
             self._check_cancel()
             self._set(phase="loading", done=i, total=len(sources), progress=0.7 * i / len(sources), message=source)
             ds = load_dataset_file(source)
-            arrays.append(np.asarray(ds["data"]))
+            if not is_compatible(ds["data"].shape, ds["info"]):
+                raise ValueError(f"{source}: {LEGACY_MESSAGE}.")
+            arrays.append(np.asarray(ds["data"], dtype=np.int16))
             metas.append([_normalize_meta_entry(m, j) for j, m in enumerate(ds["metadata"])] if ds["metadata"]
                          else [(f"{source}:{j}", 0) for j in range(len(ds["data"]))])
             source_infos.append({"name": source, "n_sequences": int(len(ds["data"])), "kind": ds["info"].get("kind", "legacy"),
@@ -1046,19 +1106,17 @@ class DatasetJobManager:
             self._log(f"Loaded {source}: {arrays[-1].shape}")
         self._check_cancel()
 
-        width = max(int(a.shape[1]) for a in arrays)
-        merged = np.zeros((sum(len(a) for a in arrays), width), dtype=int)
-        row = 0
-        for array in arrays:
-            merged[row:row + len(array), :array.shape[1]] = array
-            row += len(array)
+        lengths = {int(a.shape[1]) for a in arrays}
+        if len(lengths) > 1:
+            raise ValueError("The datasets have different max_seq_len: " + ", ".join(str(x) for x in sorted(lengths)))
+        merged = np.concatenate(arrays, axis=0).astype(np.int16)
         merged_meta = [entry for entries in metas for entry in entries]
 
         removed = 0
         if params["dedupe"]:
             self._set(phase="deduplicating", progress=0.8, message="Removing duplicate sequences")
             seen, keep = set(), []
-            rows = np.ascontiguousarray(merged)
+            rows = np.ascontiguousarray(merged).reshape(len(merged), -1)
             for i in range(len(rows)):
                 key = rows[i].tobytes()
                 if key not in seen:

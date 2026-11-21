@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(ROOT, 'src'))
 
 import rbf_server_app as server  # noqa: E402
 from hparams import hparams as default_hp  # noqa: E402
+from modules import compound  # noqa: E402
 from modules.training import run_training  # noqa: E402
 
 BRANCH = '_test_server'
@@ -32,13 +33,19 @@ def cleanup():
         shutil.rmtree(d, ignore_errors=True)
 
 
-def make_dataset(name='tiny.npz', n=64, seed=0):
+def make_frames(n=64, seed=0):
     rng = np.random.default_rng(seed)
-    data = np.zeros((n, default_hp.max_seq_len), dtype=np.int64)
-    for i in range(n):
-        length = int(rng.integers(20, 60))
-        data[i, :length] = rng.integers(default_hp.step_token, default_hp.vocab_size, size=length)
-        data[i, length] = default_hp.eos_token
+    seqs = []
+    for _ in range(n):
+        notes = [(int(rng.integers(32)), int(rng.integers(54)), int(rng.integers(32)), int(rng.integers(33)))
+                 for _ in range(int(rng.integers(5, 40)))]
+        seqs.append(compound.notes_to_frames(notes, default_hp))
+    return np.stack(seqs).astype(np.int16)
+
+
+def make_dataset(name='tiny.npz', n=64, seed=0):
+    """Synthetic compound dataset [n, max_seq_len, 4]."""
+    data = make_frames(n, seed)
     metadata = np.empty(n, dtype=object)
     for i in range(n):
         metadata[i] = (f'file{i}', 0, 120)
@@ -114,6 +121,9 @@ def main():
     shutil.copy(os.path.join(ROOT, 'src', 'hparams.py'), hparams_copy)
     try:
         make_dataset()
+        legacy = np.zeros((4, 256), dtype=np.int64)
+        np.savez(os.path.join(ROOT, 'data', BRANCH, 'legacy.npz'), data=legacy,
+                 metadata=np.array([('l.mid', 0, 120)] * 4, dtype=object))
         # A model must exist so that the server starts with working inference.
         run_training(new_config(n_epochs=1))
         time.sleep(1.1)
@@ -123,6 +133,8 @@ def main():
         assert boot['app_status']['ready'] is True and boot['app_status']['training'] is False, boot['app_status']
         items_before, cfg = none_items(h)
         assert cfg['datasets'] == ['tiny.npz'] and cfg['defaults']['batch_size'] == default_hp.batch_size
+        assert cfg['legacy_datasets'] == ['legacy.npz'], cfg['legacy_datasets']
+        assert 'legacy.npz' not in boot['dataset_options'], boot['dataset_options']
         assert cfg['state']['state'] == 'idle'
         print('ok server starts with model, train_get_config works')
 
@@ -136,6 +148,8 @@ def main():
         result = h.emit_and_get('train_start', {'mode': 'resume', 'resume': {'mode': 'best_val', 'previous': 9}},
                                 expect='train_start_result')
         assert not result['ok'] and 'resume_mode' in result['errors'], result
+        result = h.emit_and_get('train_start', new_config(dataset_name='legacy.npz'), expect='train_start_result')
+        assert not result['ok'] and 'legacy triplet' in result['errors']['dataset_name'], result
         assert h.status()['state'] == 'idle'
         print('ok invalid configs rejected per field, no worker started')
 
@@ -151,6 +165,8 @@ def main():
         snap = h.wait_state(('finished', 'failed'))
         assert snap['state'] == 'finished' and snap['stopped'] is False, snap['error']
         assert len(snap['epochs']) == 2 and snap['epochs'][-1]['val'] is not None
+        assert set(snap['epochs'][-1]['train']['fields']) == {'step', 'pitch', 'velocity', 'deviation'}, snap['epochs'][-1]
+        assert set(snap['epochs'][-1]['val']['fields']) == {'step', 'pitch', 'velocity', 'deviation'}
         assert any(c['kind'] == 'final' for c in snap['checkpoints'])
         h.drain()
         updates = [r['args'][0] for r in h.received if r['name'] == 'train_update']
@@ -194,8 +210,8 @@ def main():
 
         # ---- worker crash: server stays up, inference comes back
         time.sleep(1.1)
-        with open(os.path.join(ROOT, 'data', BRANCH, 'broken.npz'), 'wb') as handle:
-            handle.write(b'this is not an npz file')
+        # a compound dataset without the metadata array passes the format check but crashes the worker
+        np.savez(os.path.join(ROOT, 'data', BRANCH, 'broken.npz'), data=make_frames(8, 3))
         result = h.emit_and_get('train_start', new_config(dataset_name='broken.npz'), expect='train_start_result')
         assert result['ok'] is True, result
         snap = h.wait_state(('finished', 'failed'))

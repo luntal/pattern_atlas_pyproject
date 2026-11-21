@@ -28,7 +28,7 @@ from flask_socketio import SocketIO, emit
 
 from hparams import hparams as _DEFAULT_HPARAMS
 from modules.branch_paths import get_current_branch, project_root, safe_branch_name
-from modules import dataset_tools
+from modules import compound, dataset_tools
 from modules.hparams_io import HparamsSaveError, read_hparams, save_hparams
 from modules.radial_basis_function import compute_rbf_weights, rbf_interpolate_exact
 from modules.train_params import ALLOWED_KEYS, ARCHITECTURE_KEYS, MODEL_KEYS, TRAIN_KEYS, coerce_param
@@ -183,6 +183,27 @@ def _lerp_scalar(fallback_value: float, rbf_value: float, alpha: float) -> float
     return float((1.0 - a) * float(fallback_value) + a * float(rbf_value))
 
 
+_PITCH_INFO_CACHE: dict = {}
+
+
+def _pitch_info(n_pitch: int) -> dict:
+    """Pitch labels and chromatic -> generic MIDI mapping for the reconstruction viewer (cached)."""
+    n_pitch = int(n_pitch)
+    if n_pitch not in _PITCH_INFO_CACHE:
+        try:
+            labels = [str(x) for x in dataset_tools.pitch_labels()][:n_pitch]
+        except Exception:
+            labels = []
+        labels += [""] * (n_pitch - len(labels))
+        try:
+            from modules.midi_mappings import chromatic_to_generic
+            generic = [int(chromatic_to_generic(i)) for i in range(n_pitch)]
+        except Exception:
+            generic = [i + 36 for i in range(n_pitch)]
+        _PITCH_INFO_CACHE[n_pitch] = {"pitch_labels": labels, "generic_pitches": generic}
+    return _PITCH_INFO_CACHE[n_pitch]
+
+
 class FullFieldRenderManager:
     def __init__(self, runtime: "CudaRBFRuntime", hparams, retokenize: bool = False, decode_batch_size: int = DECODE_BATCH_SIZE):
         self.runtime = runtime
@@ -324,14 +345,9 @@ class FullFieldRenderManager:
             self._error = error
             self._latest_generation += 1
 
-    def _normalize_tokens(self, tokens: np.ndarray, target_len: int, pad_token: int) -> np.ndarray:
-        out = np.asarray(tokens, dtype=np.int64).reshape(-1)
-        if out.size > target_len:
-            out = out[:target_len]
-        elif out.size < target_len:
-            pad = np.full((target_len - out.size,), int(pad_token), dtype=np.int64)
-            out = np.concatenate([out, pad], axis=0)
-        return out
+    def _normalize_tokens(self, frames: np.ndarray, target_len: int) -> np.ndarray:
+        """Frame sequence -> exactly target_len frames [L, 4] (PAD frames appended, or cut with EOS last)."""
+        return compound.fit_frames(frames, target_len)
 
     def _render_job(
         self,
@@ -357,9 +373,8 @@ class FullFieldRenderManager:
         cancel_event: threading.Event,
     ):
         total = int(grid_resolution) * int(grid_resolution)
-        sequence_len = 256
-        pad_token = int(self.hparams.pad_token)
-        sequences_flat = []
+        sequence_len = int(self.hparams.max_seq_len)
+        sequences = []
         bpms = []
         completed = 0
         last_valid_latent: np.ndarray | None = None
@@ -483,8 +498,7 @@ class FullFieldRenderManager:
                         tokens = self.runtime._tokens_from_matrix_buffer(matrix)
                     else:
                         tokens = original_tokens
-                    normalized = self._normalize_tokens(tokens, sequence_len, pad_token)
-                    sequences_flat.extend(normalized.tolist())
+                    sequences.append(self._normalize_tokens(tokens, sequence_len))
                 completed += len(chunk_latents)
                 chunk_latents.clear()
                 self._publish_update(job_id, "rendering", completed, total)
@@ -517,9 +531,13 @@ class FullFieldRenderManager:
             output_dir.mkdir(parents=True, exist_ok=True)
             output_path = output_dir / f"field_render_{timestamp}.npz"
 
+            info = compound.format_info(self.hparams)
+            sequences_array = (np.stack(sequences, axis=0).astype(np.int16) if sequences
+                               else np.zeros((0, sequence_len, compound.N_FIELDS), dtype=np.int16))
             np.savez_compressed(
                 str(output_path),
-                sequences_1d=np.asarray(sequences_flat, dtype=np.int64),
+                # compound frames [N, L, 4] = (step, pitch, velocity, deviation), see modules/compound.py
+                sequences=sequences_array,
                 bpms_1d=np.asarray(bpms, dtype=np.float32),
                 control_points=control_points.astype(np.float32),
                 anchor_bpms=anchor_bpms.astype(np.float32),
@@ -533,18 +551,16 @@ class FullFieldRenderManager:
                 refined_blend_low=float(refined_blend_low),
                 refined_blend_high=float(refined_blend_high),
                 total_points=int(total),
-                # Token vocabulary / layout metadata required for external token->MIDI decoding.
-                step_token=int(self.hparams.step_token),
-                eos_token=int(self.hparams.eos_token),
-                pad_token=int(self.hparams.pad_token),
-                sos_token=int(self.hparams.sos_token),
-                min_pitch_token=int(self.hparams.min_pitch_token),
-                max_pitch_token=int(self.hparams.max_pitch_token),
-                min_vel_token=int(self.hparams.min_vel_token),
-                max_vel_token=int(self.hparams.max_vel_token),
-                min_timing_token=int(self.hparams.min_timing_token),
-                max_timing_token=int(self.hparams.max_timing_token),
-                center_timing_token=int(self.hparams.center_timing_token),
+                # Format metadata required for external frame -> MIDI decoding.
+                token_format=str(info["token_format"]),
+                field_names=np.asarray(info["field_names"]),
+                field_vocab_sizes=np.asarray(info["field_vocab_sizes"], dtype=np.int64),
+                n_specials=int(info["n_specials"]),
+                pad_token=int(info["pad_token"]),
+                sos_token=int(info["sos_token"]),
+                eos_token=int(info["eos_token"]),
+                center_timing=int(info["center_timing"]),
+                n_pitch=int(self.hparams.n_pitch),
                 n_vel=int(self.hparams.n_vel),
                 n_timing=int(self.hparams.n_timing),
                 width=int(self.hparams.width),
@@ -647,19 +663,10 @@ class RealtimeDecoderManager:
             matrix[row, 0:length - first] = value
 
     def _decode_job(self, job_id: int, latent_vector: np.ndarray, seed_matrix: np.ndarray, cancel_event: threading.Event):
+        """Greedy constrained decoding with KV-cache; every generated frame is a finished note (live update)."""
         h = self.hparams
-        n_timing = int(h.n_timing)
-        cols = int(h.width * n_timing)
-        step_token = int(h.step_token)
         eos_token = int(h.eos_token)
         sos_token = int(h.sos_token)
-        min_pitch_token = int(h.min_pitch_token)
-        max_pitch_token = int(h.max_pitch_token)
-        min_vel_token = int(h.min_vel_token)
-        max_vel_token = int(h.max_vel_token)
-        min_timing_token = int(h.min_timing_token)
-        max_timing_token = int(h.max_timing_token)
-        center_timing_token = int(h.center_timing_token)
 
         partial_matrix = np.zeros_like(seed_matrix, dtype=np.float32)
         display_matrix = seed_matrix.copy()
@@ -667,12 +674,9 @@ class RealtimeDecoderManager:
         z = torch.from_numpy(latent_vector).to(self.device, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             cache = self.decoder.init_cache(z)
-        cur_tokens = torch.full((1,), sos_token, dtype=torch.long, device=self.device)
+        cur_frame = torch.full((1, compound.N_FIELDS), sos_token, dtype=torch.long, device=self.device)
 
         step_idx = 0
-        pending_pitch = None
-        pending_vel = None
-
         for _ in range(self.max_len):
             if cancel_event.is_set():
                 self._publish_update(job_id, display_matrix, step_idx, "cancelled")
@@ -682,38 +686,18 @@ class RealtimeDecoderManager:
                 break
 
             with torch.no_grad():
-                logits = self.decoder.decode_step(cur_tokens, cache)
-                cur_tokens = torch.argmax(logits, dim=-1)
+                logits = self.decoder.decode_step(cur_frame, cache)
+                cur_frame = self.decoder.pick_frame(logits, cur_frame, sample=False, constrained=True)
 
-            token = int(cur_tokens.item())
-
-            if token == eos_token:
+            frame = cur_frame[0].detach().cpu().numpy()
+            if int(frame[compound.FIELD_STEP]) == eos_token:
                 break
-            if token == step_token:
-                step_idx += 1
+            frontier = compound.write_frame(partial_matrix, frame, h)
+            if frontier is None:
                 continue
-
-            if min_pitch_token <= token < max_pitch_token:
-                pending_pitch = token
-                pending_vel = None
-                continue
-            if pending_pitch is not None and min_vel_token <= token < max_vel_token:
-                pending_vel = token
-                continue
-            if pending_pitch is not None and pending_vel is not None and min_timing_token <= token < max_timing_token:
-                pitch_idx = pending_pitch - min_pitch_token
-                timing = token - center_timing_token
-                vel = (pending_vel - min_vel_token) / max(1, int(h.n_vel) - 1)
-                note_len = max(1, n_timing // 2)
-                start = step_idx * n_timing + timing
-                self._write_wrapped_segment(partial_matrix, pitch_idx, start, note_len, float(vel))
-
-                frontier = max(0, min(cols, step_idx * n_timing + note_len))
-                display_matrix[:, :frontier] = partial_matrix[:, :frontier]
-                self._publish_update(job_id, display_matrix, step_idx, "decoding")
-
-                pending_pitch = None
-                pending_vel = None
+            step_idx = int(frame[compound.FIELD_STEP]) - compound.N_SPECIALS
+            display_matrix[:, :frontier] = partial_matrix[:, :frontier]
+            self._publish_update(job_id, display_matrix, step_idx, "decoding")
 
         display_matrix[:, :] = partial_matrix
         self._publish_update(job_id, display_matrix, step_idx, "done")
@@ -752,51 +736,9 @@ class CudaRBFRuntime:
             matrix[row, s:s + first] = value
             matrix[row, 0:length - first] = value
 
-    def _tokens_to_matrix(self, tokens) -> np.ndarray:
-        """Parse a generated token sequence (pitch, velocity, timing triplets and STEP tokens) into a note matrix."""
-        h = self.hparams
-        n_timing = int(h.n_timing)
-        cols = int(h.width * n_timing)
-        matrix = np.zeros((int(h.height), cols), dtype=np.float32)
-
-        step_token = int(h.step_token)
-        eos_token = int(h.eos_token)
-        min_pitch_token = int(h.min_pitch_token)
-        max_pitch_token = int(h.max_pitch_token)
-        min_vel_token = int(h.min_vel_token)
-        max_vel_token = int(h.max_vel_token)
-        min_timing_token = int(h.min_timing_token)
-        max_timing_token = int(h.max_timing_token)
-        center_timing_token = int(h.center_timing_token)
-        note_len = max(1, n_timing // 2)
-
-        step_idx = 0
-        pending_pitch = None
-        pending_vel = None
-
-        for token in np.asarray(tokens, dtype=np.int64).reshape(-1).tolist():
-            if token == eos_token:
-                break
-            if token == step_token:
-                step_idx += 1
-                continue
-            if min_pitch_token <= token < max_pitch_token:
-                pending_pitch = token
-                pending_vel = None
-                continue
-            if pending_pitch is not None and min_vel_token <= token < max_vel_token:
-                pending_vel = token
-                continue
-            if pending_pitch is not None and pending_vel is not None and min_timing_token <= token < max_timing_token:
-                pitch_idx = pending_pitch - min_pitch_token
-                timing = token - center_timing_token
-                vel = (pending_vel - min_vel_token) / max(1, int(h.n_vel) - 1)
-                start = step_idx * n_timing + timing
-                self._write_wrapped_segment(matrix, pitch_idx, start, note_len, float(vel))
-                pending_pitch = None
-                pending_vel = None
-
-        return matrix
+    def _tokens_to_matrix(self, frames) -> np.ndarray:
+        """Generated compound frames [L, 4] -> note matrix (see modules.compound.frames_to_matrix)."""
+        return compound.frames_to_matrix(frames, self.hparams)
 
     def decode_latents_to_matrices(
         self,
@@ -806,7 +748,7 @@ class CudaRBFRuntime:
     ) -> list[np.ndarray] | tuple[list[np.ndarray], list[np.ndarray]]:
         """Decode many latent vectors at once (batched greedy decoding with KV-cache).
 
-        Returns one matrix per latent (and, optionally, the generated tokens up to and including EOS).
+        Returns one matrix per latent (and, optionally, the generated frames [n, 4] up to and including EOS).
         """
         latents = np.asarray(latent_vectors, dtype=np.float32)
         if latents.ndim == 1:
@@ -820,10 +762,10 @@ class CudaRBFRuntime:
         with torch.no_grad():
             for start in range(0, latents.shape[0], batch_size):
                 z = torch.from_numpy(latents[start:start + batch_size]).to(self.device)
-                generated = self.decoder.generate(z, max_len=max_len, sample=False, pad_after_eos=True)
-                generated = generated.detach().cpu().numpy().astype(np.int64)
+                generated = self.decoder.generate(z, max_len=max_len, sample=False, constrained=True, pad_after_eos=True)
+                generated = generated.detach().cpu().numpy().astype(np.int64)  # [B, L, 4]
                 for row in generated:
-                    eos_pos = np.flatnonzero(row == eos_token)
+                    eos_pos = np.flatnonzero(row[:, compound.FIELD_STEP] == eos_token)
                     seq = row[: int(eos_pos[0]) + 1] if eos_pos.size else row
                     token_lists.append(seq)
                     matrices.append(self._tokens_to_matrix(seq))
@@ -840,74 +782,48 @@ class CudaRBFRuntime:
         return self.decode_latents_to_matrices(latent, batch_size=1)[0]
 
     def _tokens_from_matrix_buffer(self, matrix_buffer: np.ndarray) -> np.ndarray:
-        h = self.hparams
-        matrix = np.asarray(matrix_buffer, dtype=np.float32)
-        if matrix.ndim != 2:
-            raise ValueError("midi_buffer.matrix must be a 2D list.")
-        if matrix.shape[0] != int(h.height):
-            raise ValueError(f"midi_buffer.matrix row count must be {int(h.height)}.")
+        """Note matrix -> compound frames [K + 1, 4] (notes sorted by (step, pitch), EOS last)."""
+        try:
+            return compound.matrix_to_frames(np.asarray(matrix_buffer, dtype=np.float32), self.hparams)
+        except ValueError as exc:
+            raise ValueError(f"midi_buffer.{exc}")
 
-        n_timing = int(h.n_timing)
-        width_steps = int(h.width)
-        target_cols = width_steps * n_timing
-        cols = matrix.shape[1]
-        if cols < target_cols:
-            matrix = np.pad(matrix, ((0, 0), (0, target_cols - cols)))
-        elif cols > target_cols:
-            matrix = matrix[:, :target_cols]
+    def _prepare_token_batch(self, raw_frames: np.ndarray) -> torch.Tensor:
+        """Frames [K, 4] -> [1, max_seq_len, 4] (PAD frames appended, or cut with EOS last)."""
+        frames = compound.fit_frames(raw_frames, int(self.hparams.max_seq_len)).astype(np.int64)
+        return torch.from_numpy(frames).to(self.device, dtype=torch.long).unsqueeze(0)
 
-        tokens = []
-        for step in range(width_steps):
-            c0 = step * n_timing
-            c1 = c0 + n_timing
-            cell = matrix[:, c0:c1]
-            for pitch in range(cell.shape[0]):
-                row = cell[pitch]
-                peak = float(np.max(row))
-                if peak <= 0.02:
-                    continue
-                peak_col = int(np.argmax(row))
-                timing = peak_col - (n_timing // 2)
-                vel_idx = int(round(peak * max(1, int(h.n_vel) - 1)))
-                vel_idx = max(0, min(int(h.n_vel) - 1, vel_idx))
-                tokens.append(int(h.min_pitch_token) + pitch)
-                tokens.append(int(h.min_vel_token) + vel_idx)
-                tokens.append(int(h.center_timing_token) + timing)
-            tokens.append(int(h.step_token))
-
-        tokens.append(int(h.eos_token))
-        return np.asarray(tokens, dtype=np.int64)
-
-    def _prepare_token_batch(self, raw_tokens: np.ndarray) -> torch.Tensor:
-        h = self.hparams
-        tokens = np.asarray(raw_tokens, dtype=np.int64).reshape(-1)
-        max_len = int(h.max_seq_len)
-        if tokens.size > max_len:
-            tokens = tokens[:max_len]
-        if tokens.size < max_len:
-            pad = np.full((max_len - tokens.size,), int(h.pad_token), dtype=np.int64)
-            tokens = np.concatenate([tokens, pad], axis=0)
-        return torch.from_numpy(tokens).to(self.device, dtype=torch.long).unsqueeze(0)
+    @staticmethod
+    def _frames_from_list(value) -> np.ndarray:
+        arr = np.asarray(value, dtype=np.int64)
+        if arr.ndim != 2 or arr.shape[-1] != compound.N_FIELDS:
+            raise ValueError(
+                "midi_buffer frames must be a list of [step, pitch, velocity, deviation] frames "
+                "(flat triplet token lists are no longer supported)."
+            )
+        return arr
 
     def encode_midi_buffer_to_latent(self, midi_buffer) -> np.ndarray:
         if midi_buffer is None:
             raise ValueError("midi_buffer is missing while Encode MIDI is enabled.")
-        if isinstance(midi_buffer, dict) and "tokens" in midi_buffer:
-            raw_tokens = np.asarray(midi_buffer["tokens"], dtype=np.int64)
+        if isinstance(midi_buffer, dict) and "frames" in midi_buffer:
+            raw_frames = self._frames_from_list(midi_buffer["frames"])
+        elif isinstance(midi_buffer, dict) and "tokens" in midi_buffer:
+            raw_frames = self._frames_from_list(midi_buffer["tokens"])
         elif isinstance(midi_buffer, dict) and "matrix" in midi_buffer:
-            raw_tokens = self._tokens_from_matrix_buffer(np.asarray(midi_buffer["matrix"], dtype=np.float32))
+            raw_frames = self._tokens_from_matrix_buffer(np.asarray(midi_buffer["matrix"], dtype=np.float32))
         elif isinstance(midi_buffer, list):
-            raw_tokens = np.asarray(midi_buffer, dtype=np.int64)
+            raw_frames = self._frames_from_list(midi_buffer)
         else:
-            raise ValueError("midi_buffer must be a token list, {tokens:[...]}, or {matrix:[[...], ...]}.")
+            raise ValueError("midi_buffer must be a frame list [[s, p, v, d], ...], {frames:[...]}, or {matrix:[[...], ...]}.")
+        if raw_frames.size and not np.any(raw_frames[:, compound.FIELD_STEP] == int(self.hparams.eos_token)):
+            raw_frames = np.concatenate([raw_frames, compound.special_frame("eos").reshape(1, -1).astype(np.int64)], axis=0)
+        if raw_frames.size == 0:
+            raw_frames = compound.special_frame("eos").reshape(1, -1).astype(np.int64)
 
-        tokens_batch = self._prepare_token_batch(raw_tokens)
-        beat_tokens = torch.cumsum((tokens_batch == int(self.hparams.step_token)).to(torch.long), dim=1)
-        beat_tokens += 1
-        beat_tokens[:, 0] = 0
-        beat_tokens = beat_tokens.masked_fill(tokens_batch == int(self.hparams.pad_token), 0)
+        frames_batch = self._prepare_token_batch(raw_frames)
         with torch.no_grad():
-            mu, _ = self.encoder(tokens_batch, beat_tokens)
+            mu, _ = self.encoder(frames_batch)
         return mu.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
 
@@ -938,8 +854,11 @@ _TRAIN_RANGES = {
 }
 
 
-def validate_train_config(raw, available_datasets, checkpoint_count, defaults) -> tuple[dict, dict]:
+def validate_train_config(raw, available_datasets, checkpoint_count, defaults, legacy_datasets=()) -> tuple[dict, dict]:
     """Validate a TrainConfig coming from the browser.
+
+    available_datasets are the compound datasets of the branch; legacy_datasets (old triplet format) are rejected
+    with a field error.
 
     Returns (clean_config, errors). errors maps a field name (or "general") to a message; the config may only be
     used when errors is empty. checkpoint_count(mode) -> number of checkpoints available for a resume mode.
@@ -998,15 +917,21 @@ def validate_train_config(raw, available_datasets, checkpoint_count, defaults) -
             errors["d_model"] = f"must be divisible by n_heads ({n_heads})"
             errors["n_heads"] = f"must divide d_model ({d_model})"
 
-    if not available_datasets:
-        errors["general"] = "No dataset found for this branch (data/<branch>/*.npz)."
+    legacy_datasets = list(legacy_datasets or ())
+    if "dataset_name" in overrides:
+        wanted = overrides["dataset_name"]
     else:
-        if "dataset_name" in overrides:
-            wanted = overrides["dataset_name"]
+        wanted = defaults.get("dataset_name") if mode == "new" else None
+    if wanted is not None and wanted in legacy_datasets and "dataset_name" not in errors:
+        errors["dataset_name"] = f"'{wanted}' is a legacy triplet dataset, re-extract it in the Dataset tab"
+    if not available_datasets:
+        if legacy_datasets:
+            errors["general"] = (f"No compound dataset for this branch: {len(legacy_datasets)} legacy (triplet) "
+                                 f"dataset(s) are blocked, re-extract them in the Dataset tab.")
         else:
-            wanted = defaults.get("dataset_name") if mode == "new" else None
-        if wanted is not None and wanted not in available_datasets and "dataset_name" not in errors:
-            errors["dataset_name"] = f"dataset '{wanted}' not found"
+            errors["general"] = "No dataset found for this branch (data/<branch>/*.npz)."
+    elif wanted is not None and wanted not in available_datasets and "dataset_name" not in errors:
+        errors["dataset_name"] = f"dataset '{wanted}' not found"
 
     resume_raw = raw.get("resume") or {}
     if mode == "resume":
@@ -1380,15 +1305,30 @@ class RBFServerController:
         branch_name = safe_branch_name(get_current_branch())
         return project_root() / "data" / branch_name
 
-    def _list_available_datasets(self) -> list[str]:
+    def _dataset_formats(self) -> dict[str, str]:
+        """name -> token format of every .npz in data/<branch>/ (cheap header read)."""
         data_dir = self._data_branch_dir()
         if not data_dir.exists():
-            return []
-        return sorted([p.name for p in data_dir.glob("*.npz") if p.is_file()])
+            return {}
+        names = sorted([p.name for p in data_dir.glob("*.npz") if p.is_file()])
+        return {name: dataset_tools.dataset_format_of(name)[0] for name in names}
+
+    def _list_available_datasets(self) -> list[str]:
+        """Only compound datasets can be used for training and inference."""
+        return [name for name, fmt in self._dataset_formats().items() if fmt == dataset_tools.compound.TOKEN_FORMAT]
+
+    def _list_legacy_datasets(self) -> list[str]:
+        return [name for name, fmt in self._dataset_formats().items() if fmt != dataset_tools.compound.TOKEN_FORMAT]
 
     def _resolve_dataset_name(self, preferred: str | None) -> str:
         options = self._list_available_datasets()
         if not options:
+            legacy = self._list_legacy_datasets()
+            if legacy:
+                raise FileNotFoundError(
+                    f"No compound dataset in {self._data_branch_dir()}: {len(legacy)} legacy (triplet) dataset(s) "
+                    f"are blocked, re-extract them in the Dataset tab"
+                )
             raise FileNotFoundError(f"No .npz datasets found in {self._data_branch_dir()}")
 
         preferred_name = str(preferred) if preferred is not None else ""
@@ -1539,6 +1479,9 @@ class RBFServerController:
         self.latent_vectors = np.zeros((0, int(getattr(self.hparams, "latent_dim", 0) or 0)), dtype=np.float32)
         self.labels: list[str] = []
         self.anchor_bpms = np.zeros(0, dtype=np.float32)
+        # Original notes of every anchor as raw [step, pitch, velocity, deviation] lists (for the reconstruction viewer).
+        self.anchor_notes: list[list[list[int]]] = []
+        self.pool_version = 0
         self._lock = threading.Lock()
         self._train_start_lock = threading.Lock()
         self.training = TrainingManager(on_finish=self._on_training_finished)
@@ -1723,6 +1666,8 @@ class RBFServerController:
         self.latent_vectors = np.zeros((0, dim), dtype=np.float32)
         self.labels = []
         self.anchor_bpms = np.zeros(0, dtype=np.float32)
+        self.anchor_notes = []
+        self.pool_version += 1
         # Keep the requested sample count / default maximum so the UI sliders stay untouched while idle.
         self.sample_count_max = 40
         self._recompute_fallback_caches()
@@ -1753,14 +1698,15 @@ class RBFServerController:
             sample_seed=self.sample_seed,
             randomize=self.sample_randomize,
         )
-        tokens = torch.from_numpy(data).to(self.runtime.device, dtype=torch.long)
-        beat_tokens = torch.cumsum((tokens == int(self.hparams.step_token)).to(torch.long), dim=1)
-        beat_tokens += 1
-        beat_tokens[:, 0] = 0
-        beat_tokens = beat_tokens.masked_fill(tokens == int(self.hparams.pad_token), 0)
+        frames = torch.from_numpy(np.asarray(data, dtype=np.int64)).to(self.runtime.device, dtype=torch.long)  # [B, T, 4]
         with torch.no_grad():
-            mu, _ = self.runtime.encoder(tokens, beat_tokens)
+            mu, _ = self.runtime.encoder(frames)
         self.latent_vectors = mu.detach().cpu().numpy().astype(np.float32)
+        self.anchor_notes = [
+            compound.frames_to_raw(row, self.hparams).astype(int).tolist()
+            for row in np.asarray(data, dtype=np.int64)
+        ]
+        self.pool_version += 1
 
         bpms = []
         labels = []
@@ -1883,6 +1829,7 @@ class RBFServerController:
                 self._list_available_datasets(),
                 self._checkpoint_count,
                 self.train_defaults(),
+                legacy_datasets=self._list_legacy_datasets(),
             )
             if errors:
                 return False, errors
@@ -2166,8 +2113,14 @@ class RBFServerController:
             "cuda_ready": True,
             "field_half_extent": self.field_half_extent,
             "n_timing": int(self.hparams.n_timing),
+            "n_vel": int(self.hparams.n_vel),
+            "pool_version": int(self.pool_version),
+            # The anchor notes are only sent when the client does not have this pool version yet.
+            **({"anchor_notes": self.anchor_notes}
+               if (self.state.last_frontend_payload or {}).get("anchor_notes_version") != self.pool_version else {}),
             "recon_cols": int(self.hparams.width * self.hparams.n_timing),
             "height": int(self.hparams.height),
+            **_pitch_info(int(self.hparams.height)),
             "decode_status": self.decode_status,
             "decode_progress_step": int(self.decode_progress_step),
             "render_status": self.render_status,
@@ -2622,7 +2575,7 @@ def create_app(sample_count: int = 10, sample_seed: int = 42, hparams_path: str 
             "hparams": {
                 "width": int(dataset_tools.HP.width), "n_timing": int(dataset_tools.HP.n_timing),
                 "n_vel": int(dataset_tools.HP.n_vel), "max_seq_len": int(dataset_tools.HP.max_seq_len),
-                "n_pitch": int(dataset_tools.HP.max_pitch_token - dataset_tools.HP.min_pitch_token),
+                "n_pitch": int(dataset_tools.HP.n_pitch), "token_format": str(dataset_tools.HP.token_format),
             },
         }
 
@@ -2720,6 +2673,7 @@ def create_app(sample_count: int = 10, sample_seed: int = 42, hparams_path: str 
         return {
             "defaults": controller.train_defaults(),
             "datasets": controller._list_available_datasets(),
+            "legacy_datasets": controller._list_legacy_datasets(),
             "model_options": controller._build_model_catalog(),
             "options": {"torch_compile": _torch_compile_default(), "log_interval": 25},
             "branch": safe_branch_name(get_current_branch()),
