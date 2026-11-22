@@ -3738,8 +3738,8 @@ render();
     } else {
       const bpm = Number.isFinite(S.currentBpm) ? `${S.currentBpm.toFixed(1)} BPM` : "no BPM";
       const parts = [`${view.notes.length} notes`, `${view.steps} steps`, bpm, `decode: ${S.decodeStatus}${(Number.isFinite(S.decodeMs) && S.decodeMs > 0) ? ` (${S.decodeStatus === "done" ? "" : "last "}${S.decodeMs < 100 ? S.decodeMs.toFixed(1) : Math.round(S.decodeMs)} ms)` : ""}`];
-      if (holding && mode === "recon") parts.unshift(`holding anchor ${nearestAnchorLabel()} (${anchorNotesFor(nearestAnchor()).length} notes, orange outline)`);
-      if (mode === "both") parts.unshift(`anchor ${anchorName()} (${anchorNotesFor(selectedAnchor()).length} notes, orange outline) + reconstruction (teal)`);
+      if (holding && mode === "recon") parts.unshift(`holding anchor ${nearestAnchorLabel()} (${anchorNotesFor(nearestAnchor()).length} notes, orange dashed, overlap = dark)`);
+      if (mode === "both") parts.unshift(`anchor ${anchorName()} (${anchorNotesFor(selectedAnchor()).length} notes, orange dashed) + reconstruction (teal), overlap = dark`);
       info.textContent = parts.join(" \u00b7 ");
     }
     const warn = $("reconWarn");
@@ -3809,35 +3809,57 @@ render();
     const index = new Map(pitches.map((pt, r) => [pt, r]));
     const shown = shownNotes();
     const overlay = showEl.value === "both" || holding;
-    shown.forEach((n) => {
+    const geom = (n) => {
       const r = index.get(n.pitch);
-      if (r === undefined) return;  // outside the pitch range (or folded away)
-      const x = L.left + notePos(n) * stepW;
-      const y = L.top + plotH - (r + 1) * rowH + 1;
-      const light = 80 - 50 * n.vel_norm;
-      const nw = Math.max(3, stepW * 0.8), nh = Math.max(3, rowH - 2);
-      if (n.src === "anchor") {
-        if (overlay) {
-          // original note behind the reconstruction: translucent fill with a strong orange outline
-          ctx.fillStyle = `hsla(28, 90%, ${light}%, 0.35)`;
-          ctx.strokeStyle = "hsl(28, 90%, 42%)";
-          ctx.lineWidth = 1.5;
-          ctx.fillRect(x, y, nw, nh);
-          ctx.strokeRect(x + 0.75, y + 0.75, nw - 1.5, nh - 1.5);
-          ctx.lineWidth = 1;
-        } else {
+      if (r === undefined) return null;  // outside the pitch range (or folded away)
+      return {
+        x: L.left + notePos(n) * stepW,
+        y: L.top + plotH - (r + 1) * rowH + 1,
+        nw: Math.max(3, stepW * 0.8), nh: Math.max(3, rowH - 2),
+        light: 80 - 50 * n.vel_norm,
+      };
+    };
+    if (overlay) {
+      // Anchor (orange) and reconstruction (teal) overlap: translucent fills are multiplied, so notes lying on top
+      // of each other show up as a darker mixed colour and neither note is hidden. The outlines are drawn afterwards:
+      // anchor = dashed orange on the outside, reconstruction = solid teal slightly inside.
+      const items = shown.map((n) => ({ n, g: geom(n) })).filter((it) => it.g);
+      ctx.save();
+      ctx.globalCompositeOperation = "multiply";
+      items.forEach(({ n, g }) => {
+        ctx.fillStyle = n.src === "anchor" ? `hsla(28, 95%, ${Math.min(75, g.light + 8)}%, 0.6)` : `hsla(172, 70%, ${Math.min(75, g.light + 8)}%, 0.6)`;
+        ctx.fillRect(g.x, g.y, g.nw, g.nh);
+      });
+      ctx.restore();
+      items.forEach(({ n, g }) => {
+        if (n.src === "anchor") return;
+        const ins = (g.nw > 6 && g.nh > 6) ? 2.5 : 1;
+        ctx.strokeStyle = "hsl(172, 70%, 22%)"; ctx.lineWidth = 1;
+        ctx.strokeRect(g.x + ins, g.y + ins, Math.max(1, g.nw - 2 * ins), Math.max(1, g.nh - 2 * ins));
+      });
+      ctx.setLineDash([3, 2]); ctx.lineWidth = 1.5;
+      items.forEach(({ n, g }) => {
+        if (n.src !== "anchor") return;
+        ctx.strokeStyle = "hsl(28, 95%, 38%)";
+        ctx.strokeRect(g.x + 0.75, g.y + 0.75, g.nw - 1.5, g.nh - 1.5);
+      });
+      ctx.setLineDash([]); ctx.lineWidth = 1;
+    } else {
+      shown.forEach((n) => {
+        const g = geom(n);
+        if (!g) return;
+        const { x, y, nw, nh, light } = g;
+        if (n.src === "anchor") {
           ctx.fillStyle = `hsl(28, 85%, ${light}%)`;
           ctx.strokeStyle = `hsl(28, 85%, ${Math.max(15, light - 25)}%)`;
-          ctx.fillRect(x, y, nw, nh);
-          ctx.strokeRect(x + 0.5, y + 0.5, nw - 1, nh - 1);
+        } else {
+          ctx.fillStyle = `hsl(172, 62%, ${light}%)`;
+          ctx.strokeStyle = `hsl(172, 62%, ${Math.max(15, light - 25)}%)`;
         }
-        return;
-      }
-      ctx.fillStyle = `hsl(172, 62%, ${light}%)`;
-      ctx.strokeStyle = `hsl(172, 62%, ${Math.max(15, light - 25)}%)`;
-      ctx.fillRect(x, y, nw, nh);
-      ctx.strokeRect(x + 0.5, y + 0.5, nw - 1, nh - 1);
-    });
+        ctx.fillRect(x, y, nw, nh);
+        ctx.strokeRect(x + 0.5, y + 0.5, nw - 1, nh - 1);
+      });
+    }
     if (!shown.length) {
       ctx.fillStyle = "#77807a"; ctx.font = "12px Helvetica, Arial, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
       const reconOn = Array.isArray(S.recon) && S.recon.length;
