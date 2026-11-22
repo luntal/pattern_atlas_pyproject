@@ -113,6 +113,17 @@ def test_full_run():
     assert hp.d_model == 32 and hp.latent_dim == 16
     assert hp.token_format == 'compound_v1' and list(hp.field_vocab_sizes) == [35, 57, 35, 36]
     model, hp = load_model(onnx=False, branch=BRANCH, name=os.path.basename(result['model_path']))
+    # beta and KL of the epoch in which a checkpoint was saved are stored in its metrics
+    last_ckpt = torch.load(result['last_path'], map_location='cpu')
+    met = last_ckpt['metrics']
+    assert last_ckpt['epoch'] == 2, last_ckpt['epoch']
+    assert abs(met['beta'] - epoch_events[-1]['beta']) < 1e-9, met
+    for key in ('kl', 'kl_raw', 'kl_nofb', 'kl_raw_nofb'):
+        assert abs(met[key] - epoch_events[-1]['train'][key]) < 1e-9, (key, met)
+    assert abs(met['val_kl'] - epoch_events[-1]['val']['kl']) < 1e-9, met
+    best_val_ckpt = torch.load(model_files('model_best_val_')[-1], map_location='cpu')
+    ev = [e for e in epoch_events if e['epoch'] == best_val_ckpt['epoch']][0]
+    assert abs(best_val_ckpt['metrics']['kl'] - ev['train']['kl']) < 1e-9, 'best_val stores the KL of its own epoch'
     steps = [e['step'] for e in events if e['type'] == 'batch']
     assert max(steps) == 3, f'48 train samples / 16 = 3 batches, got {steps}'
     print('ok full run, global_step =', result['global_step'])

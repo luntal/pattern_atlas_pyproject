@@ -898,6 +898,9 @@ def train_vae(
         hparams_dict.pop('scaler_state_dict', None)
         return hparams_dict
 
+    # Beta and KL of the epoch that is being saved (filled once per epoch, stored in the checkpoint metrics).
+    epoch_kl_info = {}
+
     def _build_checkpoint(epoch, global_step_value, best_val_loss_value, best_train_loss_value, train_loss_value, val_loss_value):
         if not is_main:
             return None  # only rank 0 writes checkpoints
@@ -911,6 +914,7 @@ def train_vae(
                 'val_loss': float(val_loss_value) if val_loss_value is not None else None,
                 'best_train_loss': float(best_train_loss_value),
                 'best_val_loss': float(best_val_loss_value),
+                **epoch_kl_info,
             },
             'hparams': _checkpoint_hparams_dict(),
             'epoch': int(epoch),
@@ -1153,6 +1157,21 @@ def train_vae(
             **_kl_parts_dict((running['klp'] / n_batches).cpu().tolist()),
         }
         loss_history.append(train_epoch['loss'])
+        epoch_kl_info.clear()
+        epoch_kl_info.update({
+            'beta': float(weighted_beta),
+            'kl': float(train_epoch['kl']),
+            'kl_raw': float(train_epoch['kl_raw']),
+            'kl_nofb': float(train_epoch['kl_nofb']),
+            'kl_raw_nofb': float(train_epoch['kl_raw_nofb']),
+        })
+        if val_metrics is not None:
+            epoch_kl_info.update({
+                'val_kl': float(val_metrics['kl']),
+                'val_kl_raw': float(val_metrics['kl_raw']),
+                'val_kl_nofb': float(val_metrics['kl_nofb']),
+                'val_kl_raw_nofb': float(val_metrics['kl_raw_nofb']),
+            })
 
         train_loss_epoch = train_epoch['loss']
         val_loss_epoch = val_metrics['loss'] if val_metrics is not None else None

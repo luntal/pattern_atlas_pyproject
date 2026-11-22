@@ -65,6 +65,13 @@ Every checkpoint (all four types above) contains the same set of keys:
         'val_loss':         float, # val total loss at this epoch (None if no val)
         'best_train_loss':  float, # best train loss seen so far at save time
         'best_val_loss':    float, # best val loss seen so far at save time
+        # beta and KL of the epoch in which this checkpoint was saved (shown in Latent Field > Model Checkpoint):
+        'beta':             float, # KL weight of that epoch
+        'kl':               float, # train KL, post beta, with free bits (the "KL" curve default)
+        'kl_raw':           float, # train KL, pre beta, with free bits
+        'kl_nofb':          float, # train KL, post beta, without free bits
+        'kl_raw_nofb':      float, # true KL divergence (pre beta, without free bits)
+        'val_kl', 'val_kl_raw', 'val_kl_nofb', 'val_kl_raw_nofb': float,  # same for validation (only with a val split)
     },
     'hparams':              dict,  # all hyperparameters (no optimizer/scaler state), incl. token_format
 }

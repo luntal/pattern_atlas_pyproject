@@ -803,7 +803,12 @@ class CudaRBFRuntime:
             self.device = torch.device("cpu")
             device_name = "CPU"
         print(f"Using device: {device_name} ({self.device})")
-        self.model, self.hparams = load_model(previous=previous, onnx=False, checkpoint_kind=checkpoint_kind)
+        self.model, self.hparams, checkpoint = load_model(previous=previous, onnx=False, checkpoint_kind=checkpoint_kind,
+                                                          return_checkpoint=True)
+        # Training state of the saved epoch (epoch, beta, KL ...) for the GUI; the weights are not kept around.
+        self.checkpoint_epoch = checkpoint.get('epoch')
+        self.checkpoint_metrics = dict(checkpoint.get('metrics') or {})
+        del checkpoint
         self.model = self.model.to(self.device)
         self.model.eval()
         self.decoder = self.model.decoder
@@ -1732,6 +1737,18 @@ class RBFServerController:
         epochs = getattr(hp, "n_epochs", None)
         if epochs:
             info["epochs"] = epochs
+        # Beta and KL of the epoch in which this checkpoint was saved (older checkpoints only know beta).
+        metrics = getattr(runtime, "checkpoint_metrics", None) or {}
+        saved_epoch = getattr(runtime, "checkpoint_epoch", None)
+        if saved_epoch is not None:
+            info["saved_epoch"] = int(saved_epoch)
+        beta = metrics.get("beta", getattr(hp, "weighted_beta", None))
+        if beta is not None:
+            info["beta"] = f"{float(beta):.4g}"
+        for key, label in (("kl", "kl"), ("kl_raw", "kl_raw"), ("kl_raw_nofb", "kl_raw_nofb"),
+                           ("val_kl", "val_kl")):
+            if metrics.get(key) is not None:
+                info[label] = f"{float(metrics[key]):.4g}"
         self._model_info_cache = (runtime, info)
         return info
 
