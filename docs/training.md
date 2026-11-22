@@ -250,15 +250,14 @@ The settings above can also be set in the **Training** tab of `rbf_server_app` (
 
 ## Multi-GPU training (DistributedDataParallel)
 
-The Training tab lists the CUDA GPUs of the server (name, memory) in the *Options* box. Click a GPU to use it or to
-leave it out. Default: only GPU 0; at least one GPU always stays selected. Without CUDA the list says so and the
-training runs on MPS / CPU as before.
+The GPUs are assigned automatically, there is no GPU selection in the Training tab (it only shows the assignment).
+With two or more CUDA GPUs the last GPU is kept for inference in the Latent Field tab and the others train: 2 GPUs = training on GPU 0 and inference on GPU 1; 4 GPUs = DistributedDataParallel on GPUs 0-2 and inference on GPU 3. With one GPU, MPS or CPU, training and inference share the device. The rule lives in `modules/distributed.py` (`device_roles`); the server always sets `options.gpus` from it (a value sent by a client is ignored).
 
 - **One GPU:** unchanged single-process training.
 - **Several GPUs:** `train_worker.py` (rank 0) starts one extra process per further GPU (`RANK`, `WORLD_SIZE`,
   `MASTER_ADDR`, `MASTER_PORT` in the environment, NCCL backend). `modules/distributed.py` holds the helpers.
 - **Batch size is global.** `batch_size = 512` on 2 GPUs means 256 per GPU, so the learning-rate and beta schedules
-  behave like on one GPU. The batch must be at least the number of GPUs. Per step at most `world_size - 1` samples are
+  behave like on one GPU. The batch must be at least the number of training GPUs. Per step at most `world_size - 1` samples are
   left out (different ones every epoch) so that all ranks run equally sized steps.
 - **Metrics, validation and stop** are synchronised over the ranks. Only rank 0 writes checkpoints (without a `module.`
   prefix, so they load like single-GPU checkpoints), the CSV log and the events. `epoch` events carry `world_size`.

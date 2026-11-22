@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.join(ROOT, 'src'))
 
 from hparams import hparams as default_hp  # noqa: E402
 from modules import compound  # noqa: E402
-from modules.distributed import normalize_gpus, plan_devices  # noqa: E402
+from modules.distributed import device_roles, normalize_gpus, plan_devices  # noqa: E402
 from modules.training import TensorBatcher  # noqa: E402
 from modules.utilities import load_model  # noqa: E402
 
@@ -68,6 +68,15 @@ def test_gpu_helpers():
     assert normalize_gpus([3, 1, 1, 9, 'x', -1], 4) == [1, 3]
     assert normalize_gpus([0, 1], 0) == []
     assert len(plan_devices({'ddp_cpu_processes': 3})) == 3
+    # automatic split: the last GPU is kept for inference, the others train
+    assert device_roles(0) == {'train_gpus': [], 'inference_gpu': None, 'shared': True}
+    assert device_roles(1) == {'train_gpus': [0], 'inference_gpu': 0, 'shared': True}
+    assert device_roles(2) == {'train_gpus': [0], 'inference_gpu': 1, 'shared': False}
+    assert device_roles(4) == {'train_gpus': [0, 1, 2], 'inference_gpu': 3, 'shared': False}
+    from rbf_server_app import validate_train_config
+    for count, expected in ((0, []), (1, [0]), (2, [0]), (4, [0, 1, 2])):
+        clean, errors = validate_train_config({'options': {'gpus': [1, 2, 3]}}, ['x.npz'], lambda m: 0, {}, gpu_count=count)
+        assert clean['options']['gpus'] == expected and 'gpus' not in errors, (count, clean['options'], errors)
     assert len(plan_devices({})) == 1, 'default is a single device'
     print('ok gpu helpers')
 

@@ -30,7 +30,7 @@ from flask_socketio import SocketIO, emit
 from hparams import hparams as _DEFAULT_HPARAMS
 from modules.branch_paths import get_current_branch, project_root, safe_branch_name
 from modules import compound, dataset_tools
-from modules.distributed import cuda_device_list
+from modules.distributed import cuda_device_list, device_roles, inference_device
 from modules.hparams_io import HparamsSaveError, read_hparams, save_hparams
 from modules.radial_basis_function import compute_rbf_weights, rbf_interpolate_exact
 from modules.train_params import ALLOWED_KEYS, ARCHITECTURE_KEYS, MODEL_KEYS, TRAIN_KEYS, coerce_param
@@ -793,8 +793,9 @@ class RealtimeDecoderManager:
 class CudaRBFRuntime:
     def __init__(self, previous: int = 0, checkpoint_kind: str | None = None, retokenize: bool = False):
         if torch.cuda.is_available():
-            self.device = torch.device("cuda")
-            device_name = "CUDA"
+            # With several GPUs the last one is reserved for inference (training runs on the others).
+            self.device = inference_device()
+            device_name = f"CUDA ({torch.cuda.get_device_name(self.device)})"
         elif torch.backends.mps.is_available():
             device_name = "MPS (Metal Performance Shaders)"
             self.device = torch.device("mps")
@@ -951,8 +952,9 @@ def validate_train_config(raw, available_datasets, checkpoint_count, defaults, l
                           gpu_count=None) -> tuple[dict, dict]:
     """Validate a TrainConfig coming from the browser.
 
-    gpu_count: number of CUDA devices (None = ask torch). options.gpus must be a non-empty list of valid device
-    indices (default: [0]); with more than one GPU the training runs with DistributedDataParallel.
+    gpu_count: number of CUDA devices (None = ask torch). The training GPUs are chosen automatically
+    (modules.distributed.device_roles: with 2+ GPUs the last one is kept for inference, the others train; with more
+    than one training GPU the training runs with DistributedDataParallel). options.gpus from the client is ignored.
 
     available_datasets are the compound datasets of the branch; legacy_datasets (old triplet format) are rejected
     with a field error.
@@ -1066,31 +1068,12 @@ def validate_train_config(raw, available_datasets, checkpoint_count, defaults, l
     clean["options"]["torch_compile"] = bool(options_raw.get("torch_compile", True))
     if gpu_count is None:
         gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    gpus: list[int] = []
-    if int(gpu_count) > 0:
-        raw_gpus = options_raw.get("gpus")
-        if raw_gpus is None:
-            gpus = [0]
-        elif not isinstance(raw_gpus, (list, tuple)) or len(raw_gpus) == 0:
-            errors["gpus"] = "select at least one GPU"
-        else:
-            for value in raw_gpus:
-                try:
-                    index = coerce_param_number(value, integer=True)
-                except ValueError:
-                    errors["gpus"] = "GPU indices must be integers"
-                    break
-                if not (0 <= index < int(gpu_count)):
-                    errors["gpus"] = f"GPU {index} does not exist (available: 0..{int(gpu_count) - 1})"
-                    break
-                if index not in gpus:
-                    gpus.append(index)
-            gpus = sorted(gpus)
+    gpus: list[int] = list(device_roles(int(gpu_count))["train_gpus"])
     clean["options"]["gpus"] = gpus
-    if len(gpus) > 1 and "gpus" not in errors:
+    if len(gpus) > 1:
         batch = overrides.get("batch_size", defaults.get("batch_size"))
         if batch is not None and "batch_size" not in errors and int(batch) < len(gpus):
-            errors["batch_size"] = f"must be at least the number of selected GPUs ({len(gpus)}); it is split over them"
+            errors["batch_size"] = f"must be at least the number of training GPUs ({len(gpus)}); it is split over them"
     try:
         log_interval = coerce_param_number(options_raw.get("log_interval", 25), integer=True)
         if not (1 <= log_interval <= 1000):
@@ -1702,15 +1685,13 @@ class RBFServerController:
         dataset_ok = bool(self.dataset_name) and len(self.latent_vectors) > 0
         training = self.training.is_active()
         messages: list[str] = []
-        if training:
-            messages.append("Training läuft – die Inferenz ist pausiert. / Training is running – inference is paused.")
-        else:
-            if not model_ok:
-                messages.append(self.model_error or "No model loaded.")
-            if not dataset_ok:
-                messages.append(self.dataset_error or "No dataset loaded.")
+        # Inference stays available while a training runs (own GPU if there are several, else the shared device).
+        if not model_ok:
+            messages.append(self.model_error or "No model loaded.")
+        if not dataset_ok:
+            messages.append(self.dataset_error or "No dataset loaded.")
         return {
-            "ready": bool(model_ok and dataset_ok and not training),
+            "ready": bool(model_ok and dataset_ok),
             "model_available": bool(model_ok),
             "dataset_available": bool(dataset_ok),
             "training": bool(training),
@@ -1755,15 +1736,25 @@ class RBFServerController:
         return info
 
     def recheck_resources(self):
-        """Retry loading model/dataset (e.g. after files were added while the server is running)."""
-        if self.training.is_active():
-            return  # the GPU belongs to the training; inference comes back when it ends
+        """Retry loading model/dataset (e.g. after files were added or a training wrote new checkpoints)."""
         with self._lock:
             had_pool = self.runtime is not None and len(self.latent_vectors) > 0
+            loaded_mode = self.selected_mode
+            loaded_stamp = self._selected_timestamp() if self.runtime is not None else None
             if self.runtime is None:
                 self._try_init_runtime()
+                loaded_mode, loaded_stamp = self.selected_mode, None
             self._refresh_dataset(self.dataset_name or getattr(self.hparams, "dataset_name", None))
             self.model_catalog = self._build_model_catalog()
+            if loaded_stamp is not None:
+                # New checkpoints (e.g. written by a running training) shift the 'previous' indices: keep pointing at
+                # the checkpoint that is actually loaded.
+                items = self.model_catalog.get("modes", {}).get(loaded_mode, {}).get("items", [])
+                for item in items:
+                    if item.get("timestamp") == loaded_stamp:
+                        self.selected_mode = loaded_mode
+                        self.selected_previous = int(item["previous"])
+                        break
             self._normalize_selection_to_catalog()
             if not had_pool and self.runtime is not None and self.dataset_name:
                 self._load_latent_pool()
@@ -1899,7 +1890,8 @@ class RBFServerController:
         self.state.cursor = np.zeros(2, dtype=np.float32)
         self.state.latent_vector = None
         self.state.current_bpm = float(self.anchor_bpms[0]) if len(self.anchor_bpms) > 0 else 0.0
-        self.state.decode_enabled = False
+        # Decode is on by default as soon as a model and a dataset are available.
+        self.state.decode_enabled = bool(self.runtime is not None and len(self.latent_vectors) > 0)
         self.state.render_enabled = False
         self.state.sample_count = int(self.sample_count)
         self.state.sample_randomize = bool(self.sample_randomize)
@@ -1948,25 +1940,25 @@ class RBFServerController:
         except Exception:
             traceback.print_exc()
 
-    def pause_for_training(self):
-        """Stop render/decode jobs and drop the model so the training process gets the whole device."""
-        with self._lock:
-            if self.render_manager is not None:
-                self.render_manager.shutdown()
-            if self.decoder_manager is not None:
-                self.decoder_manager.shutdown()
-            self.runtime = None
-            self.render_manager = None
-            self.decoder_manager = None
-            self.state.decode_enabled = False
-            self.state.render_enabled = False
-            self.render_status = "idle"
-            self.decode_status = "idle"
-            self.decode_progress_step = -1
-            self._release_device_memory()
+    def device_plan(self) -> dict:
+        """Automatic device split between training and inference (for the GUI)."""
+        gpus = cuda_device_list()
+        roles = device_roles(len(gpus))
+        label = _training_device_label()
+        if not gpus:
+            return {"mode": "shared", "train_gpus": [], "inference_gpu": None, "train_device": label,
+                    "inference_device": label}
+        names = {g["index"]: g["name"] for g in gpus}
+        return {
+            "mode": "shared" if roles["shared"] else "split",
+            "train_gpus": roles["train_gpus"],
+            "inference_gpu": roles["inference_gpu"],
+            "train_device": ", ".join(f"GPU {i} ({names.get(i, '?')})" for i in roles["train_gpus"]),
+            "inference_device": f"GPU {roles['inference_gpu']} ({names.get(roles['inference_gpu'], '?')})",
+        }
 
     def _on_training_finished(self, final_state: str):
-        """Called by the TrainingManager (reader thread) after the worker ended: bring inference back."""
+        """Called by the TrainingManager (reader thread) after the worker ended: refresh checkpoints / dataset list."""
         try:
             self.recheck_resources()
         except Exception:
@@ -1996,7 +1988,7 @@ class RBFServerController:
             if errors:
                 return False, errors
             try:
-                self.training.start(clean, before_spawn=self.pause_for_training)
+                self.training.start(clean)
             except Exception as exc:
                 return False, {"general": str(exc)}
             return True, {}
@@ -2005,8 +1997,6 @@ class RBFServerController:
         return self.training.stop(force=force)
 
     def reload_model(self, mode: str, previous: int = 0):
-        if self.training.is_active():
-            raise RuntimeError("Training is running; model switching is disabled until it ends.")
         if mode not in self.MODE_LABELS:
             raise ValueError(f"Unknown mode '{mode}'.")
 
@@ -2352,7 +2342,8 @@ class RBFServerController:
                     self.hparams.dataset_name = requested_dataset
                     self._load_latent_pool()
                     self._rebuild_pool_dependent_state(reset_modes=False)
-                self.state.decode_enabled = False
+                if self._is_idle():
+                    self.state.decode_enabled = False
                 self.state.render_enabled = False
                 self.reconstruction_matrix.fill(0.0)
                 self.decode_status = "idle"
@@ -2425,7 +2416,7 @@ class RBFServerController:
                 # Ignore stale point/cursor data from this frame after pool reset.
                 cursor = self.state.cursor.copy()
                 raw_points = self.state.control_points.copy()
-                decode_enabled = False
+                decode_enabled = True
                 render_enabled = False
                 _debug_print_control_points(
                     "sample_pool_changed",
@@ -2441,7 +2432,7 @@ class RBFServerController:
                 # Ignore stale point/cursor data from this frame after dataset swap.
                 cursor = self.state.cursor.copy()
                 raw_points = self.state.control_points.copy()
-                decode_enabled = False
+                decode_enabled = True
                 render_enabled = False
                 _debug_print_control_points(
                     "dataset_changed",
@@ -2859,9 +2850,9 @@ def create_app(sample_count: int = 10, sample_seed: int = 42, hparams_path: str 
             "datasets": controller._list_available_datasets(),
             "legacy_datasets": controller._list_legacy_datasets(),
             "model_options": controller._build_model_catalog(),
-            "options": {"torch_compile": _torch_compile_default(), "log_interval": 25,
-                        "gpus": [0] if torch.cuda.is_available() else []},
+            "options": {"torch_compile": _torch_compile_default(), "log_interval": 25},
             "gpus": cuda_device_list(),
+            "device_plan": controller.device_plan(),
             "branch": safe_branch_name(get_current_branch()),
             "device": _training_device_label(),
             "keys": {"train": TRAIN_KEYS, "model": MODEL_KEYS, "architecture": ARCHITECTURE_KEYS},
@@ -2930,7 +2921,7 @@ def create_app(sample_count: int = 10, sample_seed: int = 42, hparams_path: str 
                 "latentFallbackMode": controller.state.latent_fallback_mode,
                 "datasetName": controller.dataset_name,
                 "encodeMidi": False,
-                "decodeEnabled": False,
+                "decodeEnabled": bool(controller._app_status()["ready"]),
                 "renderEnabled": False,
                 "sampleRandomize": controller.state.sample_randomize,
             },

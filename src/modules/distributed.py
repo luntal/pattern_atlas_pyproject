@@ -5,7 +5,8 @@ the other ranks itself and passes RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT 
 run_training() calls build_context(options) to find out which device this process uses and to join the process group.
 
 options (TrainConfig.options):
-    gpus: list[int] | None      CUDA device indices to train on (None -> [0]); ignored without CUDA
+    gpus: list[int] | None      CUDA device indices to train on (None -> the training GPUs of device_roles()); ignored
+                                without CUDA. The server always sets it from device_roles(), it is not user-selectable.
     ddp_cpu_processes: int      testing only: that many CPU processes with the gloo backend
 """
 import datetime
@@ -63,6 +64,32 @@ def cuda_device_list() -> list[dict]:
     return devices
 
 
+def device_roles(device_count: int) -> dict:
+    """Automatic split of the CUDA devices between training and inference.
+
+    - 2 or more GPUs: the last GPU is reserved for inference, all others train (2 GPUs: training on GPU 0, inference on
+      GPU 1; more GPUs: DistributedDataParallel over all but the last one).
+    - 1 GPU (or MPS / CPU): training and inference share the device.
+    Returns {train_gpus, inference_gpu, shared}; the GPU values are empty / None without CUDA.
+    """
+    count = max(0, int(device_count))
+    if count <= 0:
+        return {"train_gpus": [], "inference_gpu": None, "shared": True}
+    if count == 1:
+        return {"train_gpus": [0], "inference_gpu": 0, "shared": True}
+    return {"train_gpus": list(range(count - 1)), "inference_gpu": count - 1, "shared": False}
+
+
+def inference_device() -> torch.device:
+    """Device of the inference runtime in the server (the last GPU if there are several, see device_roles())."""
+    if torch.cuda.is_available():
+        index = device_roles(torch.cuda.device_count())["inference_gpu"]
+        return torch.device(f"cuda:{0 if index is None else index}")
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def normalize_gpus(gpus, device_count: int) -> list[int]:
     """Sorted unique valid device indices; None / empty -> [0] (if there is a device at all)."""
     if device_count <= 0:
@@ -85,7 +112,11 @@ def plan_devices(options) -> list[tuple[str, Optional[int]]]:
     if cpu_processes > 1:
         return [("cpu", None)] * cpu_processes
     if torch.cuda.is_available():
-        return [("cuda", index) for index in normalize_gpus(options.get("gpus"), torch.cuda.device_count())]
+        count = torch.cuda.device_count()
+        gpus = options.get("gpus")
+        if gpus is None:
+            gpus = device_roles(count)["train_gpus"]
+        return [("cuda", index) for index in normalize_gpus(gpus, count)]
     if torch.backends.mps.is_available():
         return [("mps", None)]
     return [("cpu", None)]

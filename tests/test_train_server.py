@@ -1,4 +1,4 @@
-"""Integration test: training inside rbf_server_app (TrainingManager, socket events, pause/resume of inference).
+"""Integration test: training inside rbf_server_app (TrainingManager, socket events, inference during training).
 
 Uses the Flask-SocketIO test client (no port is opened) and a throw-away branch (`_test_server`) with a tiny model and a
 random dataset. hparams.py is never touched: hparams_save writes to a temporary copy.
@@ -153,13 +153,14 @@ def main():
         assert h.status()['state'] == 'idle'
         print('ok invalid configs rejected per field, no worker started')
 
-        # ---- full run: inference paused, updates broadcast, inference back with the new checkpoint
+        # ---- full run: inference stays available during training, updates broadcast, new checkpoint appears afterwards
         result = h.emit_and_get('train_start', new_config(n_epochs=2), expect='train_start_result')
         assert result['ok'] is True, result
         health = h.health()
-        assert health['training'] is True and health['ready'] is False and health['model_available'] is False, health
-        boot = h.emit_and_get('bootstrap', expect='bootstrap')  # must not reload the model during training
-        assert boot['app_status']['training'] is True and h.health()['model_available'] is False
+        assert health['training'] is True and health['ready'] is True and health['model_available'] is True, health
+        boot = h.emit_and_get('bootstrap', expect='bootstrap')  # inference keeps working while the worker trains
+        assert boot['app_status']['training'] is True and boot['app_status']['ready'] is True, boot['app_status']
+        assert h.health()['model_available'] is True
         second = h.emit_and_get('train_start', new_config(), expect='train_start_result')
         assert second['ok'] is False and 'already running' in second['errors']['general'], second
         snap = h.wait_state(('finished', 'failed'))
@@ -176,7 +177,7 @@ def main():
         assert health['ready'] is True and health['training'] is False and health['model_available'] is True, health
         items_after, _ = none_items(h)
         assert items_after == items_before + 1, (items_before, items_after)
-        print('ok full run: paused during training, inference + new checkpoint back afterwards')
+        print('ok full run: inference available during training, new checkpoint in the catalog afterwards')
 
         # ---- stop
         time.sleep(1.1)
