@@ -3186,10 +3186,20 @@ render();
     const steps = seq.steps || 32;
     const pitches = rollPitches(seq);
     const rows = Math.max(1, pitches.length);
-    const left = 120, right = 6, top = 14, bottom = 4;
-    const plotW = w - left - right, plotH = h - top - bottom;
-    const rowH = plotH / rows, stepW = plotW / steps;
+    const right = 6, top = 14, bottom = 4;
+    const plotH = h - top - bottom;
+    const rowH = plotH / rows;
     const labels = (ds.info && ds.info.stats && ds.info.stats.pitch_labels) || [];
+    // The pitch labels start at the very left edge; the plot uses all the remaining width (gutter = widest label).
+    const labelText = (pitch) => `${pitch}${labels[pitch] ? " " + labels[pitch] : ""}`.slice(0, 22);
+    const labelFont = `${Math.min(11, Math.floor(rowH))}px Helvetica, Arial, sans-serif`;
+    let left = 6;
+    if (rowH >= 8) {
+      ctx.font = labelFont;
+      left = Math.ceil(pitches.reduce((m, pt) => Math.max(m, ctx.measureText(labelText(pt)).width), 0)) + 3 + 6;
+    }
+    ds.rollLeft = left;
+    const plotW = w - left - right, stepW = plotW / steps;
     // grid
     for (let s = 0; s <= steps; s++) {
       const x = left + s * stepW;
@@ -3205,9 +3215,9 @@ render();
       ctx.fillStyle = r % 2 ? "rgba(0,0,0,0.025)" : "rgba(0,0,0,0)";
       ctx.fillRect(left, y, plotW, rowH);
       if (rowH >= 8) {
-        ctx.fillStyle = "#405347"; ctx.font = `${Math.min(11, Math.floor(rowH))}px Helvetica, Arial, sans-serif`;
-        ctx.textAlign = "right"; ctx.textBaseline = "middle";
-        ctx.fillText(`${pitch}${labels[pitch] ? " " + labels[pitch] : ""}`.slice(0, 22), left - 5, y + rowH / 2);
+        ctx.fillStyle = "#405347"; ctx.font = labelFont;
+        ctx.textAlign = "left"; ctx.textBaseline = "middle";
+        ctx.fillText(labelText(pitch), 3, y + rowH / 2);
       }
     });
     // notes
@@ -3235,7 +3245,7 @@ render();
     if (!seq) return;
     const c = $("dsRoll");
     const rect = c.getBoundingClientRect();
-    const left = 120, right = 6, top = 14, bottom = 4;
+    const left = ds.rollLeft || 6, right = 6, top = 14, bottom = 4;
     const plotW = rect.width - left - right, plotH = rect.height - top - bottom;
     const x = e.clientX - rect.left, y = e.clientY - rect.top;
     const pitches = rollPitches(seq);
@@ -3800,9 +3810,18 @@ render();
     if (!p) return;
     const { ctx, w, h } = p;
     const steps = view.steps;
-    const plotW = w - L.left - L.right, plotH = h - L.top - L.bottom;
-    const rowH = plotH / rows, stepW = plotW / steps;
+    const plotH = h - L.top - L.bottom;
+    const rowH = plotH / rows;
     const labels = S.pitchLabels || [];
+    // The pitch labels start at the very left edge; the plot uses all the remaining width (gutter = widest label).
+    const labelText = (pitch) => `${pitch}${labels[pitch] ? " " + labels[pitch] : ""}`.slice(0, 20);
+    const labelFont = `${Math.min(11, Math.floor(rowH))}px Helvetica, Arial, sans-serif`;
+    L.left = 6;
+    if (rowH >= 8) {
+      ctx.font = labelFont;
+      L.left = Math.ceil(pitches.reduce((m, pt) => Math.max(m, ctx.measureText(labelText(pt)).width), 0)) + 3 + 6;
+    }
+    const plotW = w - L.left - L.right, stepW = plotW / steps;
     for (let s = 0; s <= steps; s++) {
       const x = L.left + s * stepW;
       ctx.strokeStyle = s % 16 === 0 ? "#8a948c" : (s % 4 === 0 ? "#c4cbc2" : "#eceee8");
@@ -3817,9 +3836,9 @@ render();
       ctx.fillStyle = r % 2 ? "rgba(0,0,0,0.025)" : "rgba(0,0,0,0)";
       ctx.fillRect(L.left, y, plotW, rowH);
       if (rowH >= 8) {
-        ctx.fillStyle = "#405347"; ctx.font = `${Math.min(11, Math.floor(rowH))}px Helvetica, Arial, sans-serif`;
-        ctx.textAlign = "right"; ctx.textBaseline = "middle";
-        ctx.fillText(`${pitch}${labels[pitch] ? " " + labels[pitch] : ""}`.slice(0, 20), L.left - 5, y + rowH / 2);
+        ctx.fillStyle = "#405347"; ctx.font = labelFont;
+        ctx.textAlign = "left"; ctx.textBaseline = "middle";
+        ctx.fillText(labelText(pitch), 3, y + rowH / 2);
       }
     });
     const index = new Map(pitches.map((pt, r) => [pt, r]));
