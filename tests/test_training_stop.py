@@ -97,6 +97,10 @@ def test_full_run():
         assert all(k in part and part[k] >= 0 for k in ('kl', 'kl_raw', 'kl_nofb', 'kl_raw_nofb')), part
         assert part['kl_raw_nofb'] <= part['kl_raw'] + 1e-6, part  # free bits only raise the KL
     assert 5 < epoch_events[-1]['avg_frames_per_sequence'] <= 41, epoch_events[-1]['avg_frames_per_sequence']
+    # throughput measurement of the training phase (GPU power values only exist with nvidia-smi)
+    perf = epoch_events[-1]['perf']
+    assert perf['samples_per_s'] > 0 and perf['train_time'] > 0 and perf['step_ms'] > 0, perf
+    assert isinstance(perf['gpus'], list) and 'power_w_total' in perf, perf
     log_files = glob.glob(os.path.join(ROOT, 'docs', BRANCH, 'training_log_*.csv'))
     header = open(log_files[0]).readline().strip().split(',')
     assert 'ce_step' in header and 'val_ce_deviation' in header and 'avg_frames_per_sequence' in header, header

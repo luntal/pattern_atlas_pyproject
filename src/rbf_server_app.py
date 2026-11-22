@@ -1588,6 +1588,7 @@ class RBFServerController:
         self.sample_count = int(sample_count)
         self.sample_seed = int(sample_seed)
         self.sample_randomize = bool(sample_randomize)
+        self._last_shuffle_nonce = 0  # last 'reshuffle samples' request of the client that was handled
         self.sample_count_max = 40
         self.selected_mode = "none"
         self.selected_previous = 0
@@ -2402,8 +2403,20 @@ class RBFServerController:
             sample_randomize = bool(button_values.get("sampleRandomize", self.state.sample_randomize))
             dataset_name = str(button_values.get("datasetName", self.dataset_name))
 
+            # 'Reshuffle' button: every click sends a new nonce; 0 (page load) never triggers a reshuffle.
+            shuffle_nonce = _safe_int(button_values.get("sampleShuffleNonce"), 0)
+            reshuffle = False
+            if shuffle_nonce and shuffle_nonce != self._last_shuffle_nonce:
+                self._last_shuffle_nonce = shuffle_nonce
+                if sample_randomize:
+                    new_seed = self.sample_seed
+                    while new_seed == self.sample_seed:
+                        new_seed = int(np.random.default_rng().integers(0, 2 ** 31 - 1))
+                    self.sample_seed = new_seed
+                    reshuffle = True
+
             sample_pool_changed = False
-            if sample_count != self.sample_count or sample_randomize != self.sample_randomize:
+            if reshuffle or sample_count != self.sample_count or sample_randomize != self.sample_randomize:
                 sample_pool_changed = True
                 self.sample_count = sample_count
                 self.sample_randomize = sample_randomize

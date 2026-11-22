@@ -25,6 +25,7 @@ class DistContext:
     world_size: int = 1
     backend: Optional[str] = None
     initialized: bool = False
+    gpu_indices: tuple = ()  # CUDA device indices of all ranks (for the power / utilisation sampling on rank 0)
 
     @property
     def is_main(self) -> bool:
@@ -111,7 +112,7 @@ def build_context(options, timeout_minutes: int = 30) -> DistContext:
         device = _device_from_spec(plan[0])
         if device.type == "cuda":
             torch.cuda.set_device(device)
-        return DistContext(device=device)
+        return DistContext(device=device, gpu_indices=tuple(i for k, i in plan[:1] if k == "cuda"))
 
     spec = plan[rank]
     device = _device_from_spec(spec)
@@ -122,4 +123,5 @@ def build_context(options, timeout_minutes: int = 30) -> DistContext:
         backend=backend, init_method="env://", rank=rank, world_size=world_size,
         timeout=datetime.timedelta(minutes=int(timeout_minutes)),
     )
-    return DistContext(device=device, rank=rank, world_size=world_size, backend=backend, initialized=True)
+    return DistContext(device=device, rank=rank, world_size=world_size, backend=backend, initialized=True,
+                       gpu_indices=tuple(i for k, i in plan[:world_size] if k == "cuda"))

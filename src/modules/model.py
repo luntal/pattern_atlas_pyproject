@@ -11,6 +11,7 @@ import onnx
 import onnxruntime
 import math
 import csv
+from modules.perf_monitor import GpuSampler, summarize as _summarize_gpus, format_perf as _format_perf
 from modules.branch_paths import branch_dir, safe_branch_name, get_current_branch
 from datetime import datetime
 import os
@@ -863,7 +864,8 @@ def train_vae(
             'val_perplexity', 'epoch_time_seconds', 'elapsed_time_seconds',
             'remaining_time_seconds', 'saved_cache'
         ] + [f'ce_{name}' for name in field_names] + [f'val_ce_{name}' for name in field_names]
-          + ['kl_raw', 'kl_nofb', 'kl_raw_nofb', 'val_kl_raw', 'val_kl_nofb', 'val_kl_raw_nofb'])
+          + ['kl_raw', 'kl_nofb', 'kl_raw_nofb', 'val_kl_raw', 'val_kl_nofb', 'val_kl_raw_nofb']
+          + ['train_samples_per_s', 'train_time_seconds', 'gpu_power_w', 'gpu_util_percent'])
 
     def _log(text):
         if is_main:
@@ -961,6 +963,12 @@ def train_vae(
     completed_epochs = 0
     perplexity = torch.tensor(1000.0)
 
+    gpu_indices = list(getattr(dist_ctx, 'gpu_indices', ()) or ())
+    if not gpu_indices and device.type == 'cuda':
+        gpu_indices = [device.index if device.index is not None else torch.cuda.current_device()]
+    gpu_sampler = GpuSampler(gpu_indices if is_main else [])
+    gpu_sampler.start()
+
     train_start_time = time.time()
     prev_epoch_time = time.time()
     print()
@@ -976,6 +984,8 @@ def train_vae(
             'klp': torch.zeros(3, device=device),  # raw (free bits), raw (no free bits), beta * raw (no free bits)
         }
         batch_iteration = 0
+        epoch_train_start = time.time()
+        gpu_sampler.collect()  # forget everything measured outside of the training phase
         prev_time = time.time()
         last_event_time = time.time()
         last_event_iteration = 0
@@ -1052,6 +1062,13 @@ def train_vae(
 
         if stopped:
             break
+
+        # Throughput of the training phase only (validation / checkpoints excluded). Reading the loss forces the
+        # device to finish all queued work, so the time is honest.
+        float(running['loss'])
+        train_time = max(time.time() - epoch_train_start, 1e-9)
+        samples_per_s = batch_iteration * int(_hparams.batch_size) / train_time
+        gpu_stats = gpu_sampler.collect()
 
         if ddp:
             # Average the epoch metrics over the ranks (equal batch counts per rank).
@@ -1216,6 +1233,8 @@ def train_vae(
         fields_text = ' | '.join(f"{name} {value:.4f}" for name, value in train_epoch['fields'].items())
         _log(f"Field CE: {fields_text}")
         print(f"Model Perplexity: {train_epoch['ppl']} | Avg frames per sequence: {avg_frames:.2f}")
+        _log(_format_perf(samples_per_s, train_time, gpu_stats))
+        gpu_summary = _summarize_gpus(gpu_stats)
 
         # print time elapsed and remaining
         elapsed_time = time.time() - train_start_time
@@ -1242,6 +1261,14 @@ def train_vae(
             'remaining': remaining_time,
             'global_step': global_step,
             'world_size': world_size,
+            'perf': {
+                'train_time': train_time,
+                'samples_per_s': samples_per_s,
+                'step_ms': 1000.0 * train_time / max(batch_iteration, 1),
+                'batch_size': int(_hparams.batch_size),
+                'gpus': gpu_stats,
+                **gpu_summary,
+            },
         })
 
         # Log metrics to CSV
@@ -1269,12 +1296,17 @@ def train_vae(
             ] + [f"{v:.6f}" for v in train_epoch['fields'].values()]
               + ([f"{v:.6f}" for v in val_metrics['fields'].values()] if val_metrics is not None else [''] * len(field_names))
               + [f"{train_epoch[k]:.6f}" for k in ('kl_raw', 'kl_nofb', 'kl_raw_nofb')]
-              + ([f"{val_metrics[k]:.6f}" for k in ('kl_raw', 'kl_nofb', 'kl_raw_nofb')] if val_metrics is not None else [''] * 3))
+              + ([f"{val_metrics[k]:.6f}" for k in ('kl_raw', 'kl_nofb', 'kl_raw_nofb')] if val_metrics is not None else [''] * 3)
+              + [f"{samples_per_s:.1f}", f"{train_time:.2f}",
+                 f"{gpu_summary['power_w_total']:.1f}" if gpu_summary['power_w_total'] is not None else '',
+                 f"{gpu_summary['util_avg']:.1f}" if gpu_summary['util_avg'] is not None else ''])
 
         if early_stopped:
             _log(f"Early stopping after epoch {epoch}: no improvement over {es_best:.4f} (min delta {es_min_delta:g}) "
                  f"for {es_bad_epochs} epoch(s).")
             break
+
+    gpu_sampler.stop()
 
     if stopped:
         # Persist the exact stop state (mid-epoch) as resume checkpoint.

@@ -269,3 +269,22 @@ training runs on MPS / CPU as before.
   an additional GPU. NVLink needs no code change, NCCL uses it automatically.
 - Test without GPUs: `python tests/test_ddp.py` (CPU processes with the gloo backend, option `ddp_cpu_processes`).
 - Not tested on real GPUs / NCCL yet.
+
+
+## Throughput and GPU measurement
+
+`nvidia-smi` showing 100 % only means that some kernel was running; it does not say how well the GPU is filled.
+`train_vae` therefore measures every epoch (training phase only, validation and checkpoints excluded):
+
+- **samples/s** and **ms/step** (`batch_size` is the global batch). The loss is read back once at the end of the
+  phase, so queued GPU work is included in the time.
+- **GPU power, utilisation and memory** of the selected GPUs, sampled once per second with `nvidia-smi`
+  (`modules/perf_monitor.py`). Without `nvidia-smi` only the throughput is reported. `RBF_PERF_MONITOR=0` switches the
+  sampling off. GPU indices are the physical ones; with `CUDA_VISIBLE_DEVICES` they can differ from the torch indices.
+- Output: a log line `Throughput: ... samples/s | GPU0 ... W, util ... %, ... GB`, the `perf` object of the `epoch`
+  event (shown in the Training tab status), and the CSV columns `train_samples_per_s`, `train_time_seconds`,
+  `gpu_power_w` (sum over GPUs), `gpu_util_percent` (mean).
+
+How to use it: run a few epochs per batch size (e.g. 512 / 1024 / 2048). If samples/s stops growing and the power draw
+stays far below the card's limit (H100: ~300-700 W), the step is latency bound and a larger batch or a larger model is
+free. If samples/s still grows nearly linearly, the GPU was not yet saturated.

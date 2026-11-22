@@ -186,6 +186,48 @@
         <svg id="worldOverlay" aria-hidden="true"></svg>
         <canvas id="fieldOverlay"></canvas>
       </div>
+      <h4>Anchor Influence</h4>
+      <canvas id="influence"></canvas>
+      <div class="select-row"><label>Hovered</label><div id="hoveredAnchorName">-</div></div>
+      <div class="select-row"><label>Current BPM</label><div id="currentBpm">-</div></div>
+      <div class="row"><label>Grid</label><input id="grid" type="range" min="4" max="60" step="1" /><span id="gridVal"></span></div>
+      <div class="row"><label>Samples</label><input id="sampleCount" type="range" min="1" max="40" step="1" /><span id="sampleCountVal"></span></div>
+      <div class="row"><label>Sigma</label><input id="sigma" type="range" min="0.05" max="3" step="0.01" /><span id="sigmaVal"></span></div>
+      <div class="btns">
+        <button id="modeBtn">Heat: Mag</button>
+        <button id="influenceBtn">Influence: Raw</button>
+        <button id="bpmInterpBtn">BPM: Gaussian</button>
+        <button id="decodeBtn">Decode: Off</button>
+        <button id="sampleRandomizeBtn">Samples: Random</button>
+        <button id="sampleReshuffleBtn" title="Draw a new random selection of samples (anchors) from the dataset.">&#128256; Reshuffle</button>
+        <button id="quantizeBtn">Mode: Continuous</button>
+        <button id="mapBtn">Map: Off</button>
+        <button id="renderBtn" class="idle">Render: Start</button>
+      </div>
+      <div class="select-row">
+        <label for="latentFallbackSelect">Latent Fallback</label>
+        <select id="latentFallbackSelect">
+          <option value="preserve_current_behavior" selected>Preserve (default)</option>
+          <option value="mean_latent">Mean latent</option>
+          <option value="nearest_anchor">Nearest anchor</option>
+          <option value="last_valid_latent">Last valid</option>
+          <option value="user_defined_anchor0">Anchor 0 fallback (hidden)</option>
+          <option value="user_defined_anchor0_refined">Anchor 0 fallback (hidden, refined blend)</option>
+        </select>
+      </div>
+      <div id="refinedBlendControls" style="display:none">
+        <div class="row"><label>Blend Low</label><input id="blendLow" type="range" min="0.00001" max="0.1" step="0.0001" /><span id="blendLowVal"></span></div>
+        <div class="row"><label>Blend High</label><input id="blendHigh" type="range" min="0.05" max="1.5" step="0.01" /><span id="blendHighVal"></span></div>
+      </div>
+      <div class="render-progress-wrap">
+        <div class="render-progress-track"><div id="renderProgressFill" class="render-progress-fill"></div></div>
+        <div id="renderProgressText" class="render-progress-text">Idle</div>
+      </div>
+      <h4>Status</h4>
+      <div class="status-indicator"><span id="statusLed" class="status-led"></span><span id="statusText">Disconnected</span></div>
+      <pre id="status">connecting...</pre>
+    </div>
+    <div class="panel">
       <h4>Latent Vector</h4>
       <canvas id="latent"></canvas>
       <h4>Reconstruction</h4>
@@ -219,53 +261,12 @@
           <div class="hint" id="rcMidiStatus"></div>
         </fieldset>
       </div>
-    </div>
-    <div class="panel">
-      <h4>Anchor Influence</h4>
-      <canvas id="influence"></canvas>
-      <div class="select-row"><label>Hovered</label><div id="hoveredAnchorName">-</div></div>
-      <div class="select-row"><label>Current BPM</label><div id="currentBpm">-</div></div>
-      <div class="row"><label>Grid</label><input id="grid" type="range" min="4" max="60" step="1" /><span id="gridVal"></span></div>
-      <div class="row"><label>Samples</label><input id="sampleCount" type="range" min="1" max="40" step="1" /><span id="sampleCountVal"></span></div>
-      <div class="row"><label>Sigma</label><input id="sigma" type="range" min="0.05" max="3" step="0.01" /><span id="sigmaVal"></span></div>
-      <div class="btns">
-        <button id="modeBtn">Heat: Mag</button>
-        <button id="influenceBtn">Influence: Raw</button>
-        <button id="bpmInterpBtn">BPM: Gaussian</button>
-        <button id="decodeBtn">Decode: Off</button>
-        <button id="sampleRandomizeBtn">Samples: Random</button>
-        <button id="quantizeBtn">Mode: Continuous</button>
-        <button id="mapBtn">Map: Off</button>
-        <button id="renderBtn" class="idle">Render: Start</button>
-      </div>
-      <div class="select-row">
-        <label for="latentFallbackSelect">Latent Fallback</label>
-        <select id="latentFallbackSelect">
-          <option value="preserve_current_behavior" selected>Preserve (default)</option>
-          <option value="mean_latent">Mean latent</option>
-          <option value="nearest_anchor">Nearest anchor</option>
-          <option value="last_valid_latent">Last valid</option>
-          <option value="user_defined_anchor0">Anchor 0 fallback (hidden)</option>
-          <option value="user_defined_anchor0_refined">Anchor 0 fallback (hidden, refined blend)</option>
-        </select>
-      </div>
-      <div id="refinedBlendControls" style="display:none">
-        <div class="row"><label>Blend Low</label><input id="blendLow" type="range" min="0.00001" max="0.1" step="0.0001" /><span id="blendLowVal"></span></div>
-        <div class="row"><label>Blend High</label><input id="blendHigh" type="range" min="0.05" max="1.5" step="0.01" /><span id="blendHighVal"></span></div>
-      </div>
-      <div class="render-progress-wrap">
-        <div class="render-progress-track"><div id="renderProgressFill" class="render-progress-fill"></div></div>
-        <div id="renderProgressText" class="render-progress-text">Idle</div>
-      </div>
       <h4>Model Checkpoint</h4>
       <div class="select-row"><label for="datasetSelect">Dataset</label><select id="datasetSelect"></select></div>
       <div class="select-row"><label for="checkpointMode">Mode</label><select id="checkpointMode"></select></div>
       <div class="select-row"><label for="checkpointStamp">Timestamp</label><select id="checkpointStamp"></select></div>
       <div class="select-row"><label>Loaded</label><div id="modelStatus">(unknown)</div></div>
       <div class="select-row"><label title="Most important parameters of the active model">Parameters</label><div id="modelInfo" title="Most important parameters of the active model">-</div></div>
-      <h4>Status</h4>
-      <div class="status-indicator"><span id="statusLed" class="status-led"></span><span id="statusText">Disconnected</span></div>
-      <pre id="status">connecting...</pre>
     </div>
   </div>
 
@@ -465,6 +466,7 @@ const S = {
   sampleCount: 10,
   sampleCountMax: 40,
   sampleRandomize: true,
+  sampleShuffleNonce: 0,
   datasetName: "",
   datasetOptions: [],
   sigma: 0.3,
@@ -523,6 +525,7 @@ const influenceBtn = document.getElementById("influenceBtn");
 const bpmInterpBtn = document.getElementById("bpmInterpBtn");
 const decodeBtn = document.getElementById("decodeBtn");
 const sampleRandomizeBtn = document.getElementById("sampleRandomizeBtn");
+const sampleReshuffleBtn = document.getElementById("sampleReshuffleBtn");
 const quantizeBtn = document.getElementById("quantizeBtn");
 const mapBtn = document.getElementById("mapBtn");
 const renderBtn = document.getElementById("renderBtn");
@@ -612,6 +615,7 @@ function syncSampleControls() {
   sampleCountVal.textContent = `${clamped}/${maxCount}`;
   sampleRandomizeBtn.classList.toggle("active", !!S.sampleRandomize);
   sampleRandomizeBtn.textContent = S.sampleRandomize ? "Samples: Random" : "Samples: Ordered";
+  sampleReshuffleBtn.style.display = S.sampleRandomize ? "" : "none";  // only meaningful for random samples
 }
 
 function renderDatasetSelector() {
@@ -681,6 +685,7 @@ function setRenderingUiState() {
     bpmInterpBtn,
     decodeBtn,
     sampleRandomizeBtn,
+    sampleReshuffleBtn,
     latentFallbackEl,
     quantizeBtn,
     mapBtn,
@@ -1101,6 +1106,7 @@ function payload() {
       // unless user explicitly clicks start again.
       renderEnabled: effectiveRenderEnabled,
       sampleRandomize: S.sampleRandomize,
+      sampleShuffleNonce: S.sampleShuffleNonce,
     },
     slider_values: {
       gridResolution: S.grid,
@@ -1240,6 +1246,11 @@ sigmaEl.addEventListener("input", () => { S.sigma = Number(sigmaEl.value); sigma
 sampleRandomizeBtn.addEventListener("click", () => {
   S.sampleRandomize = !S.sampleRandomize;
   syncSampleControls();
+  sendPayload();
+});
+sampleReshuffleBtn.addEventListener("click", () => {
+  // A unique value per click; the server draws a new random selection whenever it sees a value it has not handled yet.
+  S.sampleShuffleNonce = Date.now();
   sendPayload();
 });
 
@@ -2230,6 +2241,11 @@ render();
       if (lastEpoch.train.fields) {
         const vf = lastEpoch.val && lastEpoch.val.fields ? ` · val ${fieldsText(lastEpoch.val.fields)}` : "";
         lines.push(`field CE: train ${fieldsText(lastEpoch.train.fields)}${vf}`);
+      }
+      const pf = lastEpoch.perf;
+      if (pf && pf.samples_per_s) {
+        const gp = (pf.gpus || []).map((g) => `GPU${g.index} ${Math.round(g.power_w)} W / ${Math.round(g.util)}% / ${g.mem_gb.toFixed(1)} GB`).join(" · ");
+        lines.push(`throughput: ${Math.round(pf.samples_per_s).toLocaleString()} samples/s, ${pf.step_ms.toFixed(1)} ms/step (batch ${pf.batch_size})${gp ? " · " + gp : ""}`);
       }
     }
     lines.push(`elapsed ${fmtDuration(s.elapsed)}${remaining !== null ? `, remaining ~${fmtDuration(remaining)}` : ""}${s.pid ? `, pid ${s.pid}` : ""}`);
