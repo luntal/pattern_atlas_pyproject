@@ -84,7 +84,12 @@
     .app-banner strong { display: block; margin-bottom: 4px; }
     .app-banner ul { margin: 4px 0 0 18px; padding: 0; word-break: break-all; }
     .panel.idle-app canvas { opacity: 0.45; }
-    .tabs { max-width: 1180px; margin: 0 auto; padding: 12px 12px 0; display: flex; gap: 6px; }
+    .app-header { position: sticky; top: 0; z-index: 1000; background: #f5f6ef; border-bottom: 1px solid #d8d7cf; box-shadow: 0 1px 4px rgba(0,0,0,0.06); }
+    .tabs { max-width: 1180px; margin: 0 auto; padding: 8px 12px; display: flex; gap: 6px; align-items: center; box-sizing: border-box; }
+    .tabs .conn { margin: 0 0 0 auto; padding-left: 12px; white-space: nowrap; flex: 0 0 auto; }
+    .rc-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 14px 0 6px; }
+    .rc-head h4 { margin: 0; }
+    .rc-head button { padding: 4px 10px; font-weight: 600; }
     .tabs button { border-radius: 8px; padding: 8px 18px; font-weight: 600; }
     .train-app { max-width: 1180px; margin: 0 auto; padding: 12px; display: none; grid-template-columns: 1fr 1.1fr; gap: 12px; align-items: start; }
     .train-app.visible { display: grid; }
@@ -172,10 +177,13 @@
   </style>
 </head>
 <body>
-  <div class="tabs">
-    <button id="tabLatent" class="active" type="button">Latent Field</button>
-    <button id="tabTrain" type="button">Training</button>
-    <button id="tabDataset" type="button">Dataset</button>
+  <div class="app-header">
+    <div class="tabs">
+      <button id="tabLatent" class="active" type="button">Latent Field</button>
+      <button id="tabTrain" type="button">Training</button>
+      <button id="tabDataset" type="button">Dataset</button>
+      <div class="status-indicator conn"><span id="statusLed" class="status-led"></span><span id="statusText">Disconnected</span></div>
+    </div>
   </div>
   <div class="app" id="latentTab">
     <div class="panel">
@@ -186,6 +194,7 @@
         <svg id="worldOverlay" aria-hidden="true"></svg>
         <canvas id="fieldOverlay"></canvas>
       </div>
+      <canvas id="latent"></canvas>
       <h4>Anchor Influence</h4>
       <canvas id="influence"></canvas>
       <div class="select-row"><label>Hovered</label><div id="hoveredAnchorName">-</div></div>
@@ -197,7 +206,6 @@
         <button id="modeBtn">Heat: Mag</button>
         <button id="influenceBtn">Influence: Raw</button>
         <button id="bpmInterpBtn">BPM: Gaussian</button>
-        <button id="decodeBtn">Decode: Off</button>
         <button id="sampleRandomizeBtn">Samples: Random</button>
         <button id="sampleReshuffleBtn" title="Draw a new random selection of samples (anchors) from the dataset.">&#128256; Reshuffle</button>
         <button id="quantizeBtn">Mode: Continuous</button>
@@ -224,13 +232,13 @@
         <div id="renderProgressText" class="render-progress-text">Idle</div>
       </div>
       <h4>Status</h4>
-      <div class="status-indicator"><span id="statusLed" class="status-led"></span><span id="statusText">Disconnected</span></div>
       <pre id="status">connecting...</pre>
     </div>
     <div class="panel">
-      <h4>Latent Vector</h4>
-      <canvas id="latent"></canvas>
-      <h4>Reconstruction</h4>
+      <div class="rc-head">
+        <h4>Reconstruction</h4>
+        <button id="decodeBtn" title="Switch real-time decoding of the current latent vector on or off.">Decode: Off</button>
+      </div>
       <div id="reconPanel">
         <div class="rc-info-row">
           <div id="reconInfo">Turn on <b>Decode</b> to see the reconstruction of the current latent vector.</div>
