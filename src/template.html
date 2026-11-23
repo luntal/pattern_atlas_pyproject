@@ -123,6 +123,11 @@
     .chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .chart-grid canvas { height: 150px; }
     .chart-title { font-size: 12px; font-weight: 700; margin: 4px 0 2px; }
+    #onnxBox { margin: 6px 0 2px; }
+    #onnxBox .onnx-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    #onnxBox .hint { overflow-wrap: anywhere; word-break: break-word; margin: 0; }
+    #onnxLog { margin: 4px 0 0; height: 84px; overflow: auto; background: #f6f8f4; border: 1px solid #d8dfd5; border-radius: 5px; padding: 4px 6px; font: 11px/1.4 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; color: #2d3a31; }
+    #onnxLog.failed { border-color: #d98a8a; background: #fbf1f1; }
     #lfLog { margin-top: 6px; border-top: 1px solid #e3e5dc; padding-top: 4px; }
     #lfLog > summary { cursor: pointer; font-size: 13px; font-weight: 700; }
     #lfLog .lf-log-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 4px 0; }
@@ -293,6 +298,13 @@
       <div class="select-row"><label for="checkpointStamp">Timestamp</label><select id="checkpointStamp"></select></div>
       <div class="select-row"><label>Loaded</label><div id="modelStatus">(unknown)</div></div>
       <div class="select-row"><label title="Most important parameters of the active model">Parameters</label><div id="modelInfo" title="Most important parameters of the active model">-</div></div>
+      <div id="onnxBox">
+        <div class="onnx-bar">
+          <button id="onnxBtn" type="button" title="Export the loaded checkpoint to ONNX (like convert_to_onnx.py): encoder, decoder and the KV-cache step decoder (decoder_init + decoder_step) are written as four files to models/&lt;branch&gt;/onnx/. Runs on the server (CPU) in the background.">Export to ONNX</button>
+          <span id="onnxStatus" class="hint" title="Result of the last export">-</span>
+        </div>
+        <pre id="onnxLog" title="Log of the ONNX export (written by the server)">No export yet.</pre>
+      </div>
       <details id="lfLog">
         <summary title="Training curves of the selected checkpoint, read from docs/&lt;branch&gt;/training_log_&lt;timestamp&gt;.csv (and training_batches_&lt;timestamp&gt;.csv).">Training log of this model</summary>
         <div class="lf-log-bar">
@@ -4155,6 +4167,42 @@ render();
   }
   $("rcPlayBtn").addEventListener("click", () => { if (play.playing) stopPlayback(); else startPlayback(); });
   window.addEventListener("beforeunload", stopPlayback);
+
+  // ---- ONNX export of the loaded checkpoint (button + log below Parameters); the export runs on the server
+  const onnx = { state: "idle", requested: false };
+  function onnxRender(snap) {
+    if (!snap) return;
+    onnx.state = snap.state;
+    const log = $("onnxLog");
+    const stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 8;
+    log.textContent = snap.log && snap.log.length ? snap.log.join("\n") : (snap.error || "No export yet.");
+    log.classList.toggle("failed", snap.state === "failed");
+    if (stick) log.scrollTop = log.scrollHeight;
+    const st = $("onnxStatus");
+    if (snap.state === "running") st.textContent = `exporting ${snap.checkpoint} ...`;
+    else if (snap.state === "done") st.textContent = `done: ${snap.checkpoint} -> models/<branch>/onnx/`;
+    else if (snap.state === "failed") st.textContent = `failed: ${snap.error || "see log"}`;
+    else st.textContent = `output: ${snap.out_dir || "models/<branch>/onnx/"}`;
+    onnxUpdateButton();
+  }
+  function onnxUpdateButton() {
+    const hasModel = !!(typeof modelSelection !== "undefined" && modelSelection && modelSelection.timestamp);
+    const btn = $("onnxBtn");
+    btn.disabled = onnx.state === "running" || !hasModel;
+    btn.textContent = onnx.state === "running" ? "Exporting ..." : "Export to ONNX";
+  }
+  $("onnxBtn").addEventListener("click", () => {
+    if ($("onnxBtn").disabled) return;
+    onnx.state = "running";
+    onnxUpdateButton();
+    socket.emit("onnx_export", {});
+  });
+  socket.on("onnx_update", onnxRender);
+  socket.on("onnx_export_result", (res) => {
+    if (res && !res.ok) { $("onnxStatus").textContent = `not started: ${res.error || "error"}`; onnx.state = "idle"; onnxUpdateButton(); }
+  });
+  socket.on("bootstrap", () => { socket.emit("onnx_get"); onnxUpdateButton(); });
+  socket.on("frame", onnxUpdateButton);
 
   // ---- training log of the selected checkpoint (collapsible, below Model Checkpoint)
   const lfLog = {

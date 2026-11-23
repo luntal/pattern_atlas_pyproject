@@ -29,7 +29,7 @@ from flask_socketio import SocketIO, emit
 
 from hparams import hparams as _DEFAULT_HPARAMS
 from modules.branch_paths import get_current_branch, project_root, safe_branch_name
-from modules import compound, dataset_tools
+from modules import compound, dataset_tools, onnx_export
 from modules.distributed import cuda_device_list, device_roles, inference_device
 from modules.hparams_io import HparamsSaveError, read_hparams, save_hparams
 from modules.radial_basis_function import compute_rbf_weights, rbf_interpolate_exact
@@ -1481,6 +1481,93 @@ class TrainingManager:
             }
 
 
+class OnnxExportManager:
+    """Runs the ONNX export of one checkpoint (modules.onnx_export) in a background thread with a small log.
+
+    The export runs on the CPU, one job at a time. notify(snapshot) is called after every state / log change.
+    """
+
+    MAX_LOG_LINES = 200
+
+    def __init__(self, notify=None):
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self.notify = notify
+        self.state = "idle"  # idle | running | done | failed
+        self.checkpoint = None
+        self.log: list[str] = []
+        self.result: dict | None = None
+        self.error: str | None = None
+        self.version = 0
+
+    def is_active(self) -> bool:
+        return self.state == "running"
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "state": self.state,
+                "checkpoint": self.checkpoint,
+                "log": list(self.log),
+                "result": dict(self.result) if self.result else None,
+                "error": self.error,
+                "out_dir": str(onnx_export.onnx_dir()),
+                "version": self.version,
+            }
+
+    def _changed(self):
+        with self._lock:
+            self.version += 1
+        if self.notify is not None:
+            try:
+                self.notify(self.snapshot())
+            except Exception:
+                traceback.print_exc()
+
+    def _append(self, text: str):
+        with self._lock:
+            for line in str(text).splitlines() or [""]:
+                self.log.append(line)
+            if len(self.log) > self.MAX_LOG_LINES:
+                del self.log[: len(self.log) - self.MAX_LOG_LINES]
+        self._changed()
+
+    def start(self, file_name: str) -> tuple[bool, str | None]:
+        """Start the export of models/<branch>/<file_name>. Returns (ok, error)."""
+        with self._lock:
+            if self.state == "running":
+                return False, "An ONNX export is already running."
+        try:
+            path = onnx_export.resolve_checkpoint(file_name)
+        except (ValueError, FileNotFoundError) as exc:
+            return False, str(exc)
+        with self._lock:
+            self.state = "running"
+            self.checkpoint = path.name
+            self.log = []
+            self.result = None
+            self.error = None
+        self._changed()
+        self._thread = threading.Thread(target=self._run, args=(path,), name="onnx-export", daemon=True)
+        self._thread.start()
+        return True, None
+
+    def _run(self, path: Path):
+        try:
+            result = onnx_export.export_checkpoint_to_onnx(path, onnx_export.onnx_dir(), log=self._append)
+            self._append(f"Done. Files saved to {result['out_dir']}")
+            with self._lock:
+                self.result = result
+                self.state = "done"
+        except Exception as exc:
+            traceback.print_exc()
+            with self._lock:
+                self.error = f"{type(exc).__name__}: {exc}"
+                self.state = "failed"
+            self._append(f"ERROR: {self.error}")
+        self._changed()
+
+
 class RBFServerController:
     MODE_LABELS = {
         "best_val": "best_val",
@@ -1864,6 +1951,13 @@ class RBFServerController:
 
     def _mode_files(self, mode: str) -> list[Path]:
         return self._mode_files_static(mode)
+
+    def selected_checkpoint_file(self) -> str | None:
+        """File name (inside models/<branch>/) of the checkpoint that is selected in Model Checkpoint."""
+        stamp = self._selected_timestamp()
+        if not stamp or self.runtime is None:
+            return None
+        return f"{self.MODE_PREFIX[self.selected_mode]}{stamp}.pt"
 
     def _selected_timestamp(self) -> str | None:
         items = self.model_catalog.get("modes", {}).get(self.selected_mode, {}).get("items", [])
@@ -2754,6 +2848,7 @@ def create_app(sample_count: int = 10, sample_seed: int = 42, hparams_path: str 
 
     dataset_jobs = dataset_tools.DatasetJobManager(on_finish=_on_dataset_job_finished)
     atexit.register(dataset_jobs.cancel)
+    onnx_jobs = OnnxExportManager(notify=lambda snapshot: socketio.emit("onnx_update", snapshot))
     assets_dir = (Path(__file__).resolve().parent.parent / "assets").resolve()
 
     def decode_broadcast_loop():
@@ -2960,6 +3055,22 @@ def create_app(sample_count: int = 10, sample_seed: int = 42, hparams_path: str 
             "keys": {"train": TRAIN_KEYS, "model": MODEL_KEYS, "architecture": ARCHITECTURE_KEYS},
             "state": controller.training.snapshot(),
         }
+
+    @socketio.on("onnx_get")
+    def on_onnx_get():
+        emit("onnx_update", onnx_jobs.snapshot())
+
+    @socketio.on("onnx_export")
+    def on_onnx_export(payload=None):
+        """Export the checkpoint that is selected in Model Checkpoint (encoder + decoder) to models/<branch>/onnx/."""
+        file_name = controller.selected_checkpoint_file()
+        if not file_name:
+            ok, error = False, "No checkpoint is loaded."
+        else:
+            ok, error = onnx_jobs.start(file_name)
+        emit("onnx_export_result", {"ok": bool(ok), "error": error, "checkpoint": file_name})
+        if not ok:
+            emit("onnx_update", onnx_jobs.snapshot())
 
     @socketio.on("train_log_get")
     def on_train_log_get(payload=None):
