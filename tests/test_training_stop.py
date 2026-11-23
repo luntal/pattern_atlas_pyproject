@@ -104,6 +104,19 @@ def test_full_run():
     log_files = glob.glob(os.path.join(ROOT, 'docs', BRANCH, 'training_log_*.csv'))
     header = open(log_files[0]).readline().strip().split(',')
     assert 'ce_step' in header and 'val_ce_deviation' in header and 'avg_frames_per_sequence' in header, header
+    # batch loss curve (read by the Latent Field tab) next to the epoch log
+    batch_logs = glob.glob(os.path.join(ROOT, 'docs', BRANCH, 'training_batches_*.csv'))
+    assert len(batch_logs) == 1, batch_logs
+    brows = open(batch_logs[0]).read().strip().splitlines()
+    assert brows[0] == 'epoch,step,steps,loss,beta,lr' and len(brows) == 1 + len([e for e in events if e['type'] == 'batch']), brows[:3]
+    import re as _re
+    from rbf_server_app import read_training_log
+    stamp = _re.search(r'training_log_(.+)\.csv', log_files[0]).group(1)
+    got = read_training_log(stamp, BRANCH)
+    assert got['ok'] and len(got['epochs']) == 2 and len(got['batches']) == len(brows) - 1, got.keys()
+    assert abs(got['epochs'][-1]['train']['loss'] - epoch_events[-1]['train']['loss']) < 1e-5
+    assert set(got['epochs'][-1]['train']['fields']) == {'step', 'pitch', 'velocity', 'deviation'}
+    assert not read_training_log('2000-01-01_00-00-00', BRANCH)['ok']
     assert result['stopped'] is False and result['epochs_completed'] == 2
     kinds = {e['kind'] for e in events if e['type'] == 'checkpoint'}
     assert {'last', 'best_train', 'final'} <= kinds, kinds

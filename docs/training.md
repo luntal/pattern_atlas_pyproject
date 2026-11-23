@@ -113,7 +113,7 @@ scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
 ## Training Log
 
-In addition to checkpoint files, each training run writes a CSV log to `docs/<branch>/training_log_<timestamp>.csv` containing per-epoch metrics: total loss, reconstruction loss, KL loss, perplexity, `avg_frames_per_sequence`, learning rate, beta, annealing factor, validation metrics, timing information and the cross entropy per field (`ce_step`, `ce_pitch`, `ce_velocity`, `ce_deviation` and the `val_ce_*` counterparts). `training_log.py` plots them in an extra panel.
+In addition to checkpoint files, each training run writes a CSV log to `docs/<branch>/training_log_<timestamp>.csv` containing per-epoch metrics: total loss, reconstruction loss, KL loss, perplexity, `avg_frames_per_sequence`, learning rate, beta, annealing factor, validation metrics, timing information and the cross entropy per field (`ce_step`, `ce_pitch`, `ce_velocity`, `ce_deviation` and the `val_ce_*` counterparts). `training_log.py` plots them in an extra panel. Next to it, `docs/<branch>/training_batches_<timestamp>.csv` holds the batch loss curve (`epoch, step, steps, loss, beta, lr`, one row per logged batch, i.e. every `log_interval` batches). Both files are shown as diagrams in Latent Field > Model Checkpoint > *Training log of this model* (older runs have no batch file).
 
 View logs with:
 

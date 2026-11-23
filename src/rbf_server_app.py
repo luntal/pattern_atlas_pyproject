@@ -213,6 +213,91 @@ def _pitch_info(n_pitch: int) -> dict:
     return _PITCH_INFO_CACHE[n_pitch]
 
 
+_LOG_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
+_MAX_BATCH_LOG_POINTS = 1500
+
+
+def _csv_number(value):
+    """CSV cell -> float (None for empty / invalid cells)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def read_training_log(timestamp: str, branch: str | None = None) -> dict:
+    """Training log of the model with this timestamp (docs/<branch>/training_log_<ts>.csv and
+    training_batches_<ts>.csv), in the shape of the training tab's epoch / batch events.
+
+    Never raises for missing files: ok is False with an error message instead (older checkpoints have no log).
+    """
+    import csv
+
+    timestamp = str(timestamp or "")
+    if not _LOG_TIMESTAMP_RE.match(timestamp):
+        return {"ok": False, "timestamp": timestamp, "error": "no checkpoint selected"}
+    branch_name = safe_branch_name(branch or get_current_branch())
+    log_dir = project_root() / "docs" / branch_name
+    epoch_path = log_dir / f"training_log_{timestamp}.csv"
+    batch_path = log_dir / f"training_batches_{timestamp}.csv"
+    if not epoch_path.is_file():
+        return {"ok": False, "timestamp": timestamp,
+                "error": f"no training log found ({epoch_path.relative_to(project_root())})"}
+
+    def _rows(path):
+        try:
+            with open(path, newline="", encoding="utf-8") as handle:
+                return list(csv.DictReader(handle))
+        except (OSError, csv.Error, UnicodeDecodeError):
+            return []
+
+    epochs = []
+    for row in _rows(epoch_path):
+        def num(key):
+            return _csv_number(row.get(key))
+
+        field_names = [k[3:] for k in row if k and k.startswith("ce_")]
+
+        def side(prefix):
+            loss = num(f"{prefix}total_loss")
+            if loss is None:
+                return None
+            out = {
+                "loss": loss, "rec": num(f"{prefix}reconstruction_loss"), "kl": num(f"{prefix}kl_loss"),
+                "ppl": num(f"{prefix}perplexity"),
+                "kl_raw": num(f"{prefix}kl_raw"), "kl_nofb": num(f"{prefix}kl_nofb"),
+                "kl_raw_nofb": num(f"{prefix}kl_raw_nofb"),
+                "fields": {name: num(f"{prefix}ce_{name}") for name in field_names},
+            }
+            return out
+
+        epoch = num("epoch")
+        if epoch is None:
+            continue
+        epochs.append({
+            "type": "epoch", "epoch": int(epoch), "beta": num("beta"), "lr": num("learning_rate"),
+            "epoch_time": num("epoch_time_seconds"),
+            "train": side(""), "val": side("val_"),
+        })
+
+    batches = []
+    if batch_path.is_file():
+        rows = _rows(batch_path)
+        stride = max(1, int(math.ceil(len(rows) / _MAX_BATCH_LOG_POINTS)))
+        for i, row in enumerate(rows):
+            if i % stride:
+                continue
+            loss = _csv_number(row.get("loss"))
+            if loss is None:
+                continue
+            batches.append({"epoch": _csv_number(row.get("epoch")), "step": _csv_number(row.get("step")),
+                            "steps": _csv_number(row.get("steps")), "loss": loss,
+                            "beta": _csv_number(row.get("beta")), "lr": _csv_number(row.get("lr"))})
+    return {"ok": True, "timestamp": timestamp, "branch": branch_name, "epochs": epochs, "batches": batches,
+            "batch_stride": stride if batch_path.is_file() and rows else 1, "has_batches": batch_path.is_file()}
+
+
 class FullFieldRenderManager:
     def __init__(self, runtime: "CudaRBFRuntime", hparams, retokenize: bool = False, decode_batch_size: int = DECODE_BATCH_SIZE):
         self.runtime = runtime
@@ -2875,6 +2960,15 @@ def create_app(sample_count: int = 10, sample_seed: int = 42, hparams_path: str 
             "keys": {"train": TRAIN_KEYS, "model": MODEL_KEYS, "architecture": ARCHITECTURE_KEYS},
             "state": controller.training.snapshot(),
         }
+
+    @socketio.on("train_log_get")
+    def on_train_log_get(payload=None):
+        stamp = str((payload or {}).get("timestamp") or "") if isinstance(payload, dict) else ""
+        try:
+            emit("train_log_result", read_training_log(stamp))
+        except Exception as exc:
+            traceback.print_exc()
+            emit("train_log_result", {"ok": False, "timestamp": stamp, "error": str(exc)})
 
     @socketio.on("train_get_config")
     def on_train_get_config():

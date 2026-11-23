@@ -123,6 +123,11 @@
     .chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .chart-grid canvas { height: 150px; }
     .chart-title { font-size: 12px; font-weight: 700; margin: 4px 0 2px; }
+    #lfLog { margin-top: 6px; border-top: 1px solid #e3e5dc; padding-top: 4px; }
+    #lfLog > summary { cursor: pointer; font-size: 13px; font-weight: 700; }
+    #lfLog .lf-log-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 4px 0; }
+    #lfLog .lf-log-bar button { font-size: 11px; padding: 1px 8px; }
+    #lfLog .hint { overflow-wrap: anywhere; word-break: break-word; margin: 0; }
     .kl-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; margin: 0 0 2px; }
     .kl-controls select { width: auto; font-size: 12px; padding: 1px 4px; }
     .kl-controls label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
@@ -288,6 +293,28 @@
       <div class="select-row"><label for="checkpointStamp">Timestamp</label><select id="checkpointStamp"></select></div>
       <div class="select-row"><label>Loaded</label><div id="modelStatus">(unknown)</div></div>
       <div class="select-row"><label title="Most important parameters of the active model">Parameters</label><div id="modelInfo" title="Most important parameters of the active model">-</div></div>
+      <details id="lfLog">
+        <summary title="Training curves of the selected checkpoint, read from docs/&lt;branch&gt;/training_log_&lt;timestamp&gt;.csv (and training_batches_&lt;timestamp&gt;.csv).">Training log of this model</summary>
+        <div class="lf-log-bar">
+          <button id="lfLogReload" type="button" title="Read the log files of the selected checkpoint again (e.g. while a training is still running).">Reload</button>
+          <span id="lfLogStatus" class="hint">Open to load the log.</span>
+        </div>
+        <div class="chart-grid">
+          <div><div class="chart-title">Loss (epoch: train / val)</div><canvas id="lfChLoss"></canvas></div>
+          <div>
+            <div class="chart-title" id="lfChKlTitle">KL (epoch: train / val)</div>
+            <div class="kl-controls">
+              <select id="lfKlBeta" title="post-beta: KL as it enters the loss (beta * KL). pre-beta: KL before the beta weighting."><option value="post">post beta (kl_beta)</option><option value="pre">pre beta (kl_raw)</option></select>
+              <label title="On: KL as used in the loss (free-bits floor). Off: the true KL divergence."><input id="lfKlFreeBits" type="checkbox" checked /> show_free_bits</label>
+            </div>
+            <canvas id="lfChKl"></canvas>
+          </div>
+          <div><div class="chart-title">Beta</div><canvas id="lfChBeta"></canvas></div>
+          <div><div class="chart-title">Learning rate</div><canvas id="lfChLr"></canvas></div>
+        </div>
+        <div class="chart-title" title="Cross entropy of the four parallel decoder heads per epoch (solid = train, dashed = val).">Reconstruction error per field (epoch: step / pitch / velocity / deviation)</div><canvas id="lfChFields" style="height:150px"></canvas>
+        <div class="chart-title" id="lfChBatchTitle">Batch loss</div><canvas id="lfChBatch" style="height:120px"></canvas>
+      </details>
     </div>
   </div>
 
@@ -2146,6 +2173,7 @@ render();
     ctx.restore();
   }
 
+  window.__rbfCharts = { drawChart, fmt };
   const FIELD_COLORS = [["step", "#2b7e7a"], ["pitch", "#d06c3b"], ["velocity", "#6a5acd"], ["deviation", "#b08a3a"]];
   function fieldsText(fields) {
     if (!fields) return "";
@@ -4127,6 +4155,109 @@ render();
   }
   $("rcPlayBtn").addEventListener("click", () => { if (play.playing) stopPlayback(); else startPlayback(); });
   window.addEventListener("beforeunload", stopPlayback);
+
+  // ---- training log of the selected checkpoint (collapsible, below Model Checkpoint)
+  const lfLog = {
+    el: $("lfLog"), status: $("lfLogStatus"), stamp: null, data: null, loading: false,
+  };
+  const LF_FIELDS = [["step", "#2b7e7a"], ["pitch", "#d06c3b"], ["velocity", "#6a5acd"], ["deviation", "#b08a3a"]];
+  function lfLogDraw() {
+    const charts = window.__rbfCharts;
+    if (!charts || !lfLog.el.open) return;
+    const d = lfLog.data;
+    const epochs = (d && d.epochs) || [];
+    const pick = (fn) => epochs.map((e) => { try { const v = fn(e); return v === null || v === undefined ? NaN : Number(v); } catch (err) { return NaN; } });
+    const draw = charts.drawChart;
+    draw($("lfChLoss"), [
+      { label: "train", color: "#2b7e7a", data: pick((e) => e.train && e.train.loss) },
+      { label: "val", color: "#d06c3b", data: pick((e) => e.val && e.val.loss) },
+    ], "no log");
+    const pre = $("lfKlBeta").value === "pre";
+    const fb = $("lfKlFreeBits").checked;
+    const key = pre ? (fb ? "kl_raw" : "kl_raw_nofb") : (fb ? "kl" : "kl_nofb");
+    $("lfChKlTitle").textContent = `KL ${pre ? "pre beta" : "post beta"}, ${fb ? "with" : "without"} free bits (epoch: train / val)`;
+    draw($("lfChKl"), [
+      { label: "train", color: "#2b7e7a", data: pick((e) => e.train && e.train[key]) },
+      { label: "val", color: "#d06c3b", data: pick((e) => e.val && e.val[key]) },
+    ], "no values for this KL variant (older runs only have post beta with free bits)");
+    draw($("lfChBeta"), [{ label: "beta", color: "#6a5acd", data: pick((e) => e.beta) }], "no log");
+    draw($("lfChLr"), [{ label: "lr", color: "#a34922", data: pick((e) => e.lr) }], "no log");
+    const fieldSeries = [];
+    LF_FIELDS.forEach(([name, color]) => {
+      fieldSeries.push({ label: name, color, data: pick((e) => e.train && e.train.fields && e.train.fields[name]) });
+      fieldSeries.push({ label: `${name} val`, color, dashed: true, noLegend: true, data: pick((e) => e.val && e.val.fields && e.val.fields[name]) });
+    });
+    draw($("lfChFields"), fieldSeries, "no per field values");
+    const batches = (d && d.batches) || [];
+    const stride = (d && d.batch_stride) || 1;
+    $("lfChBatchTitle").textContent = "Batch loss" + (batches.length ? ` (${batches.length} points${stride > 1 ? `, every ${stride}. logged batch` : ""})` : "");
+    draw($("lfChBatch"), [{ label: "loss", color: "#2d9d5b", data: batches.map((b) => Number(b.loss)) }],
+      d && d.ok && !d.has_batches ? "no batch log (checkpoint from before batch logging)" : "no batch values");
+  }
+  function lfLogRequest(force) {
+    const stamp = (typeof modelSelection !== "undefined" && modelSelection && modelSelection.timestamp) || null;
+    if (!lfLog.el.open) return;
+    if (!stamp) {
+      lfLog.data = null; lfLog.stamp = null;
+      lfLog.status.textContent = "No checkpoint loaded.";
+      lfLogDraw();
+      return;
+    }
+    if (!force && stamp === lfLog.stamp) return;  // already loaded (or known to be missing); Reload forces
+    lfLog.stamp = stamp;
+    lfLog.loading = true;
+    lfLog.status.textContent = `Loading log of ${stamp} ...`;
+    socket.emit("train_log_get", { timestamp: stamp });
+  }
+  socket.on("train_log_result", (res) => {
+    if (!res || res.timestamp !== lfLog.stamp) return;  // answer for a checkpoint that is no longer selected
+    lfLog.loading = false;
+    if (!res.ok) {
+      lfLog.data = null;
+      lfLog.status.textContent = res.error || "no training log";
+    } else {
+      lfLog.data = res;
+      const last = res.epochs.length ? res.epochs[res.epochs.length - 1].epoch : 0;
+      lfLog.status.textContent = `${res.timestamp}: ${res.epochs.length} epoch(s)${last ? `, last epoch ${last}` : ""}.`;
+    }
+    lfLogDraw();
+  });
+  lfLog.el.addEventListener("toggle", () => { lfLogRequest(false); lfLogDraw(); });
+  $("lfLogReload").addEventListener("click", () => lfLogRequest(true));
+  $("lfKlBeta").value = store.get("lf.kl.beta", "post") === "pre" ? "pre" : "post";
+  $("lfKlFreeBits").checked = store.get("lf.kl.freeBits", "1") !== "0";
+  $("lfKlBeta").addEventListener("change", () => { store.set("lf.kl.beta", $("lfKlBeta").value); lfLogDraw(); });
+  $("lfKlFreeBits").addEventListener("change", () => { store.set("lf.kl.freeBits", $("lfKlFreeBits").checked ? "1" : "0"); lfLogDraw(); });
+  // the selected checkpoint changes with a model switch (bootstrap) or a new frame
+  socket.on("bootstrap", () => lfLogRequest(false));
+  socket.on("frame", () => lfLogRequest(false));
+  window.addEventListener("resize", lfLogDraw);
+
+  // ---- shortcuts (Latent Field tab): Space = play / stop, A (hold) = nearest anchor overlay
+  function latentTabActive() {
+    return typeof S !== "undefined" && S.activeTab === "latent";
+  }
+  function shortcutTarget(e) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return false;
+    const t = e.target;
+    const tag = (t && t.tagName) || "";
+    return !(tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (t && t.isContentEditable));
+  }
+  window.addEventListener("keydown", (e) => {
+    if (!latentTabActive() || !shortcutTarget(e)) return;
+    if (e.code === "Space" || e.key === " ") {
+      e.preventDefault();  // no page scroll, and a focused button must not be clicked a second time
+      if (e.repeat) return;
+      if (play.playing) stopPlayback(); else startPlayback();
+    } else if ((e.key === "a" || e.key === "A") && !e.repeat) {
+      setHold(true);
+    }
+  });
+  window.addEventListener("keyup", (e) => {
+    if (e.key === "a" || e.key === "A") setHold(false);
+    else if ((e.code === "Space" || e.key === " ") && latentTabActive() && shortcutTarget(e)) e.preventDefault();
+  });
+  window.addEventListener("blur", () => setHold(false));
 
   window.__reconViewer = { draw, stop: () => { if (play.playing) stopPlayback(); } };
   draw();

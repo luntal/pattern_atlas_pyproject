@@ -747,8 +747,10 @@ def train_vae(
     branch_name = safe_branch_name(get_current_branch())
     log_dir = branch_dir('docs')
     log_file = os.path.join(str(log_dir), f'training_log_{timestamp}.csv')
+    batch_log_file = os.path.join(str(log_dir), f'training_batches_{timestamp}.csv')
     if not is_main:
         log_file = os.devnull  # only rank 0 writes the CSV log
+        batch_log_file = os.devnull
 
     # Generate model name with timestamp
     model_dir = branch_dir('models')
@@ -866,6 +868,9 @@ def train_vae(
         ] + [f'ce_{name}' for name in field_names] + [f'val_ce_{name}' for name in field_names]
           + ['kl_raw', 'kl_nofb', 'kl_raw_nofb', 'val_kl_raw', 'val_kl_nofb', 'val_kl_raw_nofb']
           + ['train_samples_per_s', 'train_time_seconds', 'gpu_power_w', 'gpu_util_percent'])
+
+    with open(batch_log_file, 'w', newline='') as f:
+        csv.writer(f).writerow(['epoch', 'step', 'steps', 'loss', 'beta', 'lr'])
 
     def _log(text):
         if is_main:
@@ -1051,6 +1056,9 @@ def train_vae(
                 step_time = (now_event - last_event_time) / steps_since
                 last_event_time = now_event
                 last_event_iteration = batch_iteration
+                with open(batch_log_file, 'a', newline='') as bf:  # batch loss curve (read by the Latent Field tab)
+                    csv.writer(bf).writerow([epoch, batch_iteration, n_batches, f'{loss_value:.6f}',
+                                             f'{float(weighted_beta):.6f}', f"{float(optimizer.param_groups[0]['lr']):.10f}"])
                 _emit({
                     'type': 'batch',
                     'epoch': epoch,
